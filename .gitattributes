@@ -1,11 +1,18 @@
-# 统一换行，避免 Windows / Linux 互相 checkout 时整份文件显示成改动
+# 换行策略
+# 源码统一 LF；bat / txt 一律保持原样（不转换），原因见下面两段注释。
 * text=auto eol=lf
 
-# 批处理必须是 CRLF（且保持 GBK 编码，git 只动换行不动编码）
-*.bat text eol=crlf
-*.cmd text eol=crlf
+# 批处理必须原样保留 CRLF —— cmd.exe 解析 LF 结尾的 .bat 会把参数拆碎
+# （本项目就踩过：UTF-8/LF 存过的 build.bat 报 'el' / 'it' 之类的怪错）。
+# 用 -text 而不是 eol=crlf：eol=crlf 只影响 checkout，仓库对象里仍是 LF，
+# 而 GitHub 网页/ZIP 下载拿到的正是仓库对象那份。
+*.bat -text
+*.cmd -text
 
-# 二进制：不要做任何换行或编码转换
+# 说明文档与示例书：保持原有编码与换行（示例书里就有 GBK 和 UTF-8 两种）
+*.txt -text
+
+# 二进制：不做任何换行或编码转换
 *.png binary
 *.ico binary
 *.exe binary
