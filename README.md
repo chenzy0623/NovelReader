@@ -8,6 +8,7 @@
 ![体积](https://img.shields.io/badge/size-380%20KB-brightgreen)
 ![依赖](https://img.shields.io/badge/dependencies-none-success)
 ![协议](https://img.shields.io/badge/license-MIT-orange)
+[![下载](https://img.shields.io/badge/download-v1.0.0%20win64-blueviolet)](https://github.com/chenzy0623/NovelReader/releases/tag/v1.0.0)
 
 用 Electron / Qt 写个阅读器动辄几十兆，可我只是想看本小说。于是有了这个项目：只调用 Windows 自带的 API，正文自己画（不用 RichEdit），连 zip 解压（读 epub / docx）都是自己实现的，最终产物 380 KB —— 双击就能用，删掉即卸载，没有任何安装包和注册表写入。
 
@@ -35,8 +36,9 @@
 
 **方式一：直接下成品**
 
-- 本仓库里就带了一份编译好的：[`dist/NovelReader.exe`](dist/NovelReader.exe)（388,608 字节）
-- 或者到 [Releases](../../releases) 下 `NovelReader-1.0.0-win64.zip`（exe + 使用说明 + 各格式示例书）
+- 发行包：[NovelReader-1.0.0-win64.zip](https://github.com/chenzy0623/NovelReader/releases/download/v1.0.0/NovelReader-1.0.0-win64.zip)（exe + 使用说明 + 各格式示例书，**244 KB**）
+- 只要程序本体：[NovelReader.exe](https://github.com/chenzy0623/NovelReader/releases/download/v1.0.0/NovelReader.exe)（388,608 字节）
+- 仓库里也留了一份：[`dist/NovelReader.exe`](dist/NovelReader.exe)
 
 **方式二：自己编译**（见 [自己编译](#自己编译)，几分钟）
 
