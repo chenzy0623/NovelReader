@@ -23,10 +23,10 @@ echo === ???????? ===
 "%BIN%\g++.exe" -std=gnu++17 -O2 -DUNICODE -D_UNICODE -D_WIN32_WINNT=0x0601 ^
   -municode -mwindows -ffunction-sections -fdata-sections -Wall -Wextra ^
   -o build\NovelReader.exe ^
-  src\book.cpp src\ini.cpp src\view.cpp src\ui.cpp src\zip.cpp src\format.cpp src\pdf.cpp src\server.cpp src\web.cpp build\app.res ^
+  src\book.cpp src\ini.cpp src\view.cpp src\ui.cpp src\zip.cpp src\format.cpp src\pdf.cpp src\pdfrender.cpp src\server.cpp src\web.cpp build\app.res ^
   "-Wl,--gc-sections" "-Wl,-s" ^
   -static -static-libgcc -static-libstdc++ ^
-  -lwininet -lws2_32 -liphlpapi -lcomctl32 -lcomdlg32 -lshell32 -lole32 -lgdi32 -luser32 -ladvapi32
+  -lgdiplus -lshcore -lruntimeobject -lwininet -lws2_32 -liphlpapi -lcomctl32 -lcomdlg32 -lshell32 -lole32 -lgdi32 -luser32 -ladvapi32
 if errorlevel 1 goto fail
 
 echo.

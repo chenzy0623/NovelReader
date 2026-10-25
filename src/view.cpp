@@ -54,6 +54,8 @@
  *   · 本文件不缓存文本，一律从 g_book 现取；换书后必须调 ViewSetBook()。
  * ===================================================================== */
 #include "common.h"
+#include "pdf.h"
+#include "pdfrender.h"
 #include <windowsx.h>
 #include <algorithm>
 #include <cwchar>
@@ -167,6 +169,24 @@ static int s_homeHover = -1;
 /* 是否已经请求过 WM_MOUSELEAVE 通知。TrackMouseEvent 只对"下一次"离开有效，
  * 所以每次进入窗口时都得重新请求一次，这个标志就是用来避免重复请求的。 */
 static bool s_trackLeave = false;
+
+/* ---------------- PDF「原始版式」模式 ---------------- *
+ * 打开 PDF 时默认走"抽文字重排"（能搜索、能换字体、能配色）。用户按 F9 切到
+ * "原始版式"后，改成用系统 Windows.Data.Pdf 把整页渲染成位图直接贴上去：
+ * 版式、图片、字体效果 100% 还原，但这一屏里的文字是图，选不中、搜不了。
+ * 两种模式共用同一份 g_book（同一份抽出来的文字），所以阅读位置、书签、
+ * 章节列表都不受影响 —— 切换时靠 s_pdfPage 和字符偏移互相换算来保持位置。 */
+static bool s_pdfMode = false;      /* 是否处于原始版式模式 */
+static int  s_pdfPage = 0;          /* 当前显示的页号（0 基） */
+static int  s_pdfScrollY = 0;       /* 页内纵向滚动量（像素）：整页比窗口高时要能往下看 */
+static std::wstring s_pdfOpenedPath; /* 渲染器已经打开的 PDF 路径（避免重复打开） */
+
+/* PDF 模式的前置声明（定义在"绘制"一节；ViewGotoOffset 之类要靠它同步页码） */
+static bool PdfEnsureOpen();
+static int  PdfPageFromOffset(int off);
+static void PdfSyncPageFromAnchor();
+static void DrawPdfPage(int W, int H);
+
 
 /* 行距档位系数：0 紧凑 / 1 标准 / 2 宽松，乘以字号得到行高。用"系数"而不是固定像素，换字号时行距比例才
    保持稳定；下标由 g_set.spacing 提供，EnsureFonts 里会先夹到 0~2。 */
@@ -587,6 +607,19 @@ static void UpdateScrollBar()
     ZeroMemory(&si, sizeof(si));
     si.cbSize = sizeof(si);
     si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS | SIF_DISABLENOSCROLL;
+
+    /* PDF 原始版式：滚动条改用"页"作单位，一格 = 一页 */
+    if (s_pdfMode && PdfRenderOk()) {
+        int pages = PdfRenderPageCount();
+        if (pages < 1) pages = 1;
+        si.nMin = 0;
+        si.nMax = pages - 1;
+        si.nPage = 1;
+        si.nPos = s_pdfPage;
+        SetScrollInfo(s_wnd, SB_VERT, &si, TRUE);
+        return;
+    }
+
     int total = (int)g_book.text.size();
     if (total < 1) total = 1;
     int chars = 1;
@@ -690,6 +723,8 @@ void ViewGotoOffset(int off, int selLen)
        s_aOff、刷滚动条、重绘并通知主窗口，这里不再重复这些收尾动作。 */
     if (up > 0) ViewScrollLines(-up);
     SyncAnchorOffset();
+    /* 原始版式模式下，跳到某处要连带把页面翻到对应那一页（搜索命中就是这样跳页的） */
+    PdfSyncPageFromAnchor();
     UpdateScrollBar();
     InvalidateAll();
     Notify();
@@ -709,6 +744,7 @@ void ViewGotoPara(int para)
     s_selA = s_selB = -1;
     ClampAnchor();
     SyncAnchorOffset();
+    PdfSyncPageFromAnchor();
     UpdateScrollBar();
     InvalidateAll();
     Notify();
@@ -750,6 +786,73 @@ void ViewGotoChapter(int delta)
     ViewGotoPara(g_book.chapters[(size_t)target].para);
 }
 
+/* ===================== PDF 原始版式的对外接口 ===================== */
+
+/* 切换「原始版式 / 文字重排」。参数 on：true 切到原始版式。
+ * 切不过去（不是 PDF、或渲染器打不开）时保持现状 —— 调用方（ui.cpp）据此提示用户。
+ * 切过去时立刻按当前阅读位置算出该显示第几页，两种模式看到的是同一处文字。 */
+bool ViewSetPdfMode(bool on)
+{
+    if (!on) {
+        if (s_pdfMode) {
+            s_pdfMode = false;
+            if (s_wnd) { UpdateScrollBar(); InvalidateAll(); }
+        }
+        return true;
+    }
+    if (!g_book.Ok()) return false;
+    /* 先确保渲染器可用：打不开就当没这回事，界面上仍然是文字重排 */
+    if (!PdfEnsureOpen()) return false;
+    s_pdfMode = true;
+    PdfSyncPageFromAnchor();
+    if (s_wnd) { UpdateScrollBar(); InvalidateAll(); }
+    return true;
+}
+
+bool ViewIsPdfMode() { return s_pdfMode; }
+
+int ViewPdfPageCount() { return s_pdfMode ? PdfRenderPageCount() : 0; }
+
+int ViewPdfPage() { return s_pdfPage; }
+
+int ViewPdfPageFromOffset(int off) { return PdfPageFromOffset(off); }
+
+/* 翻页：delta = +1 下一页 / -1 上一页。翻页同时把文字锚点移到该页开头，
+ * 这样状态栏的百分比、书架进度、书签落点都跟着走，和文字模式口径一致。 */
+void ViewPdfFlip(int delta)
+{
+    if (!s_pdfMode) return;
+    int total = PdfRenderPageCount();
+    if (total <= 0) return;
+    int page = s_pdfPage + delta;
+    if (page < 0) page = 0;
+    if (page > total - 1) page = total - 1;
+    if (page == s_pdfPage) return;
+
+    const std::vector<uint32_t>& offs = PdfLastPageOffsets();
+    if ((size_t)page < offs.size()) {
+        /* 走 ViewGotoOffset 而不是只改 s_pdfPage：它会顺带同步锚点、进度和重绘 */
+        ViewGotoOffset((int)offs[(size_t)page] + 1, 0);
+        s_pdfPage = page;
+        s_pdfScrollY = 0;
+        if (s_wnd) { UpdateScrollBar(); InvalidateAll(); }
+    } else {
+        s_pdfPage = page;
+        s_pdfScrollY = 0;
+        if (s_wnd) { UpdateScrollBar(); InvalidateAll(); }
+        Notify();
+    }
+}
+
+/* 页内纵向滚动（整页比窗口高时用）。dy 为像素位移，正数向下。 */
+void ViewPdfScroll(int dy)
+{
+    if (!s_pdfMode || dy == 0) return;
+    s_pdfScrollY += dy;
+    if (s_pdfScrollY < 0) s_pdfScrollY = 0;
+    if (s_wnd) InvalidateAll();
+}
+
 /* 当前顶行的字符偏移 —— 对外接口，ui.cpp 用它算阅读进度百分比、保存阅读位置（PosSave）。内部直接转调
    AnchorChar。 */
 int ViewAnchorOffset() { return AnchorChar(); }
@@ -778,6 +881,15 @@ void ViewSetBook()
     s_dragging = false;
     /* 首页书架的悬停行也清掉：换书之后这一行要么不存在（有书了）、要么是新书架的另一行 */
     s_homeHover = -1;
+    /* PDF 原始版式状态一起复位：换书（包括关书回书架）后必须回到"文字重排"模式，
+       并关掉上一本书的渲染器，否则会拿旧 PDF 的页面去画新书。 */
+    s_pdfMode = false;
+    s_pdfPage = 0;
+    s_pdfScrollY = 0;
+    if (!s_pdfOpenedPath.empty()) {
+        PdfRenderClose();
+        s_pdfOpenedPath.clear();
+    }
     EnsureFonts();
     UpdateMetrics(false);
     InvalidCounts();
@@ -1092,6 +1204,138 @@ static void DrawWelcome(int W, int H)
     }
 }
 
+/* ============================ PDF「原始版式」模式 ============================ *
+ * 思路：用系统自带的 Windows.Data.Pdf 把整页渲染成位图，按"铺满窗口宽度"缩放后
+ * 贴上去。整页比窗口高时用 s_pdfScrollY 往下看（滚轮），翻页用 PageUp/PageDown。
+ * 之所以不缩放成"整页可见"：小说 PDF 正文本来就要大一点才看得清，铺满宽度更实用。
+ * 页码与文字偏移的换算依赖 pdf.cpp 记录的"每页正文起点偏移"（PdfLastPageOffsets），
+ * 这样搜索命中、书签、记忆位置在两种模式之间切换时都不会跳位置。
+ * ============================================================================ */
+
+/* 确保渲染器已经打开了当前这本书。返回 false 表示这本书根本不是 PDF、或者
+ * 渲染失败（例如加密 PDF、系统组件缺失），调用方应当退回文字模式。 */
+static bool PdfEnsureOpen()
+{
+    if (!g_book.Ok() || !PdfIsPdf(g_book.path)) return false;
+    if (s_pdfOpenedPath == g_book.path && PdfRenderOk()) return true;
+
+    /* 换了一本书（或上次没打开成功）：先关掉旧的，再开新的 */
+    PdfRenderClose();
+    s_pdfOpenedPath.clear();
+
+    std::wstring err;
+    if (!PdfRenderOpen(g_book.path, err)) return false;
+    s_pdfOpenedPath = g_book.path;
+    return true;
+}
+
+/* 字符偏移 → 页号。取"最后一个起点 ≤ off 的页"，因为页起点数组是单调递增的。 */
+static int PdfPageFromOffset(int off)
+{
+    const std::vector<uint32_t>& offs = PdfLastPageOffsets();
+    if (offs.empty()) return 0;
+    int page = 0;
+    for (size_t i = 0; i < offs.size(); i++) {
+        if ((long long)offs[i] <= (long long)off) page = (int)i;
+        else break;
+    }
+    return page;
+}
+
+/* 让"当前页"跟上文字模式下的阅读位置（切到原始版式、跳转章节/搜索命中时用）。 */
+static void PdfSyncPageFromAnchor()
+{
+    if (!s_pdfMode) return;
+    s_pdfPage = PdfPageFromOffset(ViewAnchorOffset());
+    s_pdfScrollY = 0;
+}
+
+/* 画一页 PDF：整页按窗口宽度缩放，纵向用 s_pdfScrollY 滚动。 */
+static void DrawPdfPage(int W, int H)
+{
+    const Theme& th = CurTheme();
+    int total = PdfRenderPageCount();
+    if (total <= 0) {
+        const wchar_t* msg = L"这份 PDF 无法渲染成页面";
+        SelectObject(s_dc, s_fontN);
+        SetTextColor(s_dc, th.dim);
+        ExtTextOutW(s_dc, s_padL, s_padT, 0, nullptr, msg, (int)wcslen(msg), nullptr);
+        return;
+    }
+    if (s_pdfPage < 0) s_pdfPage = 0;
+    if (s_pdfPage > total - 1) s_pdfPage = total - 1;
+
+    int availW = W - s_padL * 2;
+    if (availW < S(120)) availW = S(120);
+
+    /* 渲染位图比显示宽度大一倍（内部 2 倍超采样），缩放后文字才不糊 */
+    HBITMAP hbm = PdfRenderPageBitmap(s_pdfPage, availW);
+    if (!hbm) {
+        std::wstring err = L"页面渲染失败：";
+        err += PdfRenderLastError();
+        SelectObject(s_dc, s_fontN);
+        SetTextColor(s_dc, th.dim);
+        ExtTextOutW(s_dc, s_padL, s_padT, 0, nullptr, err.c_str(), (int)err.size(), nullptr);
+        return;
+    }
+
+    BITMAP bm;
+    ZeroMemory(&bm, sizeof(bm));
+    GetObjectW(hbm, sizeof(bm), &bm);
+    int srcW = bm.bmWidth > 0 ? bm.bmWidth : 1;
+    int srcH = bm.bmHeight > 0 ? bm.bmHeight : 1;
+
+    /* 显示尺寸：整页完整放进可视区（宽、高两个方向取更小的那个缩放比）。
+     * 只按宽度铺满的话，A4 竖版页在宽屏上会比窗口高出一截，页底要滚动才看得到，
+     * 而"看 PDF"的心理预期是"一屏一页"。等比缩放 + 水平居中，页面完整可见。 */
+    int availH = H - s_padT * 2;
+    if (availH < S(120)) availH = S(120);
+    int dw = availW;
+    int dh = (int)((long long)srcH * dw / srcW);
+    if (dh > availH) {
+        dh = availH;
+        dw = (int)((long long)srcW * dh / srcH);
+        if (dw < 1) dw = 1;
+    }
+
+    /* 页内滚动范围：整页已经被完整缩放进来，正常情况不需要滚；
+     * 只有窗口被拉得极扁（availH 极小）时才有余量，逻辑保留以防万一。 */
+    int maxScroll = dh - (H - s_padT * 2);
+    if (maxScroll < 0) maxScroll = 0;
+    if (s_pdfScrollY > maxScroll) s_pdfScrollY = maxScroll;
+    if (s_pdfScrollY < 0) s_pdfScrollY = 0;
+
+    /* 等比缩放后左右留白，页面居中更好看 */
+    int dx = s_padL + (availW - dw) / 2;
+
+    HDC mem = CreateCompatibleDC(s_dc);
+    if (mem) {
+        HGDIOBJ old = SelectObject(mem, hbm);
+        SetStretchBltMode(s_dc, HALFTONE);
+        SetBrushOrgEx(s_dc, 0, 0, nullptr);
+        /* 位图右侧/底部可能露出的底色先补一下，避免 StretchBlt 边缘出现黑边 */
+        StretchBlt(s_dc, dx, s_padT - s_pdfScrollY, dw, dh,
+                   mem, 0, 0, srcW, srcH, SRCCOPY);
+        SelectObject(mem, old);
+        DeleteDC(mem);
+    }
+    /* 注意：这里**不能** DeleteObject(hbm)。
+     * 这张位图归 pdfrender 的页面缓存所有，下一次重绘（滚动、改窗口大小、
+     * 甚至只是刷新光标）还会再取一次；在这里删掉的话缓存里就留下一个野句柄，
+     * 下一帧 GetObjectW 取不到尺寸、StretchBlt 也就画不出东西 ——
+     * 表现正是"翻页后整块区域变成纯背景色，只剩右下角页码"。 */
+
+    /* 右下角画一小行"第 n/N 页"，不依赖状态栏也能看清页码 */
+    wchar_t pg[64];
+    wsprintfW(pg, L"第 %d / %d 页", s_pdfPage + 1, total);
+    SelectObject(s_dc, s_fontN);
+    SetTextColor(s_dc, th.dim);
+    SIZE sz;
+    sz.cx = sz.cy = 0;
+    GetTextExtentPoint32W(s_dc, pg, (int)wcslen(pg), &sz);
+    ExtTextOutW(s_dc, W - sz.cx - s_padL, H - sz.cy - S(4), 0, nullptr, pg, (int)wcslen(pg), nullptr);
+}
+
 /* 处理 WM_PAINT：整屏重绘。流程见文件头"一、绘制数据流"。
    · 开头就把三样东西对齐：DC、字体、排版宽度（EnsureDC / EnsureFonts /
      UpdateMetrics）—— 任一样不对，画出来就是错的（行数、行高、宽度）。
@@ -1131,6 +1375,14 @@ static void PaintAll()
         /* 首页：有书架记录就画书架，没有就画三行引导语（DrawHome 内部自己分派） */
         DrawHome(W, H);
         /* 双缓冲的一次性呈现：把整幅画面从内存 DC 拷到窗口 DC。 */
+        BitBlt(hdc, 0, 0, W, H, s_dc, 0, 0, SRCCOPY);
+        EndPaint(s_wnd, &ps);
+        return;
+    }
+
+    /* PDF「原始版式」模式：整页位图直接贴上去，文字重排那条路整段跳过 */
+    if (s_pdfMode && PdfRenderOk()) {
+        DrawPdfPage(W, H);
         BitBlt(hdc, 0, 0, W, H, s_dc, 0, 0, SRCCOPY);
         EndPaint(s_wnd, &ps);
         return;
@@ -1320,6 +1572,16 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM w, LPARAM l)
             return 0;
         }
         UiAutoStop();                       /* 手动拨轮时停下自动下滑 */
+        /* PDF 原始版式：滚轮优先在页内上下移动；已经滚到底（或整页装得下）才翻页。
+           这样"整页比窗口高"的 PDF 也能顺畅看完全文，而不是一格就跳过一页。 */
+        if (s_pdfMode) {
+            int step = (int)(delta / WHEEL_DELTA) * S(60);
+            /* 判断是否还能在页内继续滚：滚不动且方向向下 → 翻下一页 */
+            int before = s_pdfScrollY;
+            ViewPdfScroll(-step);
+            if (s_pdfScrollY == before) ViewPdfFlip(step > 0 ? -1 : 1);
+            return 0;
+        }
         /* 一次滚动 delta / WHEEL_DELTA 个"格"，每格 3 行 —— 比滚 1
            行更符合"滚一格走一小段"的直觉。符号要取负：滚轮往上是 delta > 0，而 ViewScrollLines 里正数是向下。 */
         int lines = (int)(delta / WHEEL_DELTA) * 3;
@@ -1332,6 +1594,25 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM w, LPARAM l)
         if (!g_book.Ok()) return 0;
         UiAutoStop();                       /* 手动拖动滚动条时停下自动下滑 */
         int code = LOWORD(w);
+        /* PDF 原始版式：滚动条一格 = 一页 */
+        if (s_pdfMode) {
+            switch (code) {
+            case SB_LINEUP:   case SB_PAGEUP:   ViewPdfFlip(-1); break;
+            case SB_LINEDOWN: case SB_PAGEDOWN: ViewPdfFlip(1);  break;
+            case SB_TOP:      ViewPdfFlip(-ViewPdfPageCount()); break;
+            case SB_BOTTOM:   ViewPdfFlip(ViewPdfPageCount());  break;
+            case SB_THUMBTRACK:
+            case SB_THUMBPOSITION: {
+                SCROLLINFO si; ZeroMemory(&si, sizeof(si));
+                si.cbSize = sizeof(si); si.fMask = SIF_TRACKPOS;
+                GetScrollInfo(h, SB_VERT, &si);
+                ViewPdfFlip(si.nTrackPos - s_pdfPage);
+                break;
+            }
+            default: break;
+            }
+            return 0;
+        }
         switch (code) {
         case SB_LINEUP:   ViewScrollLines(-1); break;
         case SB_LINEDOWN: ViewScrollLines(1); break;
@@ -1385,17 +1666,20 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM w, LPARAM l)
         default: break;
         }
         switch (w) {
-        case VK_UP:    ViewScrollLines(-1); return 0;
-        case VK_DOWN:  ViewScrollLines(1); return 0;
-        case VK_PRIOR: ViewScrollPages(-1); return 0;
-        case VK_NEXT:  ViewScrollPages(1); return 0;
+        case VK_UP:    if (s_pdfMode) { ViewPdfScroll(-S(56)); return 0; } ViewScrollLines(-1); return 0;
+        case VK_DOWN:  if (s_pdfMode) { ViewPdfScroll(S(56)); return 0; } ViewScrollLines(1); return 0;
+        case VK_PRIOR: if (s_pdfMode) { ViewPdfFlip(-1); return 0; } ViewScrollPages(-1); return 0;
+        case VK_NEXT:  if (s_pdfMode) { ViewPdfFlip(1); return 0; } ViewScrollPages(1); return 0;
         case VK_HOME:  ViewGotoOffset(0, 0); return 0;
         case VK_END:   ViewGotoOffset((int)g_book.text.size() - 1, 0); return 0;
         /* ← / → 是"翻章"而不是"移动光标"：这是阅读器，没有光标。 */
         case VK_LEFT:  ViewGotoChapter(-1); return 0;
         case VK_RIGHT: ViewGotoChapter(1); return 0;
-        /* 空格翻页（Shift 反向）：单手翻页比 PgDn 顺手。 */
-        case VK_SPACE: ViewScrollPages(shift ? -1 : 1); return 0;
+        /* 空格翻页（Shift 反向）：单手翻页比 PgDn 顺手。PDF 原始版式下按页翻。 */
+        case VK_SPACE:
+            if (s_pdfMode) ViewPdfFlip(shift ? -1 : 1);
+            else ViewScrollPages(shift ? -1 : 1);
+            return 0;
         /* Esc 只清选区，不关窗口（关窗口是 Alt+F4 / 标题栏的事）。 */
         case VK_ESCAPE: s_selA = s_selB = -1; InvalidateAll(); return 0;
         /* 吞掉 Tab：不让它把焦点跳到别的控件上，保证阅读时焦点稳定留在正文里，方向键和空格一直可用。 */

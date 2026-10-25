@@ -843,6 +843,10 @@ void PdfDoc::RunContent(const std::string& cs, int page,
     flush();
 }
 
+/* 最近一次 PdfExtractText 得到的"每页正文起点偏移"（元素个数 = 页数）。
+ * 视图的"原始版式"模式用它把字符偏移换算成页码，搜索命中也靠它跳页。 */
+static std::vector<uint32_t> s_lastPageOffsets;
+
 bool PdfDoc::Extract(std::wstring& out, std::wstring& err) {
     out.clear();
 
@@ -950,13 +954,18 @@ bool PdfDoc::Extract(std::wstring& out, std::wstring& err) {
     int prevPage = -1;
     double prevY = 0, prevSize = 12;
     bool first = true;
+    // 记录每一页的正文起点（页号 → 字符偏移）。视图切到"原始版式"后，
+    // 要靠它把"当前文字偏移"换算成"第几页"；搜索命中也用它跳页。
+    std::map<int, uint32_t> pageStart;
     for (size_t k = 0; k < pieces.size(); k++) {
         const Piece& p = pieces[k];
         if (first) {
+            pageStart[p.page] = (uint32_t)res2.size();
             res2 += p.text;
             first = false;
         } else if (p.page != prevPage) {
             res2 += L'\n';
+            pageStart[p.page] = (uint32_t)res2.size();
             res2 += p.text;
         } else {
             double gap = prevY - p.y;
@@ -983,6 +992,20 @@ bool PdfDoc::Extract(std::wstring& out, std::wstring& err) {
     }
 
     out.swap(res2);
+
+    /* 把"页号 → 起点偏移"整理成按页索引的数组（没有文字的页沿用下一页的起点，
+     * 最后一页之后的空页统一用全文长度），供视图换算"偏移 ↔ 页码"。 */
+    s_lastPageOffsets.assign(m_pages.size(), (uint32_t)out.size());
+    {
+        std::map<int, uint32_t>::const_iterator it = pageStart.begin();
+        for (size_t i = 0; i < m_pages.size(); i++) {
+            while (it != pageStart.end() && (size_t)it->first < i) ++it;
+            if (it != pageStart.end() && (size_t)it->first == i) s_lastPageOffsets[i] = it->second;
+            else if (it != pageStart.end()) s_lastPageOffsets[i] = it->second;
+            else s_lastPageOffsets[i] = (uint32_t)out.size();
+        }
+    }
+
     return !out.empty();
 }
 
@@ -1004,7 +1027,12 @@ bool PdfIsPdf(const std::wstring& path) {
 bool PdfExtractText(const uint8_t* data, size_t len, std::wstring& text, std::wstring& err) {
     text.clear();
     err.clear();
+    s_lastPageOffsets.clear();
     PdfDoc doc;
     if (!doc.Load(data, len, err)) return false;
     return doc.Extract(text, err);
+}
+
+const std::vector<uint32_t>& PdfLastPageOffsets() {
+    return s_lastPageOffsets;
 }

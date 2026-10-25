@@ -43,6 +43,7 @@
 #include "common.h"
 #include "web.h"
 #include "server.h"
+#include "pdf.h"
 #include <commctrl.h>
 #include <commdlg.h>
 #include <shellapi.h>
@@ -477,7 +478,17 @@ void UiUpdateStatus()
         int pos = ViewAnchorOffset();
         int pct = total > 0 ? (int)((LONGLONG)pos * 1000 / total) : 0;
         wchar_t buf[128];
-        if (!g_book.chapters.empty()) {
+        /* PDF 原始版式模式：这里要报"第几页"，因为用户看的就是一页页的图，
+         * 报"第几章"对不上他眼前的内容（章和页不是一一对应）。 */
+        if (ViewIsPdfMode()) {
+            int pg = ViewPdfPage() + 1, tot = ViewPdfPageCount();
+            if (!g_book.chapters.empty() && ch >= 0) {
+                wsprintfW(buf, L"%d.%d%%  ·  第 %d/%d 页  ·  %d/%d 章", pct / 10, pct % 10,
+                          pg, tot, ch + 1, (int)g_book.chapters.size());
+            } else {
+                wsprintfW(buf, L"%d.%d%%  ·  第 %d/%d 页", pct / 10, pct % 10, pg, tot);
+            }
+        } else if (!g_book.chapters.empty()) {
             // 有章节时一律显示"第几个/共几个章"；还没进入第一章（书名、作者等开篇文字）时显示总章数
             if (ch >= 0) {
                 wsprintfW(buf, L"%d.%d%%  ·  %d/%d 章", pct / 10, pct % 10,
@@ -1791,6 +1802,9 @@ static HMENU BuildMenu()
     AppendMenuW(r, MF_STRING, IDM_AUTO_SLOW, L"下滑减速\tF7");
     AppendMenuW(r, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(r, MF_STRING, IDM_TOC, L"显示/隐藏目录\tCtrl+T");
+    /* PDF 专用：原始版式（整页渲染，版式 100% 还原）与文字重排（可搜索、可换字体）之间切换。
+       不是 PDF 时这条会被 UiSyncMenuState 置灰，避免用户按了没反应。 */
+    AppendMenuW(r, MF_STRING, IDM_PDF_MODE, L"PDF 原始版式（F9 切换）\tF9");
 
     /* 书签子菜单：加 / 看 / 删。删除不给快捷键 —— 删数据不该有"顺手就按到"的键。 */
     HMENU bm = CreatePopupMenu();
@@ -1888,8 +1902,10 @@ static void ShowKeys()
  */
 static void ShowAbout()
 {
-    std::wstring m = L"轻量小说阅读器\n\n";
-    m += L"支持 TXT / EPUB / HTML / Markdown / DOCX 等格式；\n";
+    std::wstring m = L"轻量小说阅读器  NovelReader\n\n";
+    m += L"第一作者：chenzy0623\n";
+    m += L"第二作者：xuanmo 的大肥鱼\n\n";
+    m += L"支持 TXT / EPUB / PDF / HTML / Markdown / DOCX 等格式；\n";
     m += L"文本编码自动识别：UTF-8 / GBK(GB18030) / UTF-16；\n";
     m += L"自动识别“第 N 章”等章节标题；\n";
     m += L"首页书架显示每本书读到第几章、共几章、百分之多少；\n";
@@ -2012,6 +2028,37 @@ void UiToggleSidebar()
     if (g_set.sidebar) s_panel = 0;
     UiLayout();
     IniSetInt(L"settings", L"sidebar", g_set.sidebar);
+}
+
+/* 在「PDF 原始版式」与「文字重排」之间切换（菜单 / F9）。无参数。
+ * 为什么需要这个开关：文字重排能搜索、能换字体、能夜间配色，但会把 PDF 的
+ * 分栏、表格、图片丢掉；原始版式则 100% 还原版式，代价是那一屏的字搜不了。
+ * 两种模式给不同场景用，所以让用户自己随时切，而不是替他选一种。
+ * 边界：没开书 / 不是 PDF 时给出提示而不是静默失败（静默会让人以为是程序坏了）；
+ * 渲染器打不开（加密 PDF、系统组件缺失）时保持文字模式并说明原因。 */
+void UiTogglePdfMode()
+{
+    if (!g_book.Ok()) {
+        MessageBoxW(g_hMain, L"请先打开一个 PDF 文件。", L"提示", MB_ICONINFORMATION);
+        return;
+    }
+    if (!PdfIsPdf(g_book.path)) {
+        MessageBoxW(g_hMain, L"「原始版式」只对 PDF 文件有效。\n当前这本是重排后的文本，已经是最好的显示方式了。",
+                    L"提示", MB_ICONINFORMATION);
+        return;
+    }
+    bool want = !ViewIsPdfMode();
+    if (!ViewSetPdfMode(want)) {
+        MessageBoxW(g_hMain,
+                    L"这个 PDF 无法按原始版式渲染。\n"
+                    L"可能是加密文件、扫描件，或者系统的 PDF 组件不可用。\n"
+                    L"继续用文字重排模式阅读不影响搜索与书签。",
+                    L"提示", MB_ICONWARNING);
+        return;
+    }
+    /* 状态栏第三格要从"第几章"变成"第几页"（反之亦然），所以立刻刷一次 */
+    UiUpdateStatus();
+    ViewFocus();
 }
 
 /* ---------------- 自动下滑 ---------------- */
@@ -2202,6 +2249,7 @@ static void OnCommand(int id, int code, HWND ctl)
     case IDM_BM_ADD:      UiAddBookmark(); break;
     case IDM_BM_LIST:     UiShowBookmarks(); break;
     case IDM_BM_DEL:      UiDelBookmark(); break;
+    case IDM_PDF_MODE:    UiTogglePdfMode(); break;
     case IDM_OPEN_URL:    UiOpenWebNovel(); break;
     case IDM_PICK_FONT:   UiPickFont(); break;
     case IDM_IMPORT_FONT: UiImportFont(); break;
@@ -2448,6 +2496,7 @@ static HACCEL BuildAccel()
         { FVIRTKEY,                        VK_F6,       IDM_AUTO_TOGGLE },
         { FVIRTKEY,                        VK_F7,       IDM_AUTO_SLOW },
         { FVIRTKEY,                        VK_F8,       IDM_AUTO_FAST },
+        { FVIRTKEY,                        VK_F9,       IDM_PDF_MODE },
         { FVIRTKEY | FCONTROL,             VK_OEM_PLUS, IDM_FONT_UP },
         { FVIRTKEY | FCONTROL,             VK_ADD,      IDM_FONT_UP },
         { FVIRTKEY | FCONTROL,             VK_OEM_MINUS, IDM_FONT_DOWN },

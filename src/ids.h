@@ -72,6 +72,7 @@
 #define IDM_OPEN_URL    1280    /* 从网址打开：抓网页正文（后续做成整本抓取） */
 #define IDM_PHONE        1290   /* 手机阅读：开局域网服务并显示地址 */
 #define IDM_PHONE_JUMP   1291   /* 跳到手机端最近读到的位置 */
+#define IDM_PDF_MODE     1292   /* PDF 原始版式 / 文字重排 切换（F9，仅 PDF 有效） */
 
 /* ---- 子控件 ID ---- */
 #define IDC_TOC         2001    /* 左侧章节目录 LISTBOX */

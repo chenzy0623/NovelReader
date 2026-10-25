@@ -1,16 +1,18 @@
 # 小说阅读器 NovelReader
 
 一个**单文件、免安装、零依赖**的 Windows 小说阅读器。用 C++17 + Win32 从零写成，
-**513 KB** 一个 exe，双击就能用，不写注册表、不装运行库、不需要联网。
+**530 KB** 一个 exe，双击就能用，不写注册表、不装运行库、不需要联网。
 
 支持 **TXT / EPUB / PDF / DOCX / HTML / Markdown**，自动识别章节，全文搜索，
 记忆阅读位置，自动下滑，书签，换字体，自定义配色，还能直接把网页小说抓成本地书。
 
-![版本](https://img.shields.io/badge/version-1.1.0-blue)
-![体积](https://img.shields.io/badge/size-513%20KB-brightgreen)
+![版本](https://img.shields.io/badge/version-1.2.0-blue)
+![体积](https://img.shields.io/badge/size-530%20KB-brightgreen)
 ![平台](https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-lightgrey)
 ![依赖](https://img.shields.io/badge/dependencies-none-success)
 ![许可](https://img.shields.io/badge/license-MIT-orange)
+
+**作者**：[chenzy0623](https://github.com/chenzy0623)（第一作者） · xuanmo 的大肥鱼（第二作者）
 
 ---
 
@@ -18,8 +20,8 @@
 
 到 [Releases](https://github.com/chenzy0623/NovelReader/releases) 下载最新版：
 
-- **[NovelReader-1.1.0-win64.zip](https://github.com/chenzy0623/NovelReader/releases/download/v1.1.0/NovelReader-1.1.0-win64.zip)**（推荐，含使用说明和示例小说）
-- [单个 NovelReader.exe](https://github.com/chenzy0623/NovelReader/releases/download/v1.1.0/NovelReader.exe)（只要程序本体）
+- **[NovelReader-1.2.0-win64.zip](https://github.com/chenzy0623/NovelReader/releases/download/v1.2.0/NovelReader-1.2.0-win64.zip)**（推荐，含使用说明和示例小说）
+- [单个 NovelReader.exe](https://github.com/chenzy0623/NovelReader/releases/download/v1.2.0/NovelReader.exe)（只要程序本体）
 
 解压任意目录，双击 `NovelReader.exe` 即可。**绿色版**：阅读进度存在 exe 同目录的
 `NovelReader.ini`（目录不可写时自动改用 `%APPDATA%\NovelReader\`），删掉 ini 就等于恢复出厂。
@@ -40,6 +42,7 @@
 | 字体 | 系统字体随便选，也能**导入 ttf/otf/ttc 字体文件**私有加载（不污染系统字体库） |
 | 配色 | 日间 / 夜间 / 护眼绿 / 羊皮纸 / 高对比暗 五种预设，还能逐项自定义背景、正文、标题、选中、悬停色 |
 | 多格式 | TXT、EPUB、PDF、DOCX、HTML、Markdown，以及任意扩展名的纯文本 |
+| PDF 两种看法 | 默认抽文字重排（能搜索、能换字体）；`F9` 切「原始版式」，整页按原样渲染，图表、分栏、字体效果一点不走样 |
 | 网页抓书 | `Ctrl+U` 输入目录页网址，自动找目录、逐章抓取，存成本地书 |
 | 手机阅读 | 局域网 HTTP 服务，手机浏览器直接读（菜单位置：帮助 → 手机阅读） |
 | 大文件 | 14.7 MB / 8794 章实测 0.8 秒载入，只渲染可视区域，滚动不掉帧 |
@@ -86,9 +89,13 @@
 
 ![字体](https://github.com/chenzy0623/NovelReader/raw/main/screenshots/14-font.png)
 
-PDF（抽出文字后重排，可搜索、可换字体）：
+PDF 文字重排（可搜索、可换字体、夜间模式）：
 
 ![PDF](https://github.com/chenzy0623/NovelReader/raw/main/screenshots/13-pdf.png)
+
+PDF 原始版式（`F9`，整页按原样渲染，右下角显示页码）：
+
+![PDF 原始版式](https://github.com/chenzy0623/NovelReader/raw/main/screenshots/13-pdf-layout.png)
 
 EPUB：
 
@@ -106,7 +113,7 @@ EPUB：
 |---|---|---|
 | `.txt` | 直接解码 | 自动识别 UTF-8 / GBK / GB18030 / UTF-16 LE、BE（带 BOM 或自动猜测） |
 | `.epub` | 内建 zip 解压 + 解析 OPF | 按 `spine` 顺序读，章节顺序跟原书一致 |
-| `.pdf` | 内建 PDF 解析器 | 抽出文字层后**重新排版**（可搜索、换字体、夜间模式）；扫描版/图片型 PDF 没有文字层，读不出内容 |
+| `.pdf` | 内建 PDF 解析器 + 系统 `Windows.Data.Pdf` 渲染 | 两种看法：默认抽出文字层**重新排版**（可搜索、换字体、夜间模式）；`F9` 切**原始版式**整页渲染，版式 100% 还原。扫描版/图片型 PDF 没有文字层，文字模式读不出内容，但原始版式照样能看 |
 | `.docx` | 内建 zip 解压 + 读 `word/document.xml` | 只取段落文字，表格内容会按行拼进来；图片不显示 |
 | `.html` `.htm` | 去标签取正文 | 解码实体（`&ldquo;` 等），跳过 script/style/head |
 | `.md` | 去掉标记符号 | `#` 标题变章节名，列表/引用/加粗记号剥掉 |
@@ -131,6 +138,7 @@ EPUB：
 | `↑` `↓` `←` `→` | 逐行 / 逐字滚动 | `Home` / `End` | 全书开头 / 结尾 |
 | `Alt+←` / `Alt+→` | 上一章 / 下一章 | `F5` | 重新加载当前书 |
 | `Ctrl+C` / `Ctrl+A` | 复制选中 / 全选 | `F1` | 快捷键说明 |
+| `F9` | PDF：文字重排 / 原始版式切换 | `Ctrl+Shift+G` | 跳到手机上读到的位置 |
 
 鼠标：滚轮滚动，拖滚动条，点目录跳章，双击页边距快速翻页，拖动即可选中文字（松开自动复制）。
 
@@ -225,6 +233,7 @@ NovelReader/
 │  ├─ format.cpp/.h      EPUB / DOCX / HTML / Markdown 抽正文
 │  ├─ zip.cpp/.h         自写 zip 容器 + DEFLATE (RFC1951) 解压
 │  ├─ pdf.cpp/.h         自写 PDF 解析：对象扫描、FlateDecode、ToUnicode、文本重建
+│  ├─ pdfrender.cpp/.h   用系统 Windows.Data.Pdf 把整页渲染成位图（原始版式）
 │  ├─ web.cpp/.h         网页小说抓取（WinInet + 目录识别 + 逐章下载）
 │  ├─ server.cpp/.h      手机阅读：局域网 HTTP 服务
 │  ├─ ini.cpp            ini 读写、设置与阅读进度、书架数据
@@ -246,9 +255,13 @@ NovelReader/
   行，段落行数懒计算，滚动永远跟手。
 - **为什么自己写 zip 和 DEFLATE**：为了 EPUB / DOCX 引 zlib 要多 100 KB 以上；
   手写一份 RFC1951 解压器不到 30 KB，还省掉了 DLL 依赖。
-- **为什么 PDF 抽文字而不是渲染页面**：渲染成图片后没法搜索、没法换字体、夜间模式
-  也白搭，而且一页 5 MB 的位图在 14 MB 的书里会直接把内存吃光。抽文字重排后，
-  PDF 和 TXT 走完全一样的阅读管线。
+- **PDF 为什么两种看法都留着**：渲染成图片版式最忠实，但那一屏的字搜不了、换不了字体、
+  夜间模式也白搭；抽文字重排能搜索能排版，但分栏 / 表格 / 图片会丢。所以两条路都做，
+  `F9` 让用户按场景自己选，两种模式共用同一份文字，阅读位置、章节、书签都连续。
+- **为什么手写 WinRT 接口声明**：MinGW 没有 C++/WinRT 也没有 `windows.data.pdf.h`，
+  于是按 Windows 元数据把 `IPdfDocument`、`IPdfPage`、`IPdfPageRenderOptions` 的虚表
+  逐个手写出来，再用 `RoGetActivationFactory` 拿工厂 —— 只花了几百行，省掉一个 MSVC
+  工具链，也不用多带任何 DLL。
 - **为什么限制单实例**：两个实例同时写同一份 ini 会互相覆盖进度，用户会看到
   "读到一半的进度莫名其妙回退"。现在第二个实例把自己的文件参数转发给第一个就退出。
 
@@ -263,7 +276,7 @@ NovelReader/
 | 全文搜索 7 万字 | 即时（`< 20 ms`） |
 | 全文搜索 14.7 MB | 约 120 ms（一次性扫完，结果可到 4000 条） |
 | 内存占用（14.7 MB 的书） | 约 60 MB（正文 + 段落索引 + 章节表） |
-| 程序体积 | 513 KB（静态链接，无 DLL 依赖） |
+| 程序体积 | 530 KB（静态链接，无 DLL 依赖） |
 
 ---
 
@@ -278,8 +291,10 @@ NovelReader/
 **进度丢了？** 进度写在 exe 同目录的 `NovelReader.ini`。如果程序放在只读目录，
 会自动改写到 `%APPDATA%\NovelReader\NovelReader.ini`。
 
-**PDF 打开是空白？** 说明这份 PDF 没有文字层（扫描件），或者用了对象流压缩 / 加密。
-本程序只做文字抽取，不做 OCR。
+**PDF 打开是空白？** 说明这份 PDF 没有文字层（扫描件），或者用了对象流压缩 / 加密 ——
+这种情况下文字模式读不出内容，但按 `F9` 切到「原始版式」照样能一页页看（版式按原样渲染）。
+
+**PDF 原始版式字太小？** 把窗口拉大即可等比放大；想换字体、调配色、搜索，`F9` 切回文字重排。
 
 **网页抓取失败？** 检查网址是否为目录页、站点是否需要登录（本程序不带 cookie），
 以及本机代理设置；抓取时会先走系统代理，失败再直连重试。
@@ -294,3 +309,13 @@ NovelReader/
 ## 许可
 
 MIT License，见 [LICENSE](LICENSE)。
+
+## 作者
+
+| 顺序 | 作者 | 分工 |
+| --- | --- | --- |
+| 第一作者 | [chenzy0623](https://github.com/chenzy0623) | 需求、设计取舍、验收与发布 |
+| 第二作者 | xuanmo 的大肥鱼 | 编码、调试、文档与截图 |
+
+Copyright (c) 2025 chenzy0623, xuanmo 的大肥鱼
+

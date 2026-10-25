@@ -1,4 +1,4 @@
-﻿NovelReader 1.1.0 —— 源码说明与编译方法
+﻿NovelReader 1.2.0 —— 源码说明与编译方法
 ==========================================
 
 这个文件夹里是阅读器的全部源码：纯 C++17 + Win32 API，没有任何第三方库
@@ -7,6 +7,8 @@
 
 源码里每个文件的开头都有一段中文说明，讲这个文件负责什么、关键决定为什么这么做；
 重要函数和容易踩坑的地方都有逐段注释。
+
+作者：chenzy0623（第一作者） · xuanmo 的大肥鱼（第二作者）
 
 
 一、目录结构
@@ -20,9 +22,13 @@
                         epub 读 container.xml → OPF → spine 顺序拼章节
   源码\src\zip.h        zip 模块的声明（ZipArchive / InflateRaw）
   源码\src\zip.cpp      zip 中央目录解析 + DEFLATE 解压（RFC 1951 三种块，自己实现）
-  源码\src\pdf.h        PDF 模块的声明（PdfIsPdf / PdfExtractText）
+  源码\src\pdf.h        PDF 模块的声明（PdfIsPdf / PdfExtractText / PdfLastPageOffsets）
   源码\src\pdf.cpp      PDF 解析：对象扫描、FlateDecode、字体与 ToUnicode CMap、
-                        内容流文本算子、按坐标重建段落
+                        内容流文本算子、按坐标重建段落、每页起始偏移表
+  源码\src\pdfrender.h  PDF「原始版式」渲染的声明
+  源码\src\pdfrender.cpp 用系统 Windows.Data.Pdf 把整页渲染成位图：
+                        手写 IPdfDocument / IPdfPage / IPdfPageRenderOptions 的
+                        WinRT 接口，RoGetActivationFactory 取工厂，GDI+ 解 PNG
   源码\src\web.h        网页抓书的声明（WebFetchUrl / WebFetchBook / WebIsUrl）
   源码\src\web.cpp      网页抓书：WinInet 抓取（系统代理失败自动直连重试）、
                         目录页链接识别、逐章下载、去导航行、写缓存文件
@@ -62,17 +68,21 @@ build.bat 会做两件事：
       -municode -mwindows -ffunction-sections -fdata-sections -Wall -Wextra ^
       -Wl,--gc-sections -Wl,-s -static -static-libgcc -static-libstdc++ ^
       src\book.cpp src\ini.cpp src\view.cpp src\ui.cpp src\zip.cpp ^
-      src\format.cpp src\web.cpp src\pdf.cpp src\server.cpp ^
+      src\format.cpp src\web.cpp src\pdf.cpp src\pdfrender.cpp src\server.cpp ^
       build\app.res -o build\NovelReader.exe ^
       -lcomctl32 -lcomdlg32 -lshell32 -lole32 -lgdi32 -luser32 -ladvapi32 ^
-      -lwininet -lws2_32 -liphlpapi
+      -lgdiplus -lshcore -lruntimeobject -lwininet -lws2_32 -liphlpapi
 
 说明：
   -static -static-libgcc -static-libstdc++   不依赖任何 DLL
   -Wl,-s                                    去符号表，省几百 KB
   -municode -mwindows wWinMain 入口，无控制台窗口
+  -lgdiplus -lshcore -lruntimeobject        PDF 原始版式：GDI+ 解 PNG、WinRT 激活
   -lwininet                                 网页抓书用的 WinInet
   -lws2_32 -liphlpapi                       手机阅读服务的 socket 与网卡枚举
+
+注意：pdfrender.cpp 自己把 _WIN32_WINNT 改成 0x0A00（上面命令行传的是 0x0601），
+因为它要用 Win10 才有的 CreateRandomAccessStreamOnFile；文件顶部用 #undef 覆盖。
 
 注意：build.bat / build_dbg.bat 是 GBK 编码 + CRLF 换行，别用 UTF-8 编辑器
 另存，否则 cmd 会把中文提示行拆碎。
@@ -92,25 +102,35 @@ build.bat 会做两件事：
    为了 EPUB / DOCX 引 zlib 要多一百多 KB；手写 RFC 1951 解压器不到 30 KB，
    还省掉一个 DLL 依赖。
 
-4. PDF 为什么抽文字而不渲染页面
-   渲染成位图后没法搜索、没法换字体、夜间模式也白废；而且大页位图很吃内存。
-   抽文字重排后，PDF 和 TXT 走完全一样的阅读管线（分章、搜索、记忆位置全都能用）。
+4. PDF 为什么要做两套（抽文字 + 原始版式）
+   只渲染位图：那一屏的字搜不了、换不了字体、夜间配色也白废；
+   只抽文字：分栏、表格、插图、原字体效果全丢。
+   所以两条路都做，F9 让用户按场景选。两者共用同一份文字与同一套阅读位置，
+   切换时靠 pdf.cpp 导出的「每页起始字符偏移」（PdfLastPageOffsets）互相换算。
 
-5. 网页抓书怎么判断"哪一行是章节标题"
+5. 原始版式怎么在 MinGW 下调到 Windows.Data.Pdf
+   MinGW 没有 C++/WinRT，也没有 windows.data.pdf.h。于是按 Windows 运行时的
+   元数据手写 IPdfDocument / IPdfPage / IPdfPageRenderOptions / IAsyncInfo 的
+   虚表，用 RoGetActivationFactory 取静态工厂、IActivationFactory::ActivateInstance
+   造渲染参数对象，异步用轮询 get_Status 等结果，最后用 GDI+ 把 PNG 解成 HBITMAP。
+   一个坑：渲染出的位图归页面缓存所有，视图里千万不能 DeleteObject，否则下一帧
+   拿去 StretchBlt 的是个野句柄（表现是"翻页后整块变背景色，只剩页码"）。
+
+6. 网页抓书怎么判断"哪一行是章节标题"
    复用分章规则 BookLooksLikeChapterTitle()，和本地文件的分章逻辑完全一致；
    抓完一章后先丢导航行（上一章/下一章/目录/返回目录…），再丢掉"与章节标题
    重复的那一行"，最后连续空行压成一行。
 
-6. 手机阅读为什么是网页而不是 APK
+7. 手机阅读为什么是网页而不是 APK
    开发环境没有 Java / Android SDK，打包不出能装到手机上的 APK；局域网网页
    方案不用安装、不受应用商店限制，进度还能和电脑共用同一份 ini。
 
-7. 进度与书架
+8. 进度与书架
    NovelReader.ini 里每本书一个段（段名是路径的 FNV-1a 哈希），记 off（字符
    偏移）+ chname（章名）+ ch/chn（第几章/共几章）+ pct（千分数）+ title。
    书架就是把这些段按最近打开顺序读出来。
 
-8. 为什么限制单实例
+9. 为什么限制单实例
    两个窗口同时写同一份 ini 会互相覆盖进度。现在第二个实例用 WM_COPYDATA
    把文件参数转发给第一个就退出。
 
@@ -128,6 +148,7 @@ trace 覆盖：菜单命令分发、搜索链路、自动下滑的定时器、�
   ui.cpp      2600 行      主窗口与全部交互
   view.cpp    1300 行      排版与绘制
   pdf.cpp      900 行      PDF 解析
+  pdfrender.cpp 590 行     PDF 原始版式渲染（WinRT + GDI+）
   server.cpp   650 行      局域网阅读服务
   web.cpp      700 行      网页抓书
   format.cpp   640 行      EPUB/DOCX/HTML/MD 抽正文

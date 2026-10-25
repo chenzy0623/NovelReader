@@ -21,6 +21,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 // 判断扩展名是不是 .pdf（大小写不敏感）
 bool PdfIsPdf(const std::wstring& path);
@@ -32,5 +33,9 @@ bool PdfIsPdf(const std::wstring& path);
 //   err      ：失败时的中文原因（给界面直接显示）
 // 返回 false 表示这份 PDF 读不出文字（加密、扫描件、结构损坏等）。
 bool PdfExtractText(const uint8_t* data, size_t len, std::wstring& text, std::wstring& err);
+
+// 最近一次 PdfExtractText 得到的"每页正文起始字符偏移"（元素个数 = 页数）。
+// 视图的"原始版式"模式要靠它把字符偏移换算成页码，搜索命中也用它跳到对应页。
+const std::vector<uint32_t>& PdfLastPageOffsets();
 
 #endif // NR_PDF_H
