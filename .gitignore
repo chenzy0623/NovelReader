@@ -1,0 +1,24 @@
+# 编译产物
+build/
+*.res
+*.o
+*.obj
+
+# 仓库里只保留 dist/NovelReader.exe 这一份成品（发版用）
+*.exe
+!dist/NovelReader.exe
+
+# 运行时生成的本地状态
+NovelReader.ini
+nr_trace.log
+
+# 开发时的临时目录（大文件测试书、注释改造前的源码备份）
+test/
+src_snapshot/
+
+# 编辑器 / 系统垃圾
+.vs/
+.vscode/
+*.user
+Thumbs.db
+desktop.ini

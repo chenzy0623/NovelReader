@@ -1,0 +1,10 @@
+/* app.rc.  Resource script: program icon + manifest.
+   Keep this file PURE ASCII: windres reads .rc in the ANSI code page, so
+   Chinese text here would be garbled (or break the build).
+   - IDI_APP           : application icon (res/app.ico)
+   - RT_MANIFEST (24)  : comctl32 v6 + DPI aware manifest              */
+#include "ids.h"
+
+IDI_APP ICON "res/app.ico"
+
+1 24 "res/app.manifest"

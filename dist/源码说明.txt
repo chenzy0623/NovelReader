@@ -1,0 +1,146 @@
+﻿NovelReader —— 源码说明与编译方法
+==========================================
+
+这个文件夹里是阅读器的全部源码，纯 C++ / Win32 API，没有任何第三方库
+（连 zip 解压都是自己写的），编译出来就是一个 380 KB 的独立 exe
+（静态链接，不带 DLL）。
+
+
+一、目录结构
+------------------------------------------
+  源码\src\ids.h        菜单 / 控件 / 资源 ID 常量
+  源码\src\common.h     公共数据结构（Book、Settings、ShelfItem…）和所有模块的函数声明
+  源码\src\book.cpp     打开文件：编码识别（UTF-8 / GBK / UTF-16）、多格式分派、
+                        正文整理、段落索引、章节识别、全文搜索
+  源码\src\format.h     多格式入口的声明（epub/docx 走 zip，html/md 去标记）
+  源码\src\format.cpp   抽取纯文本：HTML/Markdown 去标记、docx 取 w:p/w:t、
+                        epub 读 container.xml → OPF → spine 顺序拼章节
+  源码\src\zip.h        zip 模块的声明（ZipArchive / InflateRaw）
+  源码\src\zip.cpp      zip 中央目录解析 + DEFLATE 解压（RFC 1951 三种块，自己实现）
+  源码\src\view.cpp     阅读视图：首页书架、自绘排版、换行、滚动、选中、绘制、
+                        侧栏折叠条
+  源码\src\ini.cpp      配置与阅读进度的读写（NovelReader.ini）、书架数据
+  源码\src\ui.cpp       主窗口、菜单、目录、搜索条、搜索面板、状态栏、
+                        自动下滑、单实例
+  源码\src\trace.cpp    调试用日志（只在定义 NR_TRACE 时编入，正式版不包含）
+  源码\res\app.rc       资源脚本（图标 + manifest，必须保持纯 ASCII）
+  源码\res\app.manifest 清单：视觉样式 6.0、DPI 感知、长路径支持
+  源码\res\app.ico      程序图标（16~256 多尺寸）
+  源码\build.bat        一键编译正式版（输出 build\NovelReader.exe）
+  源码\build_dbg.bat    编译带 trace 日志的调试版（输出 build\NovelReader_dbg.exe）
+
+
+二、需要什么工具
+------------------------------------------
+  Windows + LLVM-MinGW（本机在 D:\llvm-mingw）。
+  只要 g++.exe / windres.exe 就能编译；用 MSVC 也可以，但需要自己
+  把 build.bat 里的命令行换成 cl 的写法。
+
+  build.bat 第 9 行 set BIN=D:\llvm-mingw\bin 是编译器路径，
+  换机器时改这一行即可。
+
+
+三、编译
+------------------------------------------
+  双击 源码\build.bat（或者在 cmd 里运行它）。
+  过程：
+    1) windres 把 res\app.rc 编成 build\app.res（图标 + 清单）
+    2) g++ 编译 src 下所有 .cpp 并链接
+  成功后会打印输出文件大小，产物在 源码\build\NovelReader.exe。
+  编译参数要点（都在 build.bat 里）：
+    -std=gnu++17 -O2 -DUNICODE -D_UNICODE -D_WIN32_WINNT=0x0601
+    -municode -mwindows              （WinMain 用 wWinMain，无控制台窗口）
+    -ffunction-sections -fdata-sections -Wl,--gc-sections   （去掉没用的代码，减小体积）
+    -static -static-libgcc -static-libstdc++                （静态链接，不依赖 DLL）
+    -Wl,-s                                                  （去掉符号表）
+    -lcomctl32 -lcomdlg32 -lshell32 -lole32 -lgdi32 -luser32 -ladvapi32
+
+  注意：res\app.rc 里的图标 / 清单路径是相对"当前目录"解析的，
+  所以脚本里先 cd 到源码目录再调 windres；批处理文件名里的中文
+  在 GBK 下最稳，build.bat 本身就是 GBK 编码保存的，别用 UTF-8 重存。
+
+
+四、实现要点（想改代码时看这里）
+------------------------------------------
+  · 大文件为什么快
+      打开时把正文统一转成 UTF-16 存进一条 std::wstring，另外存一个
+      段落偏移数组 paraOff（第 i 段从第几个字符开始）。排版是"懒计算"：
+      每段有多少视觉行只有真走到那段才算一次并缓存（lineCnt[]），
+      窗口宽度或字号变了就把缓存全部作废重算。绘制时只画屏幕上那几十行。
+
+  · 滚动锚点
+      当前位置记的是"第几段 + 段内第几个视觉行"，窗口大小变化时用
+      字符偏移（s_aOff）做真相，反算回 (para, line)，这样放大窗口、
+      改字号都不会跳行。阅读进度保存的是字符偏移，所以换字号也不丢位置。
+
+  · 编码识别顺序（book.cpp 的 DecodeBytes）
+      1. 有 BOM：UTF-8 / UTF-16LE / UTF-16BE
+      2. 没有 BOM 但大量 "字符 + 0x00" 交替：当 UTF-16LE
+      3. 能按 UTF-8 严格解码并且含中文：当 UTF-8
+      4. 否则用 GB18030(54936) 解码，失败再退 GBK(936) / 系统 ANSI 代码页
+
+  · 多格式（book.cpp 的 BookLoad 三路分派 + format.cpp）
+      按扩展名分三路，最后都汇成"纯文本 + '\n' 分段"这一种形态：
+        1) .epub / .docx：zip 容器，交给 FormatFromZip 抽正文
+        2) .html / .htm / .md：先按上面的编码规则解码，再剥标签 / Markdown 记号
+        3) 其它（.txt 或任意扩展名）：原样走纯文本管线
+      好处是分章、搜索、进度、书架这些逻辑一份都不用改。
+
+  · zip 与 DEFLATE（zip.cpp）
+      自己解析 EOCD / 中央目录 / 本地头，解压支持 stored 和 DEFLATE
+      三种块（stored、固定 Huffman、动态 Huffman），重叠回溯逐字节拷贝。
+      ZIP64、加密、bzip2/lzma 这些不支持，遇到会明确返回失败而不是瞎解。
+      这样既不需要链接 zlib，exe 也只多了约 60 KB。
+
+  · EPUB / DOCX 取哪部分（format.cpp）
+      EPUB：META-INF/container.xml 找 OPF → 读 manifest(id→href) 与 spine
+            顺序 → 每章 StripHtml → 章与章之间插空行
+      DOCX：只读 word/document.xml，认 <w:p>（段落）、<w:t>（文字）、
+            <w:br>/<w:cr>（换行）、<w:tab>（制表符），再做实体解码
+      HTML：状态机四态（文本 / 标签 / 注释 / 整段丢弃），
+            <script> <style> <head> <title> 整段跳过；
+            块级标签补换行，表格单元格之间补空格
+
+  · 章节识别（book.cpp 的 IsChapterLine）
+      逐段判断：去掉首尾空白后长度 <= 60、不含 '。'，
+      再匹配 序章/楔子/番外/终章/大结局、Chapter N、
+      以及 第[数字或中文数字]+[章节回卷集篇幕话]；
+      对 回/节/篇 还额外排除「第三回合」「第节课」这类误判。
+
+  · 阅读进度存哪
+      ini 段名 = "f" + 书路径小写后的 FNV-1a 哈希（8 位十六进制），
+      键 off = 字符偏移，另外存 chname（章名）/ ch / chn / pct / title
+      给首页书架显示。滚动后 2.5 秒防抖写盘，另外每 15 秒兜底一次，
+      关窗口时再写一次。
+      ini 优先放 exe 同目录；那里不可写时退回 %APPDATA%\NovelReader\。
+      第一次创建 ini 时会先写一个 UTF-16 BOM，保证中文路径不被按 ANSI 写坏。
+
+  · 首页书架（ini.cpp 的 ShelfRefresh + view.cpp 的 DrawHome）
+      数据源就是 ini 里的 [recent] r0..r9 加各书自己的段：
+      所以书架天然按"最近阅读"倒序，不需要另存一份书单。
+      文件被删/改名时用 GetFileAttributesW 判出来并灰掉。
+
+  · 目录折叠（ui.cpp 的 DrawFoldBar + UiLayout）
+      侧栏底部一条自绘按钮（BS_OWNERDRAW）：展开时是横条「< 收起目录」，
+      收起后变成左边缘 S(18) 宽的竖条只画「>」，正文左边界跟着挪。
+      箭头特意用半角 < >，因为系统界面字体里没有 ‹ › 字形。
+
+  · 自动下滑
+      SetTimer(TIMER_AUTO) 的周期 = 3000 / 速度等级（1 级 3 秒一行，
+      10 级 0.3 秒一行），每次定时器只滚一行。用户有任何手动操作
+      （滚轮、按键、点目录、搜索跳转）都会调用 UiAutoStop() 停掉。
+
+  · 单实例（ui.cpp 的 wWinMain）
+      命名互斥量 Local\NovelReader_SingleInstance_v1 探测；
+      已有实例时把命令行文件用 WM_COPYDATA 递过去并激活旧窗口，
+      新进程直接退出 —— 避免两个进程互相覆盖同一份 ini。
+
+
+五、想继续加功能的话
+------------------------------------------
+  · 改字号范围 / 行距档位：view.cpp 的 kSpacing[] 和 ui.cpp 里字号夹取范围
+  · 加新的章节写法：book.cpp 的 IsChapterLine
+  · 加主题配色：view.cpp 顶部的 kDay / kNight 两个 Theme 常量
+  · 中文字体：view.cpp 里用的是 "Microsoft YaHei"，可换成别的
+  · 支持 PDF：工作量在渲染，不是抽文字，建议用现成库而不是自己写
+  · 想支持 mobi / azw3：它们不是 zip 容器，得另写解析（PalmDOC / KF8）
