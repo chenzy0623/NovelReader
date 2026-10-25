@@ -24,6 +24,8 @@
 #include "common.h"
 /* 多格式入口：BookLoad 里按扩展名分派到 format.cpp（epub/docx/html/md → 纯文本） */
 #include "format.h"
+/* PDF 入口：pdf.cpp 自己解析 PDF 结构，抽出带段落换行的纯文本 */
+#include "pdf.h"
 #include <cwchar>
 #include <cstring>
 #include <algorithm>
@@ -381,7 +383,18 @@ bool BookLoad(Book& b, const std::wstring& path, std::wstring* err)
      * 章节识别、全文搜索、位置记忆一行都不用改。
      */
     std::wstring w;
-    if (FormatIsZipContainer(path)) {
+    if (PdfIsPdf(path)) {
+        /* ---- PDF：抽文字 ----
+         * PDF 是页面描述语言，不是"文本文件"：要自己扫对象 → 解字体 ToUnicode
+         * → 解文本算子，才能拿到字。抽出来同样是"纯文本 + '\n' 分段"，所以
+         * 分章、搜索、书签、进度记忆全都不用改。
+         */
+        std::wstring perr;
+        if (!PdfExtractText((const uint8_t*)buf.data(), buf.size(), w, perr)) {
+            if (err) *err = perr.empty() ? L"这份 PDF 里没有可显示的正文" : perr;
+            return false;
+        }
+    } else if (FormatIsZipContainer(path)) {
         std::wstring ferr;
         if (!FormatFromZip(path, buf.data(), buf.size(), w, ferr)) {
             if (err) *err = ferr.empty() ? L"这个文件里没有可显示的正文" : ferr;
@@ -580,4 +593,34 @@ void BookSearch(const Book& b, const std::wstring& needle, std::vector<Hit>& out
         out.push_back(h);
         from = p + (hl > 0 ? hl : 1);
     }
+}
+
+/* ============================================================================
+ * 下面三个小函数是给 web.cpp（网页抓书）用的"桥"。
+ * 为什么要在这里加，而不是让 web.cpp 自己实现一份：
+ *   - BytesToText 必须和本文件里的 DecodeBytes 用**完全同一套编码判定**，
+ *     否则会出现"网页上显示正常、存到本地打开是乱码"这种最难查的问题；
+ *   - BookLooksLikeChapterTitle 必须和分章逻辑用同一个判定，
+ *     否则抓下来的 chapter 链接会被切成"假章节"或者一章都切不出来。
+ * 都是薄薄一层包装，不引入新逻辑。
+ * ========================================================================== */
+
+/* 任意字节流（HTTP 响应体、剪贴板里的 HTML 等）→ 宽字符串。
+ * 内部就是 DecodeBytes，所以 BOM / UTF-16LE / UTF-8 / GB18030 全部照样认。
+ * 参数 s：原始字节。返回：解码后的文本（失败也尽量返回能看的东西，不抛异常）。 */
+std::wstring BytesToText(const std::string& s)
+{
+    std::vector<char> v(s.begin(), s.end());
+    return DecodeBytes(v);
+}
+
+/* 这一行（段落）看起来是不是"章节标题"。给网页抓取用：网页目录里的
+ * <a>第12章 xxx</a> 链接文字，要用同一套规则判断，才能保证抓下来的目录
+ * 与本程序的分章结果一致。
+ * 参数 line：去掉首尾空白之后的整行文本。返回：是章节标题返回 true。 */
+bool BookLooksLikeChapterTitle(const std::wstring& line)
+{
+    if (line.empty()) return false;
+    int o1 = 0, o2 = 0;
+    return IsChapterLine(line, 0, (int)line.size(), &o1, &o2);
 }

@@ -14,7 +14,7 @@ if errorlevel 1 goto fail
 "%BIN%\g++.exe" -std=gnu++17 -O1 -g -DNR_TRACE -DUNICODE -D_UNICODE -D_WIN32_WINNT=0x0601 ^
   -municode -mwindows -Wall -Wextra ^
   -o build\NovelReader_dbg.exe ^
-  src\book.cpp src\ini.cpp src\view.cpp src\ui.cpp src\zip.cpp src\format.cpp src\trace.cpp build\app_dbg.res ^
+  src\book.cpp src\ini.cpp src\view.cpp src\ui.cpp src\zip.cpp src\format.cpp src\pdf.cpp src\server.cpp src\trace.cpp build\app_dbg.res ^
   -static -static-libgcc -static-libstdc++ ^
   -lcomctl32 -lcomdlg32 -lshell32 -lole32 -lgdi32 -luser32 -ladvapi32
 if errorlevel 1 goto fail

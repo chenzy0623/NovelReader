@@ -49,4 +49,8 @@ bool FormatFromZip(const std::wstring& path, const char* bytes, size_t len,
  * 返回：剥好的文本（段落之间用 '\n' 分隔）。失败也只是"什么都不认"，返回去标签后的结果。 */
 std::wstring FormatStripMarkup(const std::wstring& path, const std::wstring& in);
 
+/* 把一段 HTML 直接剥成纯文本（网页抓书用，等价于 FormatStripMarkup 里 html 那条分支）。
+ * 参数 html：已解码的 HTML 源码。返回：纯文本，段落之间用 '\\n' 分隔。 */
+std::wstring FormatHtmlToText(const std::wstring& html);
+
 #endif /* NR_FORMAT_H */

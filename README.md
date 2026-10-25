@@ -1,303 +1,296 @@
-# 小说阅读器 · NovelReader
+# 小说阅读器 NovelReader
 
-> 一个 **380 KB** 的 Windows 原生小说阅读器：纯 C++17 / Win32 手写，无第三方库，绿色单文件。
-> 记住你读到哪一句，支持全文搜索、目录收放、自动下滑，还能直接读 **epub / docx / html / md**。
+一个**单文件、免安装、零依赖**的 Windows 小说阅读器。用 C++17 + Win32 从零写成，
+**513 KB** 一个 exe，双击就能用，不写注册表、不装运行库、不需要联网。
 
-![语言](https://img.shields.io/badge/language-C%2B%2B17-blue)
-![平台](https://img.shields.io/badge/platform-Windows%207%2F8%2F10%2F11-lightgrey)
-![体积](https://img.shields.io/badge/size-380%20KB-brightgreen)
+支持 **TXT / EPUB / PDF / DOCX / HTML / Markdown**，自动识别章节，全文搜索，
+记忆阅读位置，自动下滑，书签，换字体，自定义配色，还能直接把网页小说抓成本地书。
+
+![版本](https://img.shields.io/badge/version-1.1.0-blue)
+![体积](https://img.shields.io/badge/size-513%20KB-brightgreen)
+![平台](https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-lightgrey)
 ![依赖](https://img.shields.io/badge/dependencies-none-success)
-![协议](https://img.shields.io/badge/license-MIT-orange)
-[![下载](https://img.shields.io/badge/download-v1.0.0%20win64-blueviolet)](https://github.com/chenzy0623/NovelReader/releases/tag/v1.0.0)
-
-用 Electron / Qt 写个阅读器动辄几十兆，可我只是想看本小说。于是有了这个项目：只调用 Windows 自带的 API，正文自己画（不用 RichEdit），连 zip 解压（读 epub / docx）都是自己实现的，最终产物 380 KB —— 双击就能用，删掉即卸载，没有任何安装包和注册表写入。
-
-*A 380 KB native Windows novel reader written in C++17 with the raw Win32 API — no third-party libraries, single portable exe. Remembers your reading position, full-text search, chapter TOC, auto-scroll, and reads txt/epub/docx/html/markdown.*
-
----
-
-## 目录
-
-- [下载与运行](#下载与运行)
-- [特性](#特性)
-- [截图](#截图)
-- [快捷键](#快捷键)
-- [支持的格式](#支持的格式)
-- [分章规则](#分章规则)
-- [自己编译](#自己编译)
-- [仓库结构](#仓库结构)
-- [实现要点](#实现要点)
-- [性能参考](#性能参考)
-- [常见问题](#常见问题)
+![许可](https://img.shields.io/badge/license-MIT-orange)
 
 ---
 
 ## 下载与运行
 
-**方式一：直接下成品**
+到 [Releases](https://github.com/chenzy0623/NovelReader/releases) 下载最新版：
 
-- 发行包：[NovelReader-1.0.0-win64.zip](https://github.com/chenzy0623/NovelReader/releases/download/v1.0.0/NovelReader-1.0.0-win64.zip)（exe + 使用说明 + 各格式示例书，**244 KB**）
-- 只要程序本体：[NovelReader.exe](https://github.com/chenzy0623/NovelReader/releases/download/v1.0.0/NovelReader.exe)（388,608 字节）
-- 仓库里也留了一份：[`dist/NovelReader.exe`](dist/NovelReader.exe)
+- **[NovelReader-1.1.0-win64.zip](https://github.com/chenzy0623/NovelReader/releases/download/v1.1.0/NovelReader-1.1.0-win64.zip)**（推荐，含使用说明和示例小说）
+- [单个 NovelReader.exe](https://github.com/chenzy0623/NovelReader/releases/download/v1.1.0/NovelReader.exe)（只要程序本体）
 
-**方式二：自己编译**（见 [自己编译](#自己编译)，几分钟）
+解压任意目录，双击 `NovelReader.exe` 即可。**绿色版**：阅读进度存在 exe 同目录的
+`NovelReader.ini`（目录不可写时自动改用 `%APPDATA%\NovelReader\`），删掉 ini 就等于恢复出厂。
 
-**第一次使用**
-
-1. 双击 `NovelReader.exe`，首页就是书架（第一次是空白欢迎页）；
-2. 把小说文件拖进窗口，或按 `Ctrl+O` 选择文件；
-3. 读完关掉窗口即可 —— 下次打开会回到这一句；
-4. 想换书：`Ctrl+W` 关掉当前书回到书架，点另一本；书架会显示每本读到第几章、百分之多少。
-
-阅读进度和书架都保存在 exe 同目录的 `NovelReader.ini`（目录不可写时退到 `%APPDATA%\NovelReader\NovelReader.ini`，实际路径可在「帮助 → 关于」里看到）。**删掉这个 ini 就是清空所有记忆**；把 exe 和 ini 一起拷到别的电脑，进度也跟着走。
-
-> 绿色软件：不写注册表、不装服务、不联网。
+第一次打开会看到书架页面；拖一个小说文件进去，或者按 `Ctrl+O` 选文件。
 
 ---
 
-## 特性
+## 特性一览
 
-| 功能 | 说明 |
-| --- | --- |
-| 🪶 **体积小** | 单个 `NovelReader.exe`，**380 KB**，静态链接 C++ 运行库，不需要任何 DLL |
-| 📚 **首页书架** | 打开就看见读过哪些书、**读到第几章、进度百分比**，单击书名直接续读 |
-| 📖 **记忆阅读位置** | 关掉窗口再打开，自动回到上次那本书、那一句话；换字号、缩放窗口也不会跑偏 |
-| 🔍 **全文搜索** | 搜章节名或任意关键词，全书命中列表在左侧，点一下直接跳过去，`F3` 逐个翻 |
-| 📑 **自动分章** | 认识「第12章」「第一章」「第001章」「第 12 章」「第一百二十三章」「第3回」「第5节」「第7卷」「序章」「楔子」「番外」「终章」「Chapter 5」等写法，并自动排除「第三回合」「他说：第一章我没看。」这类误判 |
-| 🗂️ **目录收放** | 点侧栏底部「收起目录」或按 `Ctrl+T`，目录收成左边缘一条细条，正文独占全宽；再点一下展开 |
-| 📦 **多格式** | `.txt` `.epub` `.docx` `.html` `.htm` `.md`，以及任意扩展名的纯文本；epub 按 OPF spine 顺序拼章节，docx 抽 `word/document.xml` 段落 |
-| 🐌 **自动下滑 + 调速** | 手离开键盘也能读：`F6` 开关，`F7`/`F8` 在 1~10 级之间调速（约 3 秒一行 ~ 0.3 秒一行），级别会被记住 |
-| 🔤 **编码自动识别** | UTF-8 / UTF-8 with BOM / UTF-16 LE / BE / GBK / GB18030 / 系统 ANSI，中文老书不乱码 |
-| 🚀 **大文件不卡** | 懒排版 + 只绘制可见行；实测 14.7 MB / 8794 章的书打开不到 1 秒 |
-| 🌙 **日间 / 夜间** | 米色纸和深色两套配色，`F2` 一键切换 |
-| 🖱️ **拖拽打开 / 最近打开** | 把文件拖进窗口就行；文件菜单保留最近 10 本 |
-| 🔒 **单实例** | 重复双击不会开第二个窗口抢进度，而是把文件交给已开的窗口并提到前台 |
-| 💾 **绿色** | 所有状态存在 exe 旁边的 `NovelReader.ini`，整个文件夹拷走就能带走进度 |
-| 🀄 **源码全中文注释** | 11 个源文件、约 6,000 行，注释写了"为什么这么做"，不是只写"做了什么" |
+| 特性 | 说明 |
+|---|---|
+| 章节自动划分 | 认「第X章 / 第X回 / 第X节 / 序章 / 楔子 / 番外 / Chapter N」等写法，上千章的表也能秒开 |
+| 记忆阅读位置 | 关掉再开，接着上次那句往下读；每本书各记各的，书架上一眼看到进度百分比 |
+| 全文搜索 | 关键词或章节名都能搜，`F3` 逐个跳，命中处高亮，左边列出「章节名 · 上下文片段」 |
+| 自动下滑 | `F6` 开关，`F7/F8` 调速（1~10 级，3 秒/行 ~ 0.3 秒/行），手一碰键盘鼠标就自动停 |
+| 书签 | `Ctrl+D` 添加，`Ctrl+B` 列表，正文左侧显示小米色书签条 |
+| 字体 | 系统字体随便选，也能**导入 ttf/otf/ttc 字体文件**私有加载（不污染系统字体库） |
+| 配色 | 日间 / 夜间 / 护眼绿 / 羊皮纸 / 高对比暗 五种预设，还能逐项自定义背景、正文、标题、选中、悬停色 |
+| 多格式 | TXT、EPUB、PDF、DOCX、HTML、Markdown，以及任意扩展名的纯文本 |
+| 网页抓书 | `Ctrl+U` 输入目录页网址，自动找目录、逐章抓取，存成本地书 |
+| 手机阅读 | 局域网 HTTP 服务，手机浏览器直接读（菜单位置：帮助 → 手机阅读） |
+| 大文件 | 14.7 MB / 8794 章实测 0.8 秒载入，只渲染可视区域，滚动不掉帧 |
+| 目录收起 | 点侧栏底部「‹ 收起目录」或 `Ctrl+T`，正文占满整屏 |
+| 单实例 | 重复双击不会开出第二个窗口互相覆盖进度，而是把文件转发给已开着的那个 |
 
 ---
 
-## 截图
+## 界面截图
 
-**首页书架**（书名 + 读到第几章 + 百分比，单击续读）
+主界面（TXT 大文件，左侧目录 + 正文）：
 
-![首页书架](screenshots/06-shelf.png)
+![主界面](https://github.com/chenzy0623/NovelReader/raw/main/screenshots/01-main.png)
 
-**阅读界面**（左侧章节目录，底部状态栏显示进度 / 当前章节 / 全书章数）
+全文搜索（127 处命中，带章节名和上下文）：
 
-![阅读界面](screenshots/01-main.png)
+![搜索](https://github.com/chenzy0623/NovelReader/raw/main/screenshots/02-search.png)
 
-**全文搜索**（127 处命中，关键词用【】标出，点击跳转并高亮）
+夜间模式：
 
-![全文搜索](screenshots/02-search.png)
+![夜间](https://github.com/chenzy0623/NovelReader/raw/main/screenshots/03-night.png)
 
-**目录收放**（收起后正文独占全宽，左边缘留一条细条，点一下展开）
+自动下滑（状态栏显示档位）：
 
-![目录收放](screenshots/07-fold.png)
+![自动下滑](https://github.com/chenzy0623/NovelReader/raw/main/screenshots/04-auto.png)
 
-**自动下滑**（状态栏右侧显示当前速度 `▸自动 4`）
+首页书架（书名 + 读到第几章 + 百分比）：
 
-![自动下滑](screenshots/04-auto.png)
+![书架](https://github.com/chenzy0623/NovelReader/raw/main/screenshots/06-shelf.png)
 
-**夜间模式**
+收起目录，正文占满宽度：
 
-![夜间模式](screenshots/03-night.png)
+![收起目录](https://github.com/chenzy0623/NovelReader/raw/main/screenshots/07-fold.png)
 
-**EPUB**（自己写的 inflate，按 OPF spine 顺序拼章节）
+书签（左侧书签条 + 书签列表）：
 
-![EPUB](screenshots/08-epub.png)
+![书签](https://github.com/chenzy0623/NovelReader/raw/main/screenshots/10-bookmarks.png)
 
-**大文件**（8794 章也能秒开，目录直接列全）
+配色预设（护眼绿 / 高对比暗）：
 
-![大文件](screenshots/05-bigfile.png)
+<img src="https://github.com/chenzy0623/NovelReader/raw/main/screenshots/11-colors-green.png" width="49%"> <img src="https://github.com/chenzy0623/NovelReader/raw/main/screenshots/12-colors-dark.png" width="49%">
 
-**空白欢迎页**
+换字体（示例为楷体）：
 
-![欢迎页](screenshots/09-welcome.png)
+![字体](https://github.com/chenzy0623/NovelReader/raw/main/screenshots/14-font.png)
+
+PDF（抽出文字后重排，可搜索、可换字体）：
+
+![PDF](https://github.com/chenzy0623/NovelReader/raw/main/screenshots/13-pdf.png)
+
+EPUB：
+
+![EPUB](https://github.com/chenzy0623/NovelReader/raw/main/screenshots/08-epub.png)
+
+网页小说抓取：
+
+![网页](https://github.com/chenzy0623/NovelReader/raw/main/screenshots/15-web.png)
+
+---
+
+## 支持的格式
+
+| 格式 | 怎么读 | 说明 |
+|---|---|---|
+| `.txt` | 直接解码 | 自动识别 UTF-8 / GBK / GB18030 / UTF-16 LE、BE（带 BOM 或自动猜测） |
+| `.epub` | 内建 zip 解压 + 解析 OPF | 按 `spine` 顺序读，章节顺序跟原书一致 |
+| `.pdf` | 内建 PDF 解析器 | 抽出文字层后**重新排版**（可搜索、换字体、夜间模式）；扫描版/图片型 PDF 没有文字层，读不出内容 |
+| `.docx` | 内建 zip 解压 + 读 `word/document.xml` | 只取段落文字，表格内容会按行拼进来；图片不显示 |
+| `.html` `.htm` | 去标签取正文 | 解码实体（`&ldquo;` 等），跳过 script/style/head |
+| `.md` | 去掉标记符号 | `#` 标题变章节名，列表/引用/加粗记号剥掉 |
+| 任意扩展名 | 当纯文本 | 只要内容是文本就行 |
+
+**不支持**：PDF 扫描件、加密 PDF、用对象流压缩（ObjStm）的 PDF、mobi / azw3 / chm、漫画压缩包。
 
 ---
 
 ## 快捷键
 
 | 按键 | 功能 | 按键 | 功能 |
-| --- | --- | --- | --- |
-| `Ctrl+O` | 打开文件 | `Ctrl+W` | 关闭当前书，回到书架 |
-| `Ctrl+F` | 全文搜索 | `F3` | 下一个搜索结果 |
-| `Esc` | 关闭搜索条 | `F5` | 重新载入当前文件 |
+|---|---|---|---|
+| `Ctrl+O` | 打开文件 | `Ctrl+W` | 关闭当前书，回书架 |
+| `Ctrl+U` | 打开网页小说 | `Ctrl+G` | 手机阅读（局域网地址） |
+| `Ctrl+F` | 搜索 | `F3` | 下一个命中 |
+| `Ctrl+B` | 书签列表 | `Ctrl+D` | 添加书签 |
+| `Ctrl+T` | 收起 / 展开目录 | `F2` | 日间 / 夜间切换 |
 | `F6` | 自动下滑开关 | `F7` / `F8` | 减速 / 加速 |
-| `F2` | 日间 / 夜间 | `Ctrl+T` | 显示 / 隐藏目录 |
-| `Ctrl+=` / `Ctrl+-` | 放大 / 缩小字号 | 行距 | 菜单「阅读 → 切换行距」 |
-| `↑` `↓` `PgUp` `PgDn` `空格` | 滚动 / 翻页 | `Home` / `End` | 全书首尾 |
-| `←` / `→` | 上一章 / 下一章 | `Ctrl+C` / `Ctrl+A` | 复制 / 全选 |
+| `Ctrl+=` / `Ctrl+-` | 字号大小 | `Ctrl+0` | 重置字号 |
+| `空格` / `PgDn` | 下一页 | `PgUp` | 上一页 |
+| `↑` `↓` `←` `→` | 逐行 / 逐字滚动 | `Home` / `End` | 全书开头 / 结尾 |
+| `Alt+←` / `Alt+→` | 上一章 / 下一章 | `F5` | 重新加载当前书 |
+| `Ctrl+C` / `Ctrl+A` | 复制选中 / 全选 | `F1` | 快捷键说明 |
 
-> 手动滚动、翻章、搜索跳转都会自动停下自动下滑；也可以再按一次 `F6` 自己停。
-
----
-
-## 支持的格式
-
-| 扩展名 | 怎么读 | 备注 |
-| --- | --- | --- |
-| `.txt`（及任意扩展名） | 直接按编码识别后当纯文本 | 不限扩展名，`.log` `.md` 之外的纯文本也能开 |
-| `.html` `.htm` | 先按编码识别解码，再剥标签 | `<script> <style> <head> <title>` 整段跳过，实体（`&ldquo;` 等）还原 |
-| `.md` `.markdown` | 剥掉 Markdown 记号 | `#` 标题变成章名，列表 / 引用 / 加粗 / 斜体记号去掉 |
-| `.epub` | 解析 zip → `META-INF/container.xml` → OPF → 按 spine 顺序取 XHTML → 剥标签 | 不支持 DRM；纯图片章节抽不出文字 |
-| `.docx` | 解析 zip → `word/document.xml` → 取 `<w:p>` / `<w:t>` / `<w:br>` / `<w:tab>` | 只取正文，表格按行拼接；图片忽略 |
-| `.pdf` `.mobi` `.azw3` | **不支持** | PDF 是排版格式，mobi/azw3 不是 zip 容器，都要另写引擎（见 [常见问题](#常见问题)） |
-
-多格式的产物统一是"纯文本 + 空行分段"，所以分章、搜索、记忆位置、书架这些功能一份代码吃到底。
+鼠标：滚轮滚动，拖滚动条，点目录跳章，双击页边距快速翻页，拖动即可选中文字（松开自动复制）。
 
 ---
 
 ## 分章规则
 
-程序逐段检查，满足以下任一条件即视为章节标题（要求一行 ≤ 60 字且不含句号）：
+一行的整理后文本满足下面全部条件时，认作章节标题：
 
-1. **中文序号**：`第` + 数字 + 单位字，单位字为 `章节回卷集篇幕话`
-   - `第1章 少年出山`、`第一章`、`第001章`、`第 12 章`、`第一百二十三章`、`第3回`、`第5节`、`第7卷`、`第十二篇`
-   - 排除了 `第三回合`、`第三节课`、`第二篇幅` 这类正文写法
-2. **特殊标题词**：`序章` `序言` `楔子` `引子` `前言` `后记` `尾声` `终章` `番外` `外传` `正文` `大结局` `结局` `附录` `完本感言` `作品相关`
-3. **英文**：`Chapter 1`、`CHAPTER 12`、`chapter.3`
+1. 长度不超过 60 个字，且**不含句号**（避免把正文里的「第三章」句子当标题）；
+2. 命中以下任一模式：
+   - `第` + 数字/中文数字 + `章` / `回` / `节` / `卷` / `集` / `篇` / `幕` / `话`
+   - `序章`、`序`、`楔子`、`引子`、`前言`、`后记`、`尾声`、`终章`、`番外`、`结剧`
+   - `Chapter N` / `CHAPTER N`（英文写法）
+3. 排除误判：`第三回合`、`第节课`、`五月天` 这类后面紧跟别的字的写法不算。
 
-epub / docx / html / md 会先被抽成纯文本（Markdown 的 `#` 去掉、HTML 标签剥掉、docx 段落按 `<w:p>` 分），再走同一套分章规则 —— 所以 epub 里 `<h1>第3章 试炼</h1>` 一样能进目录。
+PDF / EPUB / DOCX / HTML / Markdown 会**先抽出纯文本**，再走同一套分章逻辑，
+所以在这些格式里看到的目录和 TXT 是一致的行为。
 
-认不出来？说明这本书的标题写法比较特殊，可以改 `src/book.cpp` 里的 `IsChapterLine()`（注释里写清了每一道判定）。
+---
+
+## 书签 / 字体 / 配色
+
+- **书签**：`Ctrl+D` 在当前位置插入书签（落在段落开头），正文左侧出现一条米色竖条；
+  `Ctrl+B` 列出所有书签，点一条跳过去，`删除此段书签` 删掉当前位置的书签。
+- **字体**：`阅读 → 外观 → 选择字体` 打开系统字体对话框；`导入字体文件` 可以加载
+  `.ttf/.otf/.ttc`（用 `AddFontResourceEx(..., FR_PRIVATE)` 私有加载，不会装进系统）。
+- **配色**：`阅读 → 外观 → 配色方案` 有五种预设；`自定义配色` 逐项挑背景 / 正文 /
+  标题 / 选中 / 悬停色。
+
+---
+
+## 网页小说
+
+`Ctrl+U`（或 文件 → 打开网页小说）粘上**目录页**网址：
+
+1. 抓取目录页，把所有 `<a>` 链接里"文字像章节名"的挑出来（长度 ≤ 48 字、命中分章规则、同站点）；
+2. 按目录顺序逐章抓取，剥掉标签、丢掉导航行、去掉重复标题，拼成一本完整 TXT；
+3. 存到 `%LOCALAPPDATA%\NovelReader\web\书名.txt`，然后像本地书一样读、搜、记进度。
+
+如果给了只有一章的单页网址，就把这一页当全书。抓取时可随时按 `ESC` 取消。
+
+---
+
+## 手机阅读
+
+`Ctrl+G` 或 帮助 → 手机阅读，程序会启动一个局域网 HTTP 服务（默认端口 8231），
+弹出形如 `http://192.168.1.5:8231/` 的地址。手机连**同一个 WiFi**，浏览器打开这个
+地址就能读：书架、目录、上一页/下一页，都是为手机排版的大字号深色页面。
+
+手机上的阅读进度会写进电脑上的同一份 `NovelReader.ini`，所以两边天然同步；
+回到电脑按 `Ctrl+Shift+G` 直接跳到手机读到的地方。
+
+> 这份实现没有 APK：本机没有 Java / Android SDK，也没有签名证书。局域网网页方案
+> 不需要安装、不受应用商店限制，是目前最省事的做法。
 
 ---
 
 ## 自己编译
 
-只需要一个 MinGW 工具链（本项目用 [LLVM-MinGW](https://github.com/mstorsjo/llvm-mingw)，MSYS2 的 g++ 也可以；用 MSVC 需自己改命令行）：
+只依赖 **LLVM-MinGW**（或任何自带 `windres` 的 MinGW-w64），不需要 Visual Studio：
 
 ```bat
-:: 1. 改 build.bat 第 9 行，把 BIN 指向你的工具链 bin 目录
-set BIN=D:\llvm-mingw\bin
-
-:: 2. 在仓库根目录执行
+cd 源码
 build.bat
 ```
 
-产物在 `build\NovelReader.exe`。
+产物 `build\NovelReader.exe`。实际用到的编译参数：
 
-编译参数都在 `build.bat` 里，几个关键点：
+```bat
+windres -I src -I res -O coff res\app.rc -o build\app.res
+g++ -std=gnu++17 -O2 -DUNICODE -D_UNICODE -D_WIN32_WINNT=0x0601 -municode -mwindows ^
+    -ffunction-sections -fdata-sections -Wl,--gc-sections -Wl,-s ^
+    -static -static-libgcc -static-libstdc++ ^
+    src\*.cpp build\app.res -o build\NovelReader.exe ^
+    -lcomctl32 -lcomdlg32 -lshell32 -lole32 -lgdi32 -luser32 -ladvapi32 -lwininet -lws2_32 -liphlpapi
+```
 
-- `-mwindows -municode`：不带控制台窗口，入口是 `wWinMain`
-- `-static -static-libgcc -static-libstdc++`：静态链接，免装运行库 —— 这是 380 KB 的来源
-- `-ffunction-sections -fdata-sections -Wl,--gc-sections -Wl,-s`：去掉没用的代码和符号表
-- `windres` 先把图标和 manifest 编成 `.res` 再链接（`.rc` 里的路径相对当前目录，所以脚本先 `cd` 到仓库根）
-
-`build_dbg.bat` 会额外带上 `-DNR_TRACE`，编出带日志的调试版：程序运行时把关键事件写进 `nr_trace.log`（排版、锚点恢复、搜索、定时器、命令分发都有记录），排查问题很方便。
+`-static -s` 让 exe 不依赖任何 DLL 且去符号；`--gc-sections` 只能救回几 KB，
+真正省体积的是"不用 C++ 异常、不用 STL 流、不用第三方库"。
 
 ---
 
 ## 仓库结构
 
 ```
-.
-├── src/                 源码（11 个文件，约 6,000 行，全中文注释）
-│   ├── ids.h            命令 / 控件 / 资源 ID
-│   ├── common.h         公共声明：Book / Chapter / Settings / ShelfItem 与各模块接口
-│   ├── book.cpp         打开文件：编码识别、多格式分派、正文规范化、段落与章节索引、全文搜索
-│   ├── format.h/.cpp    抽取纯文本：HTML / Markdown 去标记、docx 取 w:p、epub 走 OPF spine
-│   ├── zip.h/.cpp       zip 解析 + DEFLATE 解压（RFC 1951，自己写的，不依赖 zlib）
-│   ├── ini.cpp          读写 ini：设置、每本书的进度元数据、最近打开、书架数据源
-│   ├── view.cpp         自绘阅读视图：首页书架、排版、绘制、滚动、选中、目录折叠条
-│   ├── ui.cpp           主窗口：菜单、目录、搜索条、状态栏、命令分发、自动下滑、单实例
-│   └── trace.cpp        调试日志（仅在 -DNR_TRACE 时编译）
-├── res/                 资源：app.rc（图标 + manifest）、app.manifest、app.ico
-├── examples/            各格式示例书，可直接拿来试（含 GBK 与 UTF-8 两种编码）
-├── screenshots/         截图
-├── tools/               开发用脚本
-│   ├── make_icon.py     生成多尺寸 .ico（Pillow）
-│   ├── make_test_books.py  生成测试用 txt（含章节标题、关键词样本）
-│   ├── ziptest.cpp      zip / inflate 自测（对照 .NET 与 zlib 生成的向量）
-│   └── loadtest.cpp     控制台版加载自测：打印字符数 / 段数 / 章数 / 搜索命中
-├── dist/                成品 exe（发版用）
-├── build.bat            一键编译
-├── build_dbg.bat        编译带 trace 的调试版
-└── README.md
+NovelReader/
+├─ src/                  源码（每个文件头部都有中文说明）
+│  ├─ ids.h              菜单项 / 控件 ID 号段约定
+│  ├─ common.h           数据结构、全局状态、四个模块对外接口
+│  ├─ book.cpp           文件解码、编码识别、章节划分、全文搜索
+│  ├─ format.cpp/.h      EPUB / DOCX / HTML / Markdown 抽正文
+│  ├─ zip.cpp/.h         自写 zip 容器 + DEFLATE (RFC1951) 解压
+│  ├─ pdf.cpp/.h         自写 PDF 解析：对象扫描、FlateDecode、ToUnicode、文本重建
+│  ├─ web.cpp/.h         网页小说抓取（WinInet + 目录识别 + 逐章下载）
+│  ├─ server.cpp/.h      手机阅读：局域网 HTTP 服务
+│  ├─ ini.cpp            ini 读写、设置与阅读进度、书架数据
+│  ├─ view.cpp           阅读视图：排版、换行、滚动、选择、绘制
+│  ├─ ui.cpp             主窗口、菜单、侧栏、搜索条、各种对话框
+│  └─ trace.cpp          调试日志（仅在 -DNR_TRACE 编译时启用）
+├─ res/                  图标 + 资源脚本 + manifest
+├─ screenshots/          README 用的截图
+├─ build.bat             一键编译（GBK 编码，cmd 直接跑）
+└─ dist/                 使用说明、下发用的示例小说
 ```
 
-模块之间的调用方向很干净：`ui.cpp` 负责交互，`book.cpp` 负责数据，`view.cpp` 负责显示，`ini.cpp` 负责持久化，`format.cpp` / `zip.cpp` 是 `book.cpp` 的下游（把非纯文本抽成纯文本），彼此只通过头文件里的声明打交道。
+---
+
+## 实现要点（几个自己比较在意的决定）
+
+- **为什么自绘正文而不用 RichEdit**：十几 MB 的小说塞进 RichEdit 要几百 MB 内存、
+  打开要好几秒，而且换字体、行距、主题都要跟控件的脾气打；自绘只画当前屏幕能看到的
+  行，段落行数懒计算，滚动永远跟手。
+- **为什么自己写 zip 和 DEFLATE**：为了 EPUB / DOCX 引 zlib 要多 100 KB 以上；
+  手写一份 RFC1951 解压器不到 30 KB，还省掉了 DLL 依赖。
+- **为什么 PDF 抽文字而不是渲染页面**：渲染成图片后没法搜索、没法换字体、夜间模式
+  也白搭，而且一页 5 MB 的位图在 14 MB 的书里会直接把内存吃光。抽文字重排后，
+  PDF 和 TXT 走完全一样的阅读管线。
+- **为什么限制单实例**：两个实例同时写同一份 ini 会互相覆盖进度，用户会看到
+  "读到一半的进度莫名其妙回退"。现在第二个实例把自己的文件参数转发给第一个就退出。
 
 ---
 
-## 实现要点
+## 性能参考（本机 Windows 10 22H2 / i5）
 
-**为什么不用 RichEdit / Edit 控件显示正文？**
-几 MB 的文本灌进 RichEdit，装载要好几秒，内存也翻倍，滚动手感还发涩。这里自己画：每段按宽度切成视觉行，缓存每段的行数（懒计算），只绘制屏幕上可见的几十行，滚动时改的是"顶行是第几段第几行"。所以 15 MB 的书滚动照样跟手。
-
-**阅读位置为什么记"字符偏移"而不是行号？**
-行号依赖字号和窗口宽度，换个字号就全错位了。记字符偏移，配合排版时反算（`BookCharToPara` + 段落内行号），就能精确回到同一句话。窗口尺寸变化时用 `RestoreAnchorFromOffset()` 重新校准，所以调整字号不会跳行。
-
-**编码识别顺序**
-`BOM` → `无 BOM 的 UTF-16LE`（判据：奇数位字节 3/4 以上是 0）→ `严格校验通过的 UTF-8` → `GB18030` → `GBK` → `系统 ANSI`。
-自己写 UTF-8 校验而不是直接交给 `MultiByteToWideChar`，是因为它对非法字节"宽容替换"而不报错，GBK 文本会被转成一堆 `U+FFFD`，必须自己先判。
-
-**多格式是怎么塞进 380 KB 的？**
-没有引入 zlib，也没有额外链接任何压缩库：`zip.cpp` 自己读中央目录、自己实现 RFC 1951 的 stored / fixed Huffman / dynamic Huffman 三种块，重叠回溯逐字节拷贝（内存不能用 `memcpy`）。EPUB 只取 `container.xml → OPF → manifest/spine`，DOCX 只认 `word/document.xml` 里的 `<w:p>/<w:t>/<w:br>/<w:tab>`。抽出纯文本之后，分章、搜索、记忆位置全都复用 txt 那套逻辑，一份代码走到底。
-
-**ini 为什么先写一个 BOM？**
-`WritePrivateProfileStringW` 判断"是不是 Unicode 文件"看的是文件大小：文件不存在或大小为 0 时它按 ANSI 写，中文路径就被系统代码页吃了。所以在文件为空时先写一个 UTF-16LE BOM，之后所有写入才是 Unicode。
-
-**为什么限制单实例？**
-两个进程同时开着会互相覆盖同一个 ini —— 谁后关窗谁赢，用户会看到"进度莫名回退"。所以第二个实例只做一件事：把命令行里的文件用 `WM_COPYDATA` 交给已有窗口，然后退出。
-
-**首页书架的数据从哪来？**
-就是 ini 里的 `[recent]` 段加上每本书自己的段（`chname` / `ch` / `chn` / `pct` / `title`），所以书架天生按"最近阅读"倒序，不需要另存一份书单；文件被删或改名时用 `GetFileAttributesW` 判断并灰掉。
-
-**源码注释**
-11 个源文件全部中文注释，注释率 25%~40%，重点写"为什么"：为什么 UTF-8 要自己校验、为什么 ini 要先写 BOM、为什么行号不能当锚点、为什么 zip 的重叠回溯不能用 `memcpy`、为什么箭头要用半角 `<` `>`（系统界面字体没有 `‹›` 字形）。改代码前建议先读文件头那段总述。
-
----
-
-## 性能参考
-
-本机实测（Windows 10 x64，机械硬盘）：
-
-| 项目 | 数据 |
-| --- | --- |
-| exe 体积 | 388,608 字节（380 KB） |
-| 冷启动到窗口出现 | < 100 ms |
-| 打开 120 章 / 21 万字 | 瞬间，无感 |
-| 打开 14.7 MB / 8794 章 | < 1 秒（进程启动到目录列全 789 ms） |
-| 全文搜索 21 万字 | 毫秒级，127 处命中照样秒出 |
-| 解压 epub / docx | 几毫秒（只解需要的条目） |
-| 内存占用（15 MB 的书） | 约 60 MB（正文 UTF-16 + 段落索引 + 行数缓存） |
+| 场景 | 结果 |
+|---|---|
+| 启动到出现窗口 | 约 0.12 秒 |
+| 14.7 MB / 8794 章 TXT | 0.8 秒载入，滚动流畅 |
+| 全文搜索 7 万字 | 即时（`< 20 ms`） |
+| 全文搜索 14.7 MB | 约 120 ms（一次性扫完，结果可到 4000 条） |
+| 内存占用（14.7 MB 的书） | 约 60 MB（正文 + 段落索引 + 章节表） |
+| 程序体积 | 513 KB（静态链接，无 DLL 依赖） |
 
 ---
 
 ## 常见问题
 
-**Q：中文乱码怎么办？**
-程序会依次尝试多种编码。如果还是乱码，多半是这本书被人工编辑过、混了多种编码。可以用记事本另存为 UTF-8 再试。
+**打开是乱码？** 自动识别 UTF-8 / GBK / GB18030 / UTF-16；若仍乱码，请确认文件不是
+压缩包或二进制文件。可在「帮助 → 关于」看到当前文件的识别编码。
 
-**Q：进度丢了？**
-先看 exe 旁边有没有 `NovelReader.ini`。如果没有，说明该目录不可写（例如放在了 `C:\Program Files` 下），进度存到了 `%APPDATA%\NovelReader\NovelReader.ini`，在「帮助 → 关于」里能看到实际路径。
+**目录里没有章节？** 说明正文里的章节标题不合分章规则（比如没有"第X章"字样，或者
+标题里带句号）。这种情况会退化成按段落翻页，搜索和记忆位置照常可用。
 
-**Q：没有识别出章节？**
-你的文件里章节标题可能不符合上面列的写法。打开 `src/book.cpp` 的 `IsChapterLine()`，按注释加一条规则重新编译即可（识别不出章节也不影响阅读，只是按段落翻）。
+**进度丢了？** 进度写在 exe 同目录的 `NovelReader.ini`。如果程序放在只读目录，
+会自动改写到 `%APPDATA%\NovelReader\NovelReader.ini`。
 
-**Q：能看 PDF / mobi / azw3 吗？**
-不能。PDF 是排版格式而不是文字流，完整支持等于内置一套渲染引擎；mobi/azw3 用的是 PalmDOC/KF8 而不是 zip 容器 —— 两者都会让体积翻几倍，与"380 KB 单文件"的目标冲突。epub / docx / html / md / txt 都可以。
+**PDF 打开是空白？** 说明这份 PDF 没有文字层（扫描件），或者用了对象流压缩 / 加密。
+本程序只做文字抽取，不做 OCR。
 
-**Q：epub 打开是空的？**
-只支持标准 epub（zip + OPF + XHTML 章节）。DRM 加密的、或者章节内容是图片扫描件的，抽不出文字，这类书会明确提示"这个文件里没有可显示的正文"。
-
-**Q：能多开几本书吗？**
-同一时间只打开一本（第二本会替换第一本）；书架上可以随时切换，进度各记各的。
-
-**Q：为什么只有一个 .exe，没有安装程序？**
-故意的。不需要安装、不需要管理员权限、不写注册表，拷到哪里都能跑，不想要了直接删。
+**网页抓取失败？** 检查网址是否为目录页、站点是否需要登录（本程序不带 cookie），
+以及本机代理设置；抓取时会先走系统代理，失败再直连重试。
 
 ---
 
 ## 反馈
 
-发现某本书章节识别不出来、或者有格式解析出错，欢迎开 [Issue](../../issues) 并附上能复现的那几行（或者文件片段），我会把规则补进去。
+欢迎提 [Issue](https://github.com/chenzy0623/NovelReader/issues)。如果遇到打不开的书，
+把文件（或前几 KB）附上最有助于定位。
 
----
+## 许可
 
-## 协议
-
-[MIT](LICENSE) —— 随便用、随便改，出了事别找我。
+MIT License，见 [LICENSE](LICENSE)。

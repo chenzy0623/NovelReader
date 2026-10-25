@@ -139,6 +139,20 @@ void SettingsLoad()
     if (g_set.autoSpeed > 10) g_set.autoSpeed = 10;
     g_set.lastFile = IniGetStr(S0, L"lastFile", L"");   /* 上次打开的书 */
 
+    /* ---- 外观：字体与自定义配色 ---- */
+    g_set.theme = g_set.theme < 0 ? 0 : (g_set.theme > 2 ? 2 : g_set.theme);
+    /* 字体名：空串在 view.cpp 里当作"用内置默认字体"，这里不强行填默认值 ——
+     * 将来改了默认字体，老用户 ini 里的空串就会自动跟着变。 */
+    g_set.fontFace  = IniGetStr(S0, L"fontFace", L"Microsoft YaHei");
+    g_set.fontFiles = IniGetStr(S0, L"fontFiles", L"");
+    /* 自定义配色：存的是 COLORREF 整数（0x00BBGGRR）。缺省值就是日间配色，
+     * 这样第一次切到"自定义"时不会看到一片黑或一片白。 */
+    g_set.cBg    = (COLORREF)(uint32_t)IniGetInt(S0, L"cBg",    (int)RGB(0xF7, 0xF3, 0xE9));
+    g_set.cFg    = (COLORREF)(uint32_t)IniGetInt(S0, L"cFg",    (int)RGB(0x31, 0x2D, 0x27));
+    g_set.cTitle = (COLORREF)(uint32_t)IniGetInt(S0, L"cTitle", (int)RGB(0x8A, 0x5A, 0x2B));
+    g_set.cSel   = (COLORREF)(uint32_t)IniGetInt(S0, L"cSel",   (int)RGB(0xBF, 0xDC, 0xF4));
+    g_set.cHov   = (COLORREF)(uint32_t)IniGetInt(S0, L"cHov",   (int)RGB(0xEC, 0xE6, 0xD8));
+
     /* 窗口位置：四个值缺一不可，而且要有意义的大小（right>left、bottom>top）。
      * 用 -100000 当"没有记录"的哨兵，比 0 更安全（多显示器可能出现负数坐标）。 */
     int l = IniGetInt(S0, L"winL", -100000);
@@ -163,6 +177,15 @@ void SettingsSave()
     IniSetInt(S0, L"spacing", g_set.spacing);
     IniSetInt(S0, L"autoSpeed", g_set.autoSpeed);
     IniSetStr(S0, L"lastFile", g_set.lastFile);
+    /* 外观：字体名 / 导入的字体文件 / 自定义配色。
+     * 每次关窗口都写，哪怕用户没改 —— 反正只有十几行文本，省得再维护"脏标记"。 */
+    IniSetStr(S0, L"fontFace", g_set.fontFace);
+    IniSetStr(S0, L"fontFiles", g_set.fontFiles);
+    IniSetInt(S0, L"cBg",    (int)g_set.cBg);
+    IniSetInt(S0, L"cFg",    (int)g_set.cFg);
+    IniSetInt(S0, L"cTitle", (int)g_set.cTitle);
+    IniSetInt(S0, L"cSel",   (int)g_set.cSel);
+    IniSetInt(S0, L"cHov",   (int)g_set.cHov);
     if (g_set.hasRect) {
         IniSetInt(S0, L"winL", g_set.winRect.left);
         IniSetInt(S0, L"winT", g_set.winRect.top);
@@ -339,3 +362,61 @@ void RecentAdd(const std::wstring& path)
         IniSetStr(L"recent", key, i < (int)list.size() ? list[(size_t)i] : L"");
     }
 }
+
+/* ---------------- 书签 ---------------- */
+
+/* 一本书的书签段名："bm" + 该书进度段的段名（f + 8 位哈希）。
+ * 为什么不直接用路径：同 PosSectionFor 的理由（段名不能含 ] 和换行）。
+ * 为什么加 "bm" 前缀：和进度段区分开，两者能并存且互不覆盖。 */
+static std::wstring BmSectionFor(const std::wstring& path)
+{
+    return L"bm" + PosSectionFor(path);
+}
+
+/* 读一本书的书签。返回的每个元素是 "字符偏移|标题"（偏移是十进制文本），
+ * 顺序就是用户添加的顺序（不排序 —— 列表里按"我加的顺序"看更符合直觉）。
+ * 上限 200 条：一本小说真有 200 个书签已经远超正常使用，留个硬上限防止
+ * ini 被写坏后无限循环。 */
+std::vector<std::wstring> BookmarkLoad(const std::wstring& path)
+{
+    std::vector<std::wstring> v;
+    if (path.empty()) return v;
+    std::wstring sec = BmSectionFor(path);
+    int n = IniGetInt(sec.c_str(), L"n", 0);
+    if (n < 0) n = 0;
+    if (n > 200) n = 200;
+    for (int i = 0; i < n; i++) {
+        wchar_t key[16];
+        wsprintfW(key, L"b%d", i);
+        std::wstring s = IniGetStr(sec.c_str(), key, L"");
+        if (!s.empty()) v.push_back(s);
+    }
+    return v;
+}
+
+/* 覆盖写一本书的全部书签。先写 n 再写 b0..bN；列表变短时把多余的旧键写空串
+ * （WritePrivateProfileStringW 传空串就是删键），否则删掉书签后重新读又会冒出来。 */
+void BookmarkSave(const std::wstring& path, const std::vector<std::wstring>& items)
+{
+    if (path.empty()) return;
+    std::wstring sec = BmSectionFor(path);
+    /* 先记下上次写了几条，用于把多出来的旧键清空 */
+    int old = IniGetInt(sec.c_str(), L"n", 0);
+    if (old < 0) old = 0;
+    if (old > 200) old = 200;
+
+    int n = (int)items.size();
+    if (n > 200) n = 200;
+    IniSetInt(sec.c_str(), L"n", n);
+    for (int i = 0; i < n; i++) {
+        wchar_t key[16];
+        wsprintfW(key, L"b%d", i);
+        IniSetStr(sec.c_str(), key, items[(size_t)i]);
+    }
+    for (int i = n; i < old; i++) {
+        wchar_t key[16];
+        wsprintfW(key, L"b%d", i);
+        IniSetStr(sec.c_str(), key, L"");
+    }
+}
+

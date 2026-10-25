@@ -41,10 +41,13 @@
  * =====================================================================
  */
 #include "common.h"
+#include "web.h"
+#include "server.h"
 #include <commctrl.h>
 #include <commdlg.h>
 #include <shellapi.h>
 #include <cwchar>
+#include <algorithm>
 
 /* ---- 全局量（common.h 里 extern 声明，此处定义）----
  * g_dpi ：启动时由 wWinMain 从屏幕 DC 取一次，之后只读；S() 换算全靠它。
@@ -114,6 +117,9 @@ static void UiLayout();
 static void FillToc();
 static void FillHits();
 static void AutoSyncMenu();
+/* 侧栏切页：书签面板（UiShowBookmarks）的代码放在 ShowPanel 定义之前，
+ * 所以这里先声明一下；s_panel 的取值 0 目录 / 1 搜索命中 / 2 书签。 */
+static void ShowPanel(int which);
 
 /* ---------------- 字体 ---------------- */
 
@@ -330,7 +336,7 @@ static void UiLayout()
      * 为什么不直接用客户区宽度算：下面那行夹取就是理由 —— 窗口窄时要主动收窄。
      */
     /* 搜索结果列表里的条目比较长，此时侧栏放宽一些 */
-    int sideW = g_set.sidebar ? (s_panel == 1 ? S(320) : S(232)) : 0;
+    int sideW = g_set.sidebar ? (s_panel != 0 ? S(320) : S(232)) : 0;
     /* 首页书架（还没打开书）时不留侧栏：书都没开，目录和搜索结果都是空的，
      * 白占一块地方还把书架的可用宽度压窄了。折叠条也一并藏起来，
      * 因为它此时没有"可折叠的对象"，留着只会让人以为坏了。 */
@@ -385,7 +391,9 @@ static void UiLayout()
         if (s_hHits) MoveWindow(s_hHits, 0, top, sideW, sh, TRUE);
     }
     if (s_hToc)  ShowWindow(s_hToc,  (sideW > 0 && s_panel == 0) ? SW_SHOW : SW_HIDE);
-    if (s_hHits) ShowWindow(s_hHits, (sideW > 0 && s_panel == 1) ? SW_SHOW : SW_HIDE);
+    /* s_panel==2（书签面板）也复用 s_hHits 这个列表，所以要一起显示，
+     * 否则切到书签页会看到一块空白（列表被隐藏、目录也不该显示）。 */
+    if (s_hHits) ShowWindow(s_hHits, (sideW > 0 && s_panel != 0) ? SW_SHOW : SW_HIDE);
 
     /* 搜索条内部：以右边界为基准逐个往左挤。按钮之间留 6，按钮与输入框之间留 12，
      * 输入框拿走剩余宽度。这样无论窗口多宽，按钮组始终贴着右边、不会乱飘。
@@ -622,7 +630,7 @@ static void FillHits()
     NrTrace(L"FillHits n=%d", (int)s_hits.size());
     /* 搜索结果列表按侧栏宽度裁剪，避免长条目被硬切；
        面板宽度用“将要变成”的值（搜索结果面板更宽），因为 FillHits 可能先于 UiLayout 调用 */
-    int panelW = g_set.sidebar ? (s_panel == 1 ? S(320) : S(232)) : S(232);
+    int panelW = g_set.sidebar ? (s_panel != 0 ? S(320) : S(232)) : S(232);
     /* 再留 S(30) 给列表项左右内边距、WS_EX_CLIENTEDGE 边框和可能出现的竖向滚动条 */
     int maxW = panelW - S(30);
     /* 借列表自己的 DC 来量文字：同一窗口类，字体选择行为一致 */
@@ -651,7 +659,333 @@ static void FillHits()
     InvalidateRect(s_hHits, nullptr, TRUE);
 }
 
-/* 切换侧栏显示哪一页（0 目录 / 1 搜索结果），并保证侧栏是打开的。
+/* ---------------- 书签 ---------------- */
+
+/* 当前书的书签，元素是 "字符偏移|标题" 的原始串，顺序 = 用户添加的顺序。
+ * 为什么直接存这种串而不定义结构体：它既是 ini 里的存储格式，也是内存里的格式，
+ * 中间少一层来回转换；解析只在"显示 / 跳转"时做一次，成本可忽略。 */
+static std::vector<std::wstring> s_bms;
+
+/* 带书签的段落序号（升序、去重）。view.cpp 画正文时靠它在段落左边画标记，
+ * 因为是二分查找，所以必须保持有序。 */
+std::vector<int> g_bmParas;
+
+/* 从 "偏移|标题" 里解析出偏移。格式坏了（没有 '|'、含非数字、数值离谱）返回 -1，
+ * 调用方跳过这条 —— 一条坏数据不该让整个面板或跳转崩掉。 */
+static int BmParseOffset(const std::wstring& item)
+{
+    size_t bar = item.find(L'|');
+    if (bar == std::wstring::npos || bar == 0) return -1;
+    int off = 0;
+    for (size_t i = 0; i < bar; i++) {
+        wchar_t c = item[i];
+        if (c < L'0' || c > L'9') return -1;
+        off = off * 10 + (int)(c - L'0');
+        if (off > 100000000) return -1;   /* 1 亿字符以上当作坏数据 */
+    }
+    return off;
+}
+
+/* 取出 "偏移|标题" 里的标题部分 */
+static std::wstring BmParseTitle(const std::wstring& item)
+{
+    size_t bar = item.find(L'|');
+    if (bar == std::wstring::npos || bar + 1 >= item.size()) return std::wstring();
+    return item.substr(bar + 1);
+}
+
+/* 重建 g_bmParas：把每条书签的偏移换算成段落号，排序去重。 */
+static void BmRebuildParas()
+{
+    g_bmParas.clear();
+    if (!g_book.Ok()) return;
+    int len = (int)g_book.text.size();
+    for (size_t i = 0; i < s_bms.size(); i++) {
+        int off = BmParseOffset(s_bms[i]);
+        if (off < 0 || off > len) continue;
+        g_bmParas.push_back(BookCharToPara(g_book, off));
+    }
+    std::sort(g_bmParas.begin(), g_bmParas.end());
+    g_bmParas.erase(std::unique(g_bmParas.begin(), g_bmParas.end()), g_bmParas.end());
+}
+
+/* 打开一本书之后调：把这本书的书签从 ini 读进内存，并重建段落标记。 */
+static void BmReload()
+{
+    s_bms = BookmarkLoad(g_book.path);
+    BmRebuildParas();
+    NrTrace(L"BmReload n=%d", (int)s_bms.size());
+}
+
+/* 把书签填进侧栏列表（复用搜索结果那个 LISTBOX：s_panel == 2 时它就是书签列表，
+ * 这样不用再建一个控件、也不用心维护两套布局）。 */
+static void FillBookmarks()
+{
+    if (!s_hHits) return;
+    int panelW = g_set.sidebar ? S(320) : S(232);
+    int maxW = panelW - S(30);
+    HDC dc = GetDC(s_hHits);
+    HFONT old = s_uiFont ? (HFONT)SelectObject(dc, s_uiFont) : nullptr;
+
+    SendMessageW(s_hHits, WM_SETREDRAW, FALSE, 0);
+    SendMessageW(s_hHits, LB_RESETCONTENT, 0, 0);
+    if (s_bms.empty()) {
+        SendMessageW(s_hHits, LB_ADDSTRING, 0, (LPARAM)L"（还没有书签：Ctrl+D 给当前位置加一条）");
+    } else {
+        for (size_t i = 0; i < s_bms.size(); i++) {
+            std::wstring t = BmParseTitle(s_bms[i]);
+            if (t.empty()) t = L"（未命名位置）";
+            std::wstring s = ClipToWidth(dc, t, maxW);
+            SendMessageW(s_hHits, LB_ADDSTRING, 0, (LPARAM)s.c_str());
+        }
+    }
+    if (old) SelectObject(dc, old);
+    ReleaseDC(s_hHits, dc);
+    SendMessageW(s_hHits, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(s_hHits, nullptr, TRUE);
+}
+
+/* 给当前阅读位置加一条书签（Ctrl+D / 菜单）。
+ * 落点规则：取"当前视口顶行所在的段落"的段首偏移 —— 比顶行偏移稳定（滚到段中间时，
+ * 同一个段落再加书签仍然指向段首，不会出现两条书签挤在同一段里）。
+ * 标题 = 章名 + 该段前 24 个字，这样列表里能看出"这是哪一章的哪一段"。
+ * 同一段已有书签时替换标题（相当于"重新标记"），不重复添加。 */
+void UiAddBookmark()
+{
+    if (!g_book.Ok()) {
+        MessageBoxW(g_hMain, L"请先打开一本书。", L"提示", MB_ICONINFORMATION);
+        return;
+    }
+    int off = ViewAnchorOffset();
+    if (off < 0) off = 0;
+    if (off > (int)g_book.text.size()) off = (int)g_book.text.size();
+    int para = BookCharToPara(g_book, off);
+    if (para >= 0 && para < g_book.ParaCount()) off = (int)g_book.paraOff[(size_t)para];
+
+    std::wstring title;
+    int ch = BookChapterAtPara(g_book, para);
+    if (ch >= 0) { title = BookChapterTitle(g_book, ch); title += L" · "; }
+    std::wstring txt = BookParaText(g_book, para);
+    if (txt.size() > 24) { txt.resize(24); txt += L"…"; }
+    title += txt;
+    if (title.empty()) title = L"（未命名位置）";
+
+    wchar_t o[24];
+    wsprintfW(o, L"%d|", off);
+    std::wstring item = o + title;
+
+    bool replaced = false;
+    for (size_t i = 0; i < s_bms.size(); i++) {
+        int o2 = BmParseOffset(s_bms[i]);
+        if (o2 >= 0 && BookCharToPara(g_book, o2) == para) { s_bms[i] = item; replaced = true; break; }
+    }
+    if (!replaced) {
+        if (s_bms.size() >= 200) {
+            MessageBoxW(g_hMain, L"书签最多 200 条，先删几条吧。", L"提示", MB_ICONINFORMATION);
+            return;
+        }
+        s_bms.push_back(item);
+    }
+    BookmarkSave(g_book.path, s_bms);
+    BmRebuildParas();
+    if (s_panel == 2) FillBookmarks();
+    ViewInvalidate();
+    s_statusExtra = replaced ? L"书签已更新" : L"已添加书签";
+    UiUpdateStatus();
+}
+
+/* 删掉"当前这一段"上的书签（菜单项，没有快捷键 —— 删数据类操作不适合给顺手键）。 */
+void UiDelBookmark()
+{
+    if (!g_book.Ok()) return;
+    int off = ViewAnchorOffset();
+    if (off < 0) off = 0;
+    if (off > (int)g_book.text.size()) off = (int)g_book.text.size();
+    int para = BookCharToPara(g_book, off);
+
+    bool removed = false;
+    for (size_t i = 0; i < s_bms.size(); i++) {
+        int o2 = BmParseOffset(s_bms[i]);
+        if (o2 >= 0 && BookCharToPara(g_book, o2) == para) {
+            s_bms.erase(s_bms.begin() + (std::ptrdiff_t)i);
+            removed = true;
+            break;
+        }
+    }
+    if (!removed) {
+        MessageBoxW(g_hMain, L"这一段上没有书签。", L"提示", MB_ICONINFORMATION);
+        return;
+    }
+    BookmarkSave(g_book.path, s_bms);
+    BmRebuildParas();
+    if (s_panel == 2) FillBookmarks();
+    ViewInvalidate();
+    s_statusExtra = L"书签已删除";
+    UiUpdateStatus();
+}
+
+/* 打开书签面板（没书签也打开，里面有一行提示告诉用户怎么加）。 */
+void UiShowBookmarks()
+{
+    if (!g_book.Ok()) {
+        MessageBoxW(g_hMain, L"请先打开一本书。", L"提示", MB_ICONINFORMATION);
+        return;
+    }
+    FillBookmarks();
+    ShowPanel(2);
+}
+
+/* ---------------- 外观：字体 / 配色 ---------------- */
+
+/* 选择正文字体：直接借系统字体对话框（ChooseFontW）。
+ * 自带列表要自己枚举几百个字体名、还要处理"中文名/英文名同族"，用系统对话框
+ * 一次解决，而且用户熟悉。只取回字体名，字号仍归我们自己的 Ctrl+= / Ctrl+- 管 ——
+ * 两处都能改字号容易互相打架，所以这里明确不采纳对话框里的字号选择。
+ */
+void UiPickFont()
+{
+    LOGFONTW lf;
+    ZeroMemory(&lf, sizeof(lf));
+    lf.lfHeight = -MulDiv(g_set.fontPt, g_dpi, 72);
+    lf.lfWeight = FW_NORMAL;
+    lf.lfCharSet = DEFAULT_CHARSET;
+    lstrcpynW(lf.lfFaceName, g_set.fontFace.empty() ? L"Microsoft YaHei" : g_set.fontFace.c_str(), LF_FACESIZE);
+
+    CHOOSEFONTW cf;
+    ZeroMemory(&cf, sizeof(cf));
+    cf.lStructSize = sizeof(cf);
+    cf.hwndOwner = g_hMain;
+    cf.lpLogFont = &lf;
+    /* CF_SCREENFONTS：只列屏幕字体（打印字体选了也用不上）；
+     * CF_INITTOLOGFONTSTRUCT：打开时就定位到当前字体；
+     * CF_NOSTYLESEL / CF_NOSCRIPTSEL：不要粗斜体和脚本下拉 —— 正文只有常规体，
+     * 标题的加粗是我们自己按 FW_BOLD 建的，让用户在这里选粗体反而会打乱排版。 */
+    cf.Flags = CF_SCREENFONTS | CF_INITTOLOGFONTSTRUCT | CF_NOSTYLESEL | CF_NOSCRIPTSEL;
+    if (!ChooseFontW(&cf)) return;
+
+    g_set.fontFace = lf.lfFaceName;
+    SettingsSave();          /* 立刻落盘：换字体是"设置"，不该等到关窗口才存 */
+    ViewMetricsChanged(true);   /* 字体变了：行高、换行位置全部重算（传 true 让段落行数缓存作废） */
+    ViewInvalidate();
+    s_statusExtra = std::wstring(L"字体：") + g_set.fontFace;
+    UiUpdateStatus();
+}
+
+/* 导入字体文件（.ttf/.otf/.ttc）：私有加载 + 记住路径 + 顺手弹出字体对话框。
+ * 不装进系统字体库（FR_PRIVATE），所以用户"导入一个字体"不会污染系统；
+ * 路径写进 ini 的 fontFiles，下次启动由 FontsLoadImported() 重新加载。 */
+void UiImportFont()
+{
+    wchar_t path[MAX_PATH];
+    path[0] = 0;
+    OPENFILENAMEW ofn;
+    ZeroMemory(&ofn, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = g_hMain;
+    ofn.lpstrFilter = L"字体文件 (*.ttf;*.otf;*.ttc)\0*.ttf;*.otf;*.ttc\0所有文件 (*.*)\0*.*\0\0";
+    ofn.lpstrFile = path;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrTitle = L"导入字体文件";
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER;
+    if (!GetOpenFileNameW(&ofn)) return;
+
+    int cnt = AddFontResourceExW(path, FR_PRIVATE, nullptr);
+    if (cnt <= 0) {
+        MessageBoxW(g_hMain, L"这个文件里没有可用的字体，可能不是 ttf/otf/ttc，或者文件已损坏。",
+                    L"导入失败", MB_ICONWARNING);
+        return;
+    }
+    /* 记进字体文件列表（'|' 分隔，重复导入同一路径就跳过，避免列表越来越长） */
+    if (g_set.fontFiles.find(path) == std::wstring::npos) {
+        if (!g_set.fontFiles.empty()) g_set.fontFiles += L'|';
+        g_set.fontFiles += path;
+    }
+    SettingsSave();
+    MessageBoxW(g_hMain,
+                L"字体已导入，只对本程序生效，不会装进系统。\n\n"
+                L"接下来在弹出的字体列表里挑它就行（名字一般就是文件里的字体名，"
+                L"如果列表很长，可以在「字体」框里敲几个字过滤）。",
+                L"导入成功", MB_ICONINFORMATION);
+    UiPickFont();
+}
+
+/* 自定义配色：背景 / 正文 / 标题 / 选中色 / 悬停色 依次弹系统取色器。
+ * 任何一步点「取消」就整体放弃 —— 不做"改了一半"的配色，否则很容易出现
+ * "背景换了、文字还是夜间那种浅灰"的看不清组合。
+ * 取消之外的情形都会切到 theme = 2（自定义），并立刻落盘。 */
+void UiPickColors()
+{
+    COLORREF tmp[5] = { g_set.cBg, g_set.cFg, g_set.cTitle, g_set.cSel, g_set.cHov };
+    /* 取色器里的"自定义颜色"格子（系统要求在调用之间保持内容，所以必须 static） */
+    static COLORREF cust[16] = { 0 };
+
+    for (int i = 0; i < 5; i++) {
+        CHOOSECOLORW cc;
+        ZeroMemory(&cc, sizeof(cc));
+        cc.lStructSize = sizeof(cc);
+        cc.hwndOwner = g_hMain;
+        cc.rgbResult = tmp[i];
+        cc.lpCustColors = cust;
+        cc.Flags = CC_FULLOPEN | CC_RGBINIT;
+        if (!ChooseColorW(&cc)) return;   /* 取消 = 整体放弃 */
+        tmp[i] = cc.rgbResult;
+    }
+    g_set.cBg    = tmp[0];
+    g_set.cFg    = tmp[1];
+    g_set.cTitle = tmp[2];
+    g_set.cSel   = tmp[3];
+    g_set.cHov   = tmp[4];
+    g_set.theme  = 2;
+    SettingsSave();
+    ViewInvalidate();
+    s_statusExtra = L"已切换到自定义配色";
+    UiUpdateStatus();
+}
+
+/* 套用一套预设配色。索引与菜单顺序一致：
+ * 0 日间 / 1 夜间 / 2 护眼绿 / 3 羊皮纸 / 4 高对比暗。
+ * 前两个复用内置的 kDay / kNight（theme 0/1），后三个写进自定义色的槽位（theme 2）。 */
+void UiApplyPreset(int idx)
+{
+    switch (idx) {
+    case 0:
+        g_set.theme = 0;
+        break;
+    case 1:
+        g_set.theme = 1;
+        break;
+    case 2:   /* 护眼绿：淡豆绿底 + 深墨绿字，长时间看最不刺眼 */
+        g_set.theme  = 2;
+        g_set.cBg    = RGB(0xC7, 0xED, 0xCC);
+        g_set.cFg    = RGB(0x1E, 0x2B, 0x1F);
+        g_set.cTitle = RGB(0x2C, 0x5C, 0x2E);
+        g_set.cSel   = RGB(0x9E, 0xD8, 0xA8);
+        g_set.cHov   = RGB(0xB9, 0xE3, 0xC1);
+        break;
+    case 3:   /* 羊皮纸：偏黄的纸感，适合暖光下阅读 */
+        g_set.theme  = 2;
+        g_set.cBg    = RGB(0xF3, 0xE7, 0xC8);
+        g_set.cFg    = RGB(0x40, 0x32, 0x22);
+        g_set.cTitle = RGB(0x8B, 0x5A, 0x1E);
+        g_set.cSel   = RGB(0xD8, 0xC4, 0x92);
+        g_set.cHov   = RGB(0xE8, 0xDB, 0xB8);
+        break;
+    case 4:   /* 高对比暗：纯黑底 + 亮白字，夜里关灯看最清楚 */
+        g_set.theme  = 2;
+        g_set.cBg    = RGB(0x0A, 0x0A, 0x0B);
+        g_set.cFg    = RGB(0xEC, 0xEC, 0xEE);
+        g_set.cTitle = RGB(0xFF, 0xD0, 0x6A);
+        g_set.cSel   = RGB(0x30, 0x5A, 0x8C);
+        g_set.cHov   = RGB(0x18, 0x18, 0x1C);
+        break;
+    default:
+        return;
+    }
+    SettingsSave();
+    ViewInvalidate();
+    UiUpdateStatus();
+}
+/* 切换侧栏显示哪一页（0 目录 / 1 搜索结果 / 2 书签），并保证侧栏是打开的。
  * 为什么自己动手开侧栏：用户可能在「关侧栏」状态下按了 Ctrl+F，若搜到结果却看不到
  * 列表，会以为搜索坏了；所以这里顺手把 g_set.sidebar 置 1。
  * 注意只改内存里的设置、不写 ini —— 只有用户在菜单里主动开关才持久化，
@@ -836,6 +1170,8 @@ void UiOpenFile(const std::wstring& path)
     ClearSearchState();
     ViewSetBook();
     FillToc();
+    /* 书签是按书存的：换书后立刻读新书的书签，否则会在新书里看到上一本的书签标记 */
+    BmReload();
 
     int off = PosLoad(path);
     if (off > 0 && off < (int)g_book.text.size()) ViewGotoOffset(off, 0);
@@ -881,6 +1217,10 @@ void UiCloseFile()
     std::wstring().swap(g_book.title);
     std::vector<uint32_t>().swap(g_book.paraOff);
     std::vector<Chapter>().swap(g_book.chapters);
+    /* 书签也跟着清掉：段号/偏移都是针对刚才那本书算的，留着就是脏数据
+     * （ini 里的书签本身不动，下次打开这本书会重新读回来） */
+    std::vector<std::wstring>().swap(s_bms);
+    g_bmParas.clear();
 
     ClearSearchState();
     ViewSetBook();
@@ -897,6 +1237,440 @@ void UiCloseFile()
     InvalidateRect(g_hMain, nullptr, TRUE);
 }
 
+/* ============================================================================
+ * 网页小说（Ctrl+U / 文件菜单「打开网页小说」）
+ * ============================================================================
+ * 做三件事：①问用户要网址（剪贴板里是网址就替他填好）；②带进度地抓完整本书；
+ * ③把抓下来的正文写成 UTF-8 文件塞进缓存目录，然后走正常 UiOpenFile。
+ * 为什么不直接把文本塞进 g_book：落成文件之后，书架、进度、书签、重新打开、
+ * 拖拽、最近打开列表统统不用改代码就能用 —— 这是"多格式先抽成文本"思路的延续。
+ */
+
+/* 去首尾空白（网页/剪贴板里的网址常带换行和空格）。和 web.cpp 里那个 TrimW 同名同义，
+ * 但那个是 web.cpp 的 static，这里再写一份，避免为了一个 3 行函数去导出一个公共符号。 */
+static std::wstring TrimW(const std::wstring& s)
+{
+    size_t a = 0, b = s.size();
+    while (a < b) {
+        wchar_t c = s[a];
+        if (c == L' ' || c == L'\t' || c == L'\r' || c == L'\n' || c == 0x3000 || c == 0xA0) a++;
+        else break;
+    }
+    while (b > a) {
+        wchar_t c = s[b - 1];
+        if (c == L' ' || c == L'\t' || c == L'\r' || c == L'\n' || c == 0x3000 || c == 0xA0) b--;
+        else break;
+    }
+    return s.substr(a, b - a);
+}
+/* 网址输入框的返回值（跨 WndProc 传递，所以放文件级静态） */
+static std::wstring s_urlBoxText;
+static bool         s_urlBoxDone   = false;
+static HWND         s_urlBoxEdit   = nullptr;
+static bool         s_urlBoxReady  = false;   /* 窗口类是否已经注册过 */
+
+/* 网址输入框的子控件 ID（只在这一次对话框里用，不放进 ids.h 免得和主窗口撞号） */
+#define URLBOX_EDIT  1
+#define URLBOX_OK    2
+#define URLBOX_CANCEL 3
+
+/* 网址输入框的窗口过程：只有一个 EDIT 和两个按钮，回车=确定、ESC=取消。
+ * 自己画一个而不是用 InputBox：Win32 没有原生 InputBox，引 dialog 资源又会
+ * 让 exe 多一份 .res 依赖。 */
+static LRESULT CALLBACK UrlBoxProc(HWND h, UINT msg, WPARAM w, LPARAM l)
+{
+    switch (msg) {
+    case WM_CREATE: {
+        /* 提示文字 + 输入框 + 两个按钮，坐标全部按 DPI 缩放 */
+        s_urlBoxEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                                       WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                                       S(16), S(46), S(488), S(26), h, (HMENU)URLBOX_EDIT, nullptr, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"打开(&O)", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                        S(352), S(84), S(74), S(28), h, (HMENU)URLBOX_OK, nullptr, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                        S(432), S(84), S(72), S(28), h, (HMENU)URLBOX_CANCEL, nullptr, nullptr);
+        /* 预先填好剪贴板里的网址（用户从浏览器复制过来直接按回车就行） */
+        if (s_urlBoxEdit) {
+            SetWindowTextW(s_urlBoxEdit, s_urlBoxText.c_str());
+            SendMessageW(s_urlBoxEdit, EM_SETSEL, 0, -1);
+            SetFocus(s_urlBoxEdit);
+        }
+        return 0;
+    }
+    case WM_COMMAND:
+        if (LOWORD(w) == URLBOX_OK) {
+            wchar_t buf[2048];
+            buf[0] = 0;
+            if (s_urlBoxEdit) GetWindowTextW(s_urlBoxEdit, buf, 2048);
+            s_urlBoxText = buf;
+            s_urlBoxDone = true;
+            DestroyWindow(h);
+            return 0;
+        }
+        if (LOWORD(w) == URLBOX_CANCEL) {
+            DestroyWindow(h);
+            return 0;
+        }
+        return 0;
+    case WM_CLOSE:
+        DestroyWindow(h);
+        return 0;
+    case WM_DESTROY:
+        s_urlBoxEdit = nullptr;
+        return 0;
+    }
+    return DefWindowProcW(h, msg, w, l);
+}
+
+/* 从剪贴板里取一段文本（取不到返回空串）。用来给网址输入框做预填。 */
+static std::wstring ClipboardText()
+{
+    std::wstring out;
+    if (!OpenClipboard(g_hMain)) return out;
+    HANDLE h = GetClipboardData(CF_UNICODETEXT);
+    if (h) {
+        const wchar_t* p = (const wchar_t*)GlobalLock(h);
+        if (p) { out = p; GlobalUnlock(h); }
+    }
+    CloseClipboard();
+    return TrimW(out);
+}
+
+/* 弹网址输入框。确定返回 true 并把网址写进 out，取消返回 false。
+ * 用 EnableWindow(g_hMain, FALSE) 做成模态：主窗口在输入期间不接受输入，
+ * 但消息循环仍然在跑（所以界面不会假死）。 */
+static bool AskUrlBox(std::wstring& out)
+{
+    HINSTANCE hi = GetModuleHandleW(nullptr);
+    if (!s_urlBoxReady) {
+        WNDCLASSEXW wc;
+        ZeroMemory(&wc, sizeof(wc));
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = UrlBoxProc;
+        wc.hInstance = hi;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"NRUrlBox";
+        RegisterClassExW(&wc);
+        s_urlBoxReady = true;
+    }
+
+    /* 剪贴板里已经是网址就预填（这是最常见的用法：浏览器里复制地址栏再切过来） */
+    s_urlBoxText = ClipboardText();
+    if (!WebIsUrl(s_urlBoxText)) s_urlBoxText.clear();
+    s_urlBoxDone = false;
+
+    RECT wr;
+    GetWindowRect(g_hMain, &wr);
+    int wpx = S(520), hpx = S(160);
+    int x = (wr.left + wr.right - wpx) / 2;
+    int y = (wr.top + wr.bottom - hpx) / 2;
+
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"NRUrlBox", L"打开网页小说 — 粘贴目录页网址",
+                               WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+                               x, y, wpx, hpx, g_hMain, nullptr, hi, nullptr);
+    if (!dlg) return false;
+
+    /* 标题下面那句提示单独画：CreateWindow 时没有静态控件的空间，用 WM_PAINT 不方便，
+     * 所以这里塞一个 STATIC 子窗口（比自绘省事，也会自动跟 DPI 走）。 */
+    CreateWindowExW(0, L"STATIC",
+                    L"支持 http / https。目录页会自动找出所有章节并逐章抓取；"
+                    L"如果只有单页，就把这一页当全书。",
+                    WS_CHILD | WS_VISIBLE | SS_LEFT,
+                    S(16), S(16), S(480), S(24), dlg, nullptr, hi, nullptr);
+
+    EnableWindow(g_hMain, FALSE);
+    ShowWindow(dlg, SW_SHOW);
+    SetForegroundWindow(dlg);
+
+    /* 局部消息循环：直到这个对话框销毁才返回 */
+    MSG msg;
+    while (IsWindow(dlg) && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (!IsDialogMessageW(dlg, &msg)) {     /* 让 TAB / 回车在对话框内部生效 */
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    EnableWindow(g_hMain, TRUE);
+    SetForegroundWindow(g_hMain);
+
+    if (!s_urlBoxDone) return false;
+    out = TrimW(s_urlBoxText);
+    return !out.empty();
+}
+
+
+/* ---- 手机阅读提示窗 ----------------------------------------------------
+ * 为什么用自建窗口而不是 MessageBoxW：
+ *   MessageBox 里的文字不能选中、不能复制，而网址必须能复制到手机浏览器。
+ * 窗口里放一个只读的多行 EDIT 装地址，一个"复制地址"按钮就够用了。 */
+static LRESULT CALLBACK PhoneBoxProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    switch (m)
+    {
+    case WM_CREATE:
+    {
+        HINSTANCE hi = GetModuleHandleW(nullptr);
+        CreateWindowExW(0, L"STATIC", L"手机与电脑连同一个 WiFi，用浏览器打开下面的地址：",
+                        WS_CHILD | WS_VISIBLE | SS_LEFT,
+                        S(16), S(14), S(528), S(22), h, nullptr, hi, nullptr);
+        /* 地址框：只读、多行、自动换行不必要（一行一个地址） */
+        HWND ed = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                                  WS_CHILD | WS_VISIBLE | WS_BORDER | ES_MULTILINE |
+                                  ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL,
+                                  S(16), S(40), S(528), S(112), h,
+                                  (HMENU)(INT_PTR)5, hi, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"复制地址",
+                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                        S(16), S(166), S(130), S(34), h, (HMENU)(INT_PTR)2, hi, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"关闭",
+                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                        S(414), S(166), S(130), S(34), h, (HMENU)(INT_PTR)3, hi, nullptr);
+        CreateWindowExW(0, L"STATIC",
+                        L"连不上时：确认手机和电脑在同一个 WiFi，并允许本程序通过 Windows 防火墙。",
+                        WS_CHILD | WS_VISIBLE | SS_LEFT,
+                        S(16), S(208), S(528), S(40), h, nullptr, hi, nullptr);
+        (void)ed;
+        return 0;
+    }
+    case WM_COMMAND:
+        if (LOWORD(w) == 2)
+        {
+            /* 复制：把地址框里的文字放进剪贴板 */
+            HWND ed = GetDlgItem(h, 5);
+            int n = ed ? GetWindowTextLengthW(ed) : 0;
+            if (n > 0 && OpenClipboard(h))
+            {
+                EmptyClipboard();
+                HGLOBAL g = GlobalAlloc(GMEM_MOVEABLE, ((size_t)n + 1) * sizeof(wchar_t));
+                if (g)
+                {
+                    wchar_t* p = (wchar_t*)GlobalLock(g);
+                    if (p) { GetWindowTextW(ed, p, n + 1); GlobalUnlock(g); SetClipboardData(CF_UNICODETEXT, g); }
+                }
+                CloseClipboard();
+            }
+            return 0;
+        }
+        if (LOWORD(w) == 3) { DestroyWindow(h); return 0; }
+        break;
+    case WM_CLOSE:
+        DestroyWindow(h);
+        return 0;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+/* 弹出手机阅读提示窗；同时确保服务已经启动 */
+void UiShowPhone()
+{
+    std::wstring err;
+    if (!ServerStart(0, err))
+    {
+        MessageBoxW(g_hMain, (L"启动手机阅读服务失败：" + err).c_str(),
+                    L"手机阅读", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    /* 拼地址清单 */
+    std::vector<std::wstring> urls = ServerUrls();
+    std::wstring text;
+    if (urls.empty())
+    {
+        text = L"（没找到局域网地址，请先连上 WiFi 或有线网络）";
+    }
+    else
+    {
+        for (size_t i = 0; i < urls.size(); i++)
+        {
+            if (i) text += L"\r\n";
+            text += urls[i];
+        }
+    }
+
+    HINSTANCE hi = GetModuleHandleW(nullptr);
+    static bool s_reg = false;
+    if (!s_reg)
+    {
+        WNDCLASSEXW wc;
+        ZeroMemory(&wc, sizeof(wc));
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = PhoneBoxProc;
+        wc.hInstance = hi;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"NRPhoneBox";
+        RegisterClassExW(&wc);
+        s_reg = true;
+    }
+
+    RECT wr;
+    GetWindowRect(g_hMain, &wr);
+    int wpx = S(576), hpx = S(268);
+    int x = (wr.left + wr.right - wpx) / 2;
+    int y = (wr.top + wr.bottom - hpx) / 2;
+
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"NRPhoneBox", L"手机阅读 — 用手机浏览器打开",
+                               WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+                               x, y, wpx, hpx, g_hMain, nullptr, hi, nullptr);
+    if (!dlg)
+    {
+        MessageBoxW(g_hMain, text.c_str(), L"手机阅读", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    SetDlgItemTextW(dlg, 5, text.c_str());
+    EnableWindow(g_hMain, FALSE);
+    ShowWindow(dlg, SW_SHOW);
+    SetForegroundWindow(dlg);
+
+    MSG msg;
+    while (IsWindow(dlg) && GetMessageW(&msg, nullptr, 0, 0) > 0)
+    {
+        if (!IsDialogMessageW(dlg, &msg))
+        {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    if (!IsWindow(dlg)) EnableWindow(g_hMain, TRUE);
+    else EnableWindow(g_hMain, TRUE);
+    SetForegroundWindow(g_hMain);
+}
+
+/* 跳到手机端最近保存的阅读位置 */
+void UiJumpPhoneProgress()
+{
+    std::wstring path, chapter;
+    int off = 0, pct = 0;
+    if (!ServerLastPhoneProgress(path, off, chapter, pct))
+    {
+        MessageBoxW(g_hMain,
+                    L"还没收到手机端的阅读进度。\n\n"
+                    L"先在手机上打开菜单「帮助 → 手机阅读」，用浏览器读几页，再按 Ctrl+G 跳过来。",
+                    L"手机进度", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    if (!g_book.Ok() || g_book.path != path)
+    {
+        std::wstring hint = L"手机正在读另一本书：\n" + path + L"\n\n要打开它吗？";
+        if (MessageBoxW(g_hMain, hint.c_str(), L"手机进度",
+                        MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+        UiOpenFile(path);
+    }
+    ViewGotoOffset(off, 0);
+    wchar_t b[128];
+    swprintf(b, 128, L"已跳到手机端位置：%.1f%%", (double)pct / 10.0);
+    s_statusExtra = b;
+    UiUpdateStatus();
+}
+
+/* 抓书进度回调：把进度写进状态栏第 0 段，并抽空处理消息（否则界面在几十章
+ * 的抓取过程中会一直白屏、用户以为卡死了）。按住 ESC 可以取消。 */
+static bool WebProgressCb(void* ctx, int done, int total, const std::wstring& msg)
+{
+    (void)ctx;
+    std::wstring s;
+    if (!msg.empty()) {
+        s = msg;
+    } else if (total > 0) {
+        wchar_t b[128];
+        swprintf(b, 128, L"已抓取 %d/%d 章…", done, total);
+        s = b;
+    } else {
+        s = L"正在抓取…";
+    }
+    if (s_hStatus) SendMessageW(s_hStatus, SB_SETTEXTW, 0, (LPARAM)s.c_str());
+
+    MSG m;
+    while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) {
+        if (m.message == WM_QUIT) { PostQuitMessage((int)m.wParam); return false; }
+        TranslateMessage(&m);
+        DispatchMessageW(&m);
+    }
+    /* ESC 取消：用 GetAsyncKeyState 而不是收键盘消息 —— 抓取期间焦点可能不在本窗口 */
+    if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) return false;
+    return true;
+}
+
+/* 把抓到的正文写成 UTF-8（带 BOM）文件。带 BOM 是为了让 BookLoad 一眼认出编码，
+ * 也方便用户用记事本打开看。 */
+static bool WriteTextFileUtf8Bom(const std::wstring& path, const std::wstring& text)
+{
+    int n = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), (int)text.size(), nullptr, 0, nullptr, nullptr);
+    if (n < 0) return false;
+    std::string u8((size_t)n, '\0');
+    if (n > 0) WideCharToMultiByte(CP_UTF8, 0, text.c_str(), (int)text.size(), &u8[0], n, nullptr, nullptr);
+
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    const unsigned char bom[3] = { 0xEF, 0xBB, 0xBF };
+    DWORD wrote = 0;
+    bool ok = WriteFile(h, bom, 3, &wrote, nullptr) && wrote == 3;
+    if (ok && !u8.empty()) {
+        ok = WriteFile(h, u8.data(), (DWORD)u8.size(), &wrote, nullptr) && wrote == (DWORD)u8.size();
+    }
+    CloseHandle(h);
+    return ok;
+}
+
+/* 菜单/Ctrl+U 的入口：问网址 → 抓 → 存文件 → 打开。 */
+void UiOpenWebNovel()
+{
+    std::wstring url;
+    if (!AskUrlBox(url)) return;
+    if (!WebIsUrl(url)) {
+        MessageBoxW(g_hMain, L"网址要以 http:// 或 https:// 开头。\n\n例如：https://www.example.com/book/123/",
+                    L"网址不对", MB_ICONINFORMATION);
+        return;
+    }
+
+    /* 抓取期间先把自动下滑停掉，避免定时器在"没有书"的状态下乱滚 */
+    UiAutoStop();
+
+    HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+    std::wstring text, title, err;
+    bool ok = WebFetchBook(url, text, title, err, WebProgressCb, nullptr);
+    SetCursor(old);
+
+    if (!ok) {
+        std::wstring m = L"抓取失败：\n\n";
+        m += err.empty() ? std::wstring(L"未知原因。") : err;
+        m += L"\n\n";
+        m += url;
+        MessageBoxW(g_hMain, m.c_str(), L"抓取失败", MB_ICONWARNING);
+        UiUpdateStatus();
+        return;
+    }
+
+    /* 落到缓存目录：文件名就是书名，所以打开后标题栏/书架都会显示书名 */
+    std::wstring path = WebCachePath(title);
+    if (!WriteTextFileUtf8Bom(path, text)) {
+        std::wstring m = L"抓到了内容，但写文件失败：\n\n";
+        m += path;
+        MessageBoxW(g_hMain, m.c_str(), L"保存失败", MB_ICONWARNING);
+        UiUpdateStatus();
+        return;
+    }
+
+    /* 记下来源网址：以后想"重新抓取"或者想找回原站时用得上 */
+    IniSetStr(PosSectionFor(path).c_str(), L"src", url.c_str());
+
+    std::wstring chars = std::to_wstring((long long)text.size());
+    std::wstring m = L"抓取完成：";
+    m += title;
+    m += L"\n\n共 ";
+    m += chars;
+    m += L" 字\n已保存到：";
+    m += path;
+    m += L"\n\n现在打开阅读吗？";
+    if (MessageBoxW(g_hMain, m.c_str(), L"抓取完成", MB_YESNO | MB_ICONINFORMATION) != IDYES) {
+        UiUpdateStatus();
+        return;
+    }
+    UiOpenFile(path);
+}
 /* 弹「打开文件」对话框，返回选中路径；用户取消返回空串。
  * 细节：过滤器给两组（txt 默认 + 所有文件），末尾的 "\0\0" 是必需的收尾，
  * 漏了会把相邻内存当成字符串读出一串乱码；OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST
@@ -915,10 +1689,11 @@ static std::wstring OpenDlg()
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = g_hMain;
     ofn.lpstrFilter =
-        L"所有支持的格式 (*.txt;*.epub;*.html;*.htm;*.md;*.docx)\0"
-        L"*.txt;*.epub;*.html;*.htm;*.md;*.docx\0"
+        L"所有支持的格式 (*.txt;*.epub;*.pdf;*.docx;*.html;*.md)\0"
+        L"*.txt;*.epub;*.pdf;*.docx;*.html;*.htm;*.md\0"
         L"纯文本 (*.txt;*.md;*.html;*.htm)\0*.txt;*.md;*.html;*.htm\0"
         L"电子书 (*.epub)\0*.epub\0"
+        L"PDF 文档 (*.pdf)\0*.pdf\0"
         L"Word 文档 (*.docx)\0*.docx\0"
         L"所有文件 (*.*)\0*.*\0\0";
     ofn.lpstrFile = buf;
@@ -997,6 +1772,8 @@ static HMENU BuildMenu()
     /* 关闭当前书：回到首页书架。和「退出」分开是有意的 —— 想换一本书时不该把程序关掉 */
     AppendMenuW(f, MF_STRING, IDM_CLOSEFILE, L"关闭当前书(&C)\tCtrl+W");
     AppendMenuW(f, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(f, MF_STRING, IDM_OPEN_URL, L"打开网页小说(&U)...\tCtrl+U");
+    AppendMenuW(f, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(f, MF_STRING, IDM_EXIT, L"退出(&X)");
     AppendMenuW(h, MF_POPUP, (UINT_PTR)f, L"文件(&F)");
 
@@ -1007,13 +1784,37 @@ static HMENU BuildMenu()
     AppendMenuW(r, MF_STRING, IDM_FONT_UP, L"字号增大\tCtrl+=");
     AppendMenuW(r, MF_STRING, IDM_FONT_DOWN, L"字号减小\tCtrl+-");
     AppendMenuW(r, MF_STRING, IDM_LINE_SPACE, L"切换行距");
-    AppendMenuW(r, MF_STRING, IDM_THEME, L"夜间模式\tF2");
+    AppendMenuW(r, MF_STRING, IDM_THEME, L"日间 / 夜间切换\tF2");
     AppendMenuW(r, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(r, MF_STRING, IDM_AUTO_TOGGLE, L"自动下滑\tF6");
     AppendMenuW(r, MF_STRING, IDM_AUTO_FAST, L"下滑加速\tF8");
     AppendMenuW(r, MF_STRING, IDM_AUTO_SLOW, L"下滑减速\tF7");
     AppendMenuW(r, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(r, MF_STRING, IDM_TOC, L"显示/隐藏目录\tCtrl+T");
+
+    /* 书签子菜单：加 / 看 / 删。删除不给快捷键 —— 删数据不该有"顺手就按到"的键。 */
+    HMENU bm = CreatePopupMenu();
+    AppendMenuW(bm, MF_STRING, IDM_BM_ADD,  L"添加书签\tCtrl+D");
+    AppendMenuW(bm, MF_STRING, IDM_BM_LIST, L"书签列表\tCtrl+B");
+    AppendMenuW(bm, MF_STRING, IDM_BM_DEL,  L"删除此段书签");
+    AppendMenuW(r, MF_POPUP, (UINT_PTR)bm, L"书签(&M)");
+
+    /* 外观子菜单：字体 / 导入字体 / 自定义配色 / 预设方案。
+     * 预设放在二级子菜单里，是因为一共五套，平铺会把「阅读」菜单撑得太长。 */
+    HMENU look = CreatePopupMenu();
+    AppendMenuW(look, MF_STRING, IDM_PICK_FONT,   L"选择字体...");
+    AppendMenuW(look, MF_STRING, IDM_IMPORT_FONT, L"导入字体文件...");
+    AppendMenuW(look, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(look, MF_STRING, IDM_PICK_COLORS, L"自定义配色...");
+    HMENU pre = CreatePopupMenu();
+    AppendMenuW(pre, MF_STRING, IDM_PRESET_BASE + 0, L"日间（米色纸）");
+    AppendMenuW(pre, MF_STRING, IDM_PRESET_BASE + 1, L"夜间（深色）");
+    AppendMenuW(pre, MF_STRING, IDM_PRESET_BASE + 2, L"护眼绿");
+    AppendMenuW(pre, MF_STRING, IDM_PRESET_BASE + 3, L"羊皮纸");
+    AppendMenuW(pre, MF_STRING, IDM_PRESET_BASE + 4, L"高对比暗");
+    AppendMenuW(look, MF_POPUP, (UINT_PTR)pre, L"配色方案");
+    AppendMenuW(r, MF_POPUP, (UINT_PTR)look, L"外观(&A)");
+
     AppendMenuW(h, MF_POPUP, (UINT_PTR)r, L"阅读(&R)");
 
     HMENU s = CreatePopupMenu();
@@ -1025,6 +1826,10 @@ static HMENU BuildMenu()
     AppendMenuW(h, MF_POPUP, (UINT_PTR)s, L"搜索(&S)");
 
     HMENU hp = CreatePopupMenu();
+    AppendMenuW(hp, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(hp, MF_STRING, IDM_PHONE, L"手机阅读（局域网）(&P)...\tCtrl+G");
+    AppendMenuW(hp, MF_STRING, IDM_PHONE_JUMP, L"跳到手机读到的位置\tCtrl+Shift+G");
+    AppendMenuW(hp, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(hp, MF_STRING, IDM_KEYS, L"快捷键说明");
     AppendMenuW(hp, MF_STRING, IDM_ABOUT, L"关于");
     AppendMenuW(h, MF_POPUP, (UINT_PTR)hp, L"帮助(&H)");
@@ -1057,8 +1862,17 @@ static void ShowKeys()
         L"  F3           下一个结果\n"
         L"  Ctrl+C       复制选中文字\n"
         L"  Ctrl+T       显示/隐藏章节目录（也可点侧栏底部那条「收起目录」）\n"
-        L"  F2           日间 / 夜间模式\n"
+        L"  F2           日间 / 夜间切换\n"
         L"  F5           重新载入当前文件\n"
+        L"\n"
+        L"书签与外观\n"
+        L"  Ctrl+D       给当前位置加书签（同一段再加会更新标题）\n"
+        L"  Ctrl+B       打开书签列表，点条目直接跳过去\n"
+        L"  阅读 → 书签 → 删除此段书签   删掉当前这一段的书签\n"
+        L"  阅读 → 外观 → 选择字体       从系统字体里挑正文字体\n"
+        L"  阅读 → 外观 → 导入字体文件   导入 .ttf/.otf/.ttc（只对本程序生效）\n"
+        L"  阅读 → 外观 → 自定义配色     背景 / 正文 / 标题 / 选中色逐个选\n"
+        L"  阅读 → 外观 → 配色方案       日间 / 夜间 / 护眼绿 / 羊皮纸 / 高对比暗\n"
         L"\n"
         L"自动下滑\n"
         L"  F6           开启 / 关闭自动下滑\n"
@@ -1174,14 +1988,15 @@ void UiCycleSpacing()
     IniSetInt(L"settings", L"spacing", g_set.spacing);
 }
 
-/* 日间 / 夜间配色切换（0 日间米色纸，1 夜间深色）。
+/* 日间 / 夜间配色切换（F2）。
+ * 现在的 theme 有三种取值：0 日间 / 1 夜间 / 2 自定义。F2 只在「日间 ↔ 夜间」之间跳，
+ * 从自定义状态按 F2 会回到日间（否则用户会困在自己配的颜色里找不到一键变亮的路）。
  * ViewMetricsChanged(false)：换主题只影响颜色，不影响换行与行高；传 true 会让
  * 几万段的行数缓存白算一遍，滚动立刻卡一下。
- * 主题没有菜单勾选，所以不调 AutoSyncMenu；具体颜色由 view.cpp 的 CurTheme() 给。
- */
+ * 具体颜色由 view.cpp 的 CurTheme() 给：theme==2 时用 g_set 里的 c* 颜色现拼。 */
 void UiToggleTheme()
 {
-    g_set.theme = g_set.theme ? 0 : 1;
+    g_set.theme = (g_set.theme == 1) ? 0 : 1;
     ViewMetricsChanged(false);
     IniSetInt(L"settings", L"theme", g_set.theme);
 }
@@ -1342,6 +2157,11 @@ static void OnCommand(int id, int code, HWND ctl)
         UiOpenFile(p);
         return;
     }
+    /* 预设配色：IDM_PRESET_BASE..+IDM_PRESET_MAX-1 连号，用区间判断省掉五个 case */
+    if (id >= IDM_PRESET_BASE && id < IDM_PRESET_BASE + IDM_PRESET_MAX) {
+        UiApplyPreset(id - IDM_PRESET_BASE);
+        return;
+    }
     switch (id) {
     case IDM_OPEN: {
         std::wstring p = OpenDlg();
@@ -1374,9 +2194,18 @@ static void OnCommand(int id, int code, HWND ctl)
     case IDM_SELALL:    ViewSelectAll(); break;
     case IDM_KEYS:      ShowKeys(); break;
     case IDM_ABOUT:     ShowAbout(); break;
+    case IDM_PHONE:       UiShowPhone(); break;
+    case IDM_PHONE_JUMP:  UiJumpPhoneProgress(); break;
     case IDM_AUTO_TOGGLE: UiAutoToggle(); break;
     case IDM_AUTO_FAST:   UiAutoFaster(); break;
     case IDM_AUTO_SLOW:   UiAutoSlower(); break;
+    case IDM_BM_ADD:      UiAddBookmark(); break;
+    case IDM_BM_LIST:     UiShowBookmarks(); break;
+    case IDM_BM_DEL:      UiDelBookmark(); break;
+    case IDM_OPEN_URL:    UiOpenWebNovel(); break;
+    case IDM_PICK_FONT:   UiPickFont(); break;
+    case IDM_IMPORT_FONT: UiImportFont(); break;
+    case IDM_PICK_COLORS: UiPickColors(); break;
 
     case IDC_TOC:
         if (code == LBN_SELCHANGE && !s_tocSync && g_book.Ok()) {            int sel = (int)SendMessageW(s_hToc, LB_GETCURSEL, 0, 0);
@@ -1389,7 +2218,19 @@ static void OnCommand(int id, int code, HWND ctl)
     case IDC_HITS:
         if (code == LBN_SELCHANGE && !s_hitSync) {
             int sel = (int)SendMessageW(s_hHits, LB_GETCURSEL, 0, 0);
-            if (sel >= 0 && sel < (int)s_hits.size()) UiJumpHit(sel);
+            /* 这个 LISTBOX 是两个面板共用的：s_panel==2 时它显示书签，其余显示搜索结果。
+             * 所以点击后的动作要按当前面板分开处理，否则点书签会去查搜索结果数组。 */
+            if (s_panel == 2) {
+                if (sel >= 0 && sel < (int)s_bms.size()) {
+                    int off = BmParseOffset(s_bms[(size_t)sel]);
+                    if (off >= 0) {
+                        ViewGotoOffset(off, 0);
+                        UiUpdateStatus();
+                    }
+                }
+            } else if (sel >= 0 && sel < (int)s_hits.size()) {
+                UiJumpHit(sel);
+            }
         }
         break;
     case IDC_BFIND: {
@@ -1596,6 +2437,11 @@ static HACCEL BuildAccel()
         { FVIRTKEY | FCONTROL,             'W',         IDM_CLOSEFILE },
         { FVIRTKEY | FCONTROL,             'F',         IDM_FIND },
         { FVIRTKEY | FCONTROL,             'T',         IDM_TOC },
+        { FVIRTKEY | FCONTROL,             'D',         IDM_BM_ADD },
+            { FVIRTKEY | FCONTROL,             'U',         IDM_OPEN_URL },
+            { FVIRTKEY | FCONTROL,             'G',         IDM_PHONE },
+            { FVIRTKEY | FCONTROL | FSHIFT,    'G',         IDM_PHONE_JUMP },
+{ FVIRTKEY | FCONTROL,             'B',         IDM_BM_LIST },
         { FVIRTKEY,                        VK_F2,       IDM_THEME },
         { FVIRTKEY,                        VK_F3,       IDM_FIND_NEXT },
         { FVIRTKEY,                        VK_F5,       IDM_RELOAD },
@@ -1701,6 +2547,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdLine, int)
     /* 首页书架的数据源：必须在第一次绘制之前读好，否则第一帧是空的、
      * 要等下一次重绘才出现书（会看到一次闪烁）。 */
     ShelfRefresh();
+
+    /* 用户导入过的字体文件要在这里私有加载一遍，必须早于第一次建字体
+     * （否则第一帧会用回退字体画，等换页才"突然变成"用户选的字体）。 */
+    FontsLoadImported();
 
     /* 状态栏属于通用控件，必须先 InitCommonControlsEx 才能 CreateWindowExW 成功 */
     INITCOMMONCONTROLSEX icc;

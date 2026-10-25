@@ -77,13 +77,33 @@ struct Book {
  * 都是小整数 + 窗口矩形，写得直接，读的时候缺省值就放在成员初始值里。 */
 struct Settings {
     int  fontPt  = 17;      /* 阅读字号（磅），界面里限制 10~48 */
-    int  theme   = 0;       /* 0 日间（米色纸） 1 夜间（深色） */
+    int  theme   = 0;       /* 配色：0 日间（米色纸） 1 夜间（深色） 2 自定义（用下面的 c* 颜色） */
     int  sidebar = 1;       /* 是否显示左侧目录面板 */
     int  spacing = 1;       /* 行距档位：0 紧凑 1 标准 2 宽松（对应 view.cpp 的 kSpacing[]） */
     int  autoSpeed = 4;     /* 自动下滑速度，1（最慢，约 3 秒一行）~ 10（最快，约 0.3 秒一行） */
     std::wstring lastFile;  /* 上次打开的书，启动时无参数就自动打开它 */
     RECT winRect{};         /* 上次的窗口位置和大小 */
     bool hasRect = false;   /* winRect 是否有效（第一次运行没有记录，就用默认尺寸） */
+
+    /* ---- 外观：字体 ---- */
+    /* 正文字体名（如 "Microsoft YaHei" / "思源宋体 CN"）。空串表示用内置默认字体。
+     * 名字来自系统字体对话框，或用户导入的字体文件里真实的 family 名 —— 名字写错
+     * 时 CreateFontIndirectW 会自动回退到系统默认字体，不会崩，只是显示不如预期。 */
+    std::wstring fontFace = L"Microsoft YaHei";
+    /* 用户导入的字体文件列表（.ttf/.otf 绝对路径），多个之间用 '|' 分隔。
+     * 存路径而不是把字体嵌进 exe：字体动辄几 MB，写进 ini 才能"导入一次，以后都在"。
+     * 启动时由 view.cpp 的 FontsLoadImported() 逐个 AddFontResourceExW 私有加载，
+     * 私有加载只对本进程可见，不会污染系统的"已安装字体"列表。 */
+    std::wstring fontFiles;
+
+    /* ---- 外观：自定义配色（只有 theme == 2 时生效） ---- */
+    /* 注意 ini 里存的是 COLORREF 的整数（0x00BBGGRR），读写时转十进制，不存 "#RRGGBB"
+     * 字符串 —— 整数解析更短、更不容易因为手改 ini 写错颜色而解析失败。 */
+    COLORREF cBg    = RGB(0xF7, 0xF3, 0xE9);  /* 正文背景 */
+    COLORREF cFg    = RGB(0x31, 0x2D, 0x27);  /* 正文文字 */
+    COLORREF cTitle = RGB(0x8A, 0x5A, 0x2B);  /* 章节标题文字 */
+    COLORREF cSel   = RGB(0xBF, 0xDC, 0xF4);  /* 选中文字的背景（正文色会按对比度自动反转） */
+    COLORREF cHov   = RGB(0xEC, 0xE6, 0xD8);  /* 悬停/次级底色：首页书架悬停行、折叠条 */
 };
 
 /* 一套配色。日间/夜间各一份，见 view.cpp 的 kDay / kNight。 */
@@ -168,6 +188,12 @@ std::wstring BookChapterTitle(const Book& b, int chIdx);
 
 /* 取第 para 段的正文（不含换行符）；越界返回空串 */
 std::wstring BookParaText(const Book& b, int para);
+
+/* 网页抓取用的两个桥函数（实现都在 book.cpp，见那里的注释）。
+ * BytesToText：任意字节流按与打开文件完全相同的规则解码成宽字符；
+ * BookLooksLikeChapterTitle：这一行是否算章节标题（与分章逻辑同一判定）。 */
+std::wstring BytesToText(const std::string& s);
+bool BookLooksLikeChapterTitle(const std::wstring& line);
 
 /* 从 from 处向后找第一处 needle，返回命中的字符偏移，找不到返回 -1；
  * *hitLen 返回命中长度（调用方用它做高亮）。ASCII 字母大小写不敏感。
@@ -286,6 +312,15 @@ void UiOpenFile(const std::wstring& path);
  * 会先把进度落盘、重建书架列表，再把标题栏/目录/状态栏清干净。 */
 void UiCloseFile();
 
+/* 打开网页小说：弹网址输入框 → 抓整本 → 存成缓存 txt → 打开（实现见 ui.cpp）。 */
+void UiOpenWebNovel();
+
+/* 手机阅读：启动局域网服务并弹出地址提示窗（已经启动就只弹地址）*/
+void UiShowPhone();
+
+/* 跳到手机端最近保存的阅读位置（控制键 Ctrl+G）*/
+void UiJumpPhoneProgress();
+
 /* 把当前的阅读进度写进 ini（偏移 + 章节号 + 章数 + 百分比 + 章名 + 书名）。
  * 界面里所有"该存盘了"的地方都调它，省得每个调用点自己拼一遍参数。 */
 void UiSaveProgress();
@@ -325,5 +360,34 @@ void UiAutoSlower();
 void UiAutoStop();
 void UiAutoApplyTimer();   /* 速度变了：按新的间隔重设定时器 */
 bool UiAutoRunning();
+
+/* =====================================================================
+ * 书签 / 外观（ui.cpp + ini.cpp）
+ * ===================================================================== */
+
+/* 书签：每本书一份，元素是 "字符偏移|标题" 的字符串。
+ * 为什么存在 ini 的独立段（段名 = "bm" + 该书的 f 哈希）而不是塞进进度段：
+ * 进度段每 2.5 秒就可能被重写一次，而书签是低频、用户珍视的数据，
+ * 混在一起重写时更容易因为某次意外而整段丢掉。分开存，互不影响。 */
+std::vector<std::wstring> BookmarkLoad(const std::wstring& path);
+void BookmarkSave(const std::wstring& path, const std::vector<std::wstring>& items);
+
+/* 带书签的段落序号（升序），供 view.cpp 在正文左侧画一个小旗标记。
+ * 由 ui.cpp 在打开书、增删书签时重建。 */
+extern std::vector<int> g_bmParas;
+
+void UiAddBookmark();      /* 给当前阅读位置加一条书签（已在同一段则更新标题） */
+void UiShowBookmarks();    /* 打开书签面板（复用侧栏列表） */
+void UiDelBookmark();      /* 删掉当前这一段上的书签 */
+
+/* 外观：选字体 / 导入字体文件 / 自定义配色 / 套用预设方案。
+ * 四者改完都会立刻重排重绘并把设置写回 ini。 */
+void UiPickFont();
+void UiImportFont();
+void UiPickColors();
+void UiApplyPreset(int idx);
+
+/* 载入用户导入的字体文件（启动时调一次，私有加载，不装进系统） */
+void FontsLoadImported();
 
 #endif /* NR_COMMON_H */

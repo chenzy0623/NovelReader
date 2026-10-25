@@ -56,6 +56,23 @@
 #define IDM_AUTO_FAST   1241    /* 加速（F8），1~10 级，级数越大滚动间隔越短 */
 #define IDM_AUTO_SLOW   1242    /* 减速（F7） */
 
+/* ---- 外观：字体 / 配色（1250~1269） ---- */
+#define IDM_PICK_FONT   1250    /* 选正文字体（走系统字体对话框，可挑字体名和字号） */
+#define IDM_IMPORT_FONT 1251    /* 导入 .ttf/.otf/..ttc 字体文件：私有加载，不装进系统，可反复导入 */
+#define IDM_PICK_COLORS 1252    /* 自定义配色：背景 / 正文 / 标题 / 选中色各选一次 */
+#define IDM_PRESET_BASE 1260    /* 预设配色方案起始 ID，实际用 1260+i（i=0..IDM_PRESET_MAX-1） */
+#define IDM_PRESET_MAX  5       /* 预设方案个数：日间 / 夜间 / 护眼 / 羊皮纸 / 高对比暗 */
+
+/* ---- 书签（1270~1279） ---- */
+#define IDM_BM_ADD      1270    /* 给当前阅读位置加书签（Ctrl+D） */
+#define IDM_BM_LIST     1271    /* 打开/切到书签列表（Ctrl+B） */
+#define IDM_BM_DEL      1272    /* 删掉当前这一段上的书签 */
+
+/* ---- 网页小说（1280~1299，预留） ---- */
+#define IDM_OPEN_URL    1280    /* 从网址打开：抓网页正文（后续做成整本抓取） */
+#define IDM_PHONE        1290   /* 手机阅读：开局域网服务并显示地址 */
+#define IDM_PHONE_JUMP   1291   /* 跳到手机端最近读到的位置 */
+
 /* ---- 子控件 ID ---- */
 #define IDC_TOC         2001    /* 左侧章节目录 LISTBOX */
 #define IDC_HITS        2002    /* 左侧搜索结果 LISTBOX（与目录互斥显示） */

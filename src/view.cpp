@@ -72,9 +72,50 @@ static const Theme kDay   = { RGB(0xF7,0xF3,0xE9), RGB(0x31,0x2D,0x27), RGB(0x8A
 static const Theme kNight = { RGB(0x18,0x19,0x1A), RGB(0xC4,0xC6,0xC8), RGB(0x84,0xA6,0xD0),
                               RGB(0x33,0x4E,0x6B), RGB(0xEE,0xEE,0xEE), RGB(0x74,0x76,0x7A),
                               RGB(0x24,0x26,0x29) };
-/* 当前主题：只由 g_set.theme（0 日间 / 1 夜间）这一个开关决定。返回的是静态常量的引用，调用方一律
-   const Theme& th = CurTheme(); 只读引用，每帧多次调用也没有拷贝开销。 */
-const Theme& CurTheme() { return g_set.theme ? kNight : kDay; }
+/* 自定义配色的拼装结果：由 g_set 里的 cBg / cFg / cTitle / cSel / cHov 在 CurTheme()
+ * 里即时算出来，放在静态变量里返回引用 —— 每帧要调几十次，没必要每次构造一个 Theme。 */
+static Theme s_custom;
+
+/* 颜色混合：把 a 与 b 按 pa:(100-pa) 的比例混合（pa 是 a 的百分比）。
+ * 用途：从"背景色 + 正文色"推算出次要文字色（dim）和分隔线色，这样用户只选
+ * 两个主色，其余层次自动跟着走，不会出现"自己配了一套但次要文字还是原来的棕色"。 */
+static COLORREF Mix(COLORREF a, COLORREF b, int pa)
+{
+    if (pa < 0) pa = 0;
+    if (pa > 100) pa = 100;
+    int ar = GetRValue(a), ag = GetGValue(a), ab = GetBValue(a);
+    int br = GetRValue(b), bg2 = GetGValue(b), bb = GetBValue(b);
+    int r = (ar * pa + br * (100 - pa)) / 100;
+    int g = (ag * pa + bg2 * (100 - pa)) / 100;
+    int bl = (ab * pa + bb * (100 - pa)) / 100;
+    return RGB(r, g, bl);
+}
+
+/* 感知亮度（0~255，整数近似 Rec.601 权重）。
+ * 用途：选中色可能被用户选成深蓝或浅黄，选中文字究竟该用黑还是白，
+ * 只能看底色深浅来定，否则会出现"深底深字"看不见。 */
+static int Luma(COLORREF c)
+{
+    return (GetRValue(c) * 299 + GetGValue(c) * 587 + GetBValue(c) * 114) / 1000;
+}
+
+/* 当前主题：g_set.theme 三种取值 —— 0 日间、1 夜间、2 自定义。
+ * 自定义时用用户选的颜色现拼一套；选中文字的前景色按选中底色的亮度自动取黑或白，
+ * 次要文字色按"正文色 55% + 背景色 45%"混合出来，保证在任何配色下都能看出层次。 */
+const Theme& CurTheme()
+{
+    if (g_set.theme == 1) return kNight;
+    if (g_set.theme != 2) return kDay;
+    s_custom.bg    = g_set.cBg;
+    s_custom.fg    = g_set.cFg;
+    s_custom.title = g_set.cTitle;
+    s_custom.selBg = g_set.cSel;
+    s_custom.selFg = Luma(g_set.cSel) > 140 ? RGB(0x10, 0x10, 0x10) : RGB(0xF2, 0xF2, 0xF2);
+    s_custom.dim   = Mix(g_set.cFg, g_set.cBg, 55);
+    s_custom.hov   = g_set.cHov;
+    return s_custom;
+}
+
 
 /* ---------------- 状态 ---------------- */
 /* 视图窗口句柄。状态直接用文件级 static，不包类 —— 窗口过程和十几个辅助函数
@@ -93,6 +134,9 @@ static int       s_bmpW = 0, s_bmpH = 0;
    和当前字号比较，相等就直接复用，避免每次重绘都重建 GDI 字体。 */
 static HFONT     s_fontN = nullptr, s_fontB = nullptr;
 static int       s_fontPx = 0;
+/* 建这两个字体时用的字体名。只有名字变了才需要重建 —— 用户换字体时字号可能没变，
+ * 光比较 s_fontPx 会"换了字体画面不动"。用 wstring 存，比较起来直观。 */
+static std::wstring s_fontFace;
 /* 视觉行高 / 段间距 / 章标题上方留白（像素，已含 DPI 换算）。这里的初值只是"还没量过"时的兜底，真正的
    值在 EnsureFonts 里按字号和行距档位算出来。 */
 static int       s_lineH = 20, s_paraGap = 8, s_titleGap = 14;
@@ -196,7 +240,10 @@ static void EnsureFonts()
 {
     int px = -MulDiv(g_set.fontPt, g_dpi, 72);
     if (px > -S(11)) px = -S(11);
-    if (s_fontN && px == s_fontPx) return;
+    /* 字体名：用户在「阅读 → 选择字体」里挑的、或从导入的字体文件里选的；
+     * 空串时退回内置默认字体，保证任何时候都有字可画。 */
+    std::wstring face = g_set.fontFace.empty() ? std::wstring(L"Microsoft YaHei") : g_set.fontFace;
+    if (s_fontN && px == s_fontPx && face == s_fontFace) return;
     if (s_fontN) DeleteObject(s_fontN);
     if (s_fontB) DeleteObject(s_fontB);
     LOGFONTW lf;
@@ -210,13 +257,14 @@ static void EnsureFonts()
        背景上，所以下面 SetBkMode(TRANSPARENT) 之外，背景由 PaintAll 一次性刷好。 */
     lf.lfQuality = CLEARTYPE_QUALITY;
     lf.lfPitchAndFamily = DEFAULT_PITCH | FF_DONTCARE;
-    lstrcpynW(lf.lfFaceName, L"Microsoft YaHei", LF_FACESIZE);
+    lstrcpynW(lf.lfFaceName, face.c_str(), LF_FACESIZE);
     s_fontN = CreateFontIndirectW(&lf);
     /* 标题字体只改字重，其余字段复用同一个 LOGFONTW —— 保证标题和正文的字体族、宽度度量一致，"同一个字在标
        题行和正文行里宽度相同"，排版时不用为标题单独算一套宽度。 */
     lf.lfWeight = FW_BOLD;
     s_fontB = CreateFontIndirectW(&lf);
     s_fontPx = px;
+    s_fontFace = face;
     /* 行距档位来自 ini，属于用户可改数据，用前先夹到合法区间，否则 kSpacing[] 会越界读到一个随机系数。 */
     int sp = g_set.spacing; if (sp < 0) sp = 0; if (sp > 2) sp = 2;
     s_lineH = (int)((-px) * kSpacing[sp] + 0.5f);
@@ -228,6 +276,34 @@ static void EnsureFonts()
 /* 当前字体的像素高度（正数）。标题行高、欢迎页行距、ui.cpp 里算侧栏边距都要用它；内部先
    EnsureFonts()，保证刚启动还没绘制过时也能拿到正确值。 */
 int ViewFontPixel() { EnsureFonts(); return -s_fontPx; }
+
+/* 载入用户导入的字体文件：把 g_set.fontFiles 里以 '|' 分隔的每个路径
+ * 用 AddFontResourceExW(FR_PRIVATE) 私有加载一次。
+ *
+ * 为什么用 FR_PRIVATE：不写注册表、不装进系统「已安装字体」列表，只对本进程可见；
+ * 用户"导入一个字体看小说"不该悄悄改动系统字体。进程退出后自动失效。
+ * 为什么每次启动都要重新加载：字体资源是进程级的，不持久化。
+ * 文件可能已被删/改名 —— 加载失败只是那个字体名回退成系统默认字，不影响其他功能，
+ * 所以这里不报错、只记一条 trace。
+ * 调用时机：必须在第一次 CreateFontIndirectW 之前（本次改动放在 wWinMain 里，
+ * SettingsLoad 之后、建窗口之前），否则本进程内该字体名还不可见。 */
+void FontsLoadImported()
+{
+    if (g_set.fontFiles.empty()) return;
+    size_t start = 0;
+    while (start <= g_set.fontFiles.size()) {
+        size_t bar = g_set.fontFiles.find(L'|', start);
+        std::wstring one = g_set.fontFiles.substr(
+            start, bar == std::wstring::npos ? std::wstring::npos : bar - start);
+        if (!one.empty()) {
+            int cnt = AddFontResourceExW(one.c_str(), FR_PRIVATE, nullptr);
+            (void)cnt;   /* 正式版里 NrTrace 是空宏，不加这句会报"未使用变量" */
+            NrTrace(L"字体文件 %s -> 载入 %d 个", one.c_str(), cnt);
+        }
+        if (bar == std::wstring::npos) break;
+        start = bar + 1;
+    }
+}
 
 /* ---------------- 行排版 ---------------- */
 
@@ -1000,7 +1076,7 @@ static void DrawWelcome(int W, int H)
     SetTextColor(s_dc, th.dim);
     const wchar_t* lines[] = {
         L"拖一个小说文件到这里，或按 Ctrl+O 打开",
-        L"支持 TXT / EPUB / DOCX / HTML / Markdown，自动分章",
+        L"支持 TXT / EPUB / PDF / DOCX / HTML / Markdown，自动分章",
         L"关闭窗口会自动记住阅读位置"
     };
     int n = 3;
@@ -1088,6 +1164,20 @@ static void PaintAll()
         if (line >= nl) line = nl - 1;
         /* 章标题上方额外留白，只在标题的第 0 行可见时加一次。 */
         if (title && line == 0) y += s_titleGap;
+        /* 书签标记：这一段上有书签，就在正文左边缘画一道短竖条（用标题色），
+           用户在正文里一眼就能看到"我在这儿标过"。用二分查 g_bmParas —— 一屏最多几十段，
+           代价可忽略；g_bmParas 由 ui.cpp 在打开书、增删书签时重建。 */
+        if (!g_bmParas.empty() && std::binary_search(g_bmParas.begin(), g_bmParas.end(), p)) {
+            RECT rb;
+            rb.left   = x - S(15);
+            rb.right  = rb.left + S(4);
+            rb.top    = y + S(3);
+            rb.bottom = rb.top + s_lineH - S(6);
+            if (rb.bottom < rb.top + S(4)) rb.bottom = rb.top + S(4);
+            HBRUSH br = CreateSolidBrush(th.title);
+            FillRect(s_dc, &rb, br);
+            DeleteObject(br);
+        }
         for (int l = line; l < nl; l++) {
             /* 一屏画满就停：后面几十万字一概不碰，这是自绘排版能扛大文件的关键。 */
             if (y >= H) break;

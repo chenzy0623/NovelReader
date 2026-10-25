@@ -361,6 +361,13 @@ static std::wstring StripInlineMd(const std::wstring& s)
 
 /* 按行处理 Markdown：去掉标题井号、引用符、列表符号、代码围栏、水平分隔线。
  * 参数 in：Markdown 原文；返回纯文本（段落之间 '\n' 分隔）。 */
+/* 供 web.cpp 复用：把一段 HTML 剥成纯文本（含实体解码、script/style/head 丢弃）。
+ * 网页抓书时每个章节页都要走这一步，所以直接复用这里的 StripHtml，
+ * 不再另写一份 —— 否则"看网页"和"看 HTML 文件"两种入口的排版会不一致。 */
+std::wstring FormatHtmlToText(const std::wstring& html)
+{
+    return StripHtml(html);
+}
 static std::wstring StripMarkdown(const std::wstring& in)
 {
     std::wstring out;
