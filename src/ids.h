@@ -73,7 +73,8 @@
 #define IDM_PHONE        1290   /* 手机阅读：开局域网服务并显示地址 */
 #define IDM_PHONE_JUMP   1291   /* 跳到手机端最近读到的位置 */
 #define IDM_PDF_MODE     1292   /* PDF 原始版式 / 文字重排 切换（F9，仅 PDF 有效） */
-#define IDM_SOURCE       1293   /* 书源搜索：内置无忧书城，输入书名搜书并下载整本（Ctrl+S） */
+#define IDM_SOURCE       1293   /* 书源搜索：按书源规则搜书并下载整本（Ctrl+S） */
+#define IDM_SOURCE_MGR   1294   /* 书源管理：改规则 / 加新站 / 删源 */
 
 /* ---- 子控件 ID ---- */
 #define IDC_TOC         2001    /* 左侧章节目录 LISTBOX */

@@ -16,12 +16,14 @@
 
 #include "web.h"
 #include "format.h"
+#include "source.h"      /* BookSource / SourceList / SourceCurrent */
 #include "common.h"      /* BytesToText / BookLooksLikeChapterTitle（实现在 book.cpp） */
 
 #include <wininet.h>
 #include <shlobj.h>
 #include <cstdio>
 #include <cstring>
+#include <regex>         /* 书源规则用正则表示，标准库自带，不增加体积 */
 
 /* ---------------- 上限：防止被"全书一万章"的站点拖死 ---------------- */
 
@@ -786,82 +788,57 @@ bool WebFetchBook(const std::wstring& url, std::wstring& text, std::wstring& tit
     return true;
 }
 
-/* ======================= 内置书源：无忧书城 51shucheng =======================
- * 为什么要有"书源"：通用的「打开网页小说」要求用户自己找到目录页网址，
- * 这一步对普通读者太难（还得看懂站点结构）。书源把"搜索 → 选书 → 抓全书"
- * 做成一条龙，用户只需要输入书名。
- *
- * 站点结构（2026-10 实测，页面全是 UTF-8）：
- *   搜索页  /search?q=<关键词>
- *     <div class="search_result"><ul>
- *       <li><a href="https://www.51shucheng.net/wangluo/doupocangqiong" title="…">
- *             <h3>斗破苍穹</h3></a><p>简介…</p></li>…
- *     </ul></div>
- *   详情页  <h1>斗破苍穹</h1> + <ul class="category-toc-list">
- *             <li><a href="…/23716.html" title="…">第一章 陨落的天才</a></li>…
- *   正文页  <div class="neirong" id="neirong"><p>…</p>…</div>
- *           这个 div 一结束就是广告和"下一章"导航，所以正文只取到第一个 </div>。
- *
- * 站点给的域名是 .com，实际 301 到 .net；这里统一改写成 .net，省一次跳转，
- * 也让用户从搜索结果里粘 .com 的链接时照样能用。
- * ========================================================================= */
 
-/* 取标签里的某个属性值（href / title 这类）。支持 href="x" / href='x' / href=x。 */
-static std::wstring TagAttr(const std::wstring& tag, const wchar_t* name)
-{
-    size_t p = FindCI(tag, name, 0);
-    if (p == std::wstring::npos) return std::wstring();
-    size_t eq = p + std::wcslen(name);
-    /* 跳过 name 与 '=' 之间的空白 */
-    while (eq < tag.size() && (tag[eq] == L' ' || tag[eq] == L'\t')) eq++;
-    if (eq >= tag.size() || tag[eq] != L'=') return std::wstring();
-    size_t v = eq + 1;
-    while (v < tag.size() && (tag[v] == L' ' || tag[v] == L'\t')) v++;
-    if (v >= tag.size()) return std::wstring();
-    if (tag[v] == L'"' || tag[v] == L'\'') {
-        wchar_t q = tag[v];
-        size_t e = tag.find(q, v + 1);
-        if (e == std::wstring::npos) return std::wstring();
-        return tag.substr(v + 1, e - v - 1);
-    }
-    size_t e = tag.find_first_of(L" \t\r\n>", v);
-    if (e == std::wstring::npos) e = tag.size();
-    return tag.substr(v, e - v);
-}
+/* ================= 书源引擎：按规则抓网页 =================
+ * 书源由五条规则拼成（字段含义见 source.h）：
+ *   search    搜索网址模板（{kw} 是关键词）
+ *   listRe    结果页正则：第 1 组网址、第 2 组书名、第 3 组（可选）简介
+ *   tocStart  目录容器起点（普通子串，先把页面切小再跑目录正则）
+ *   tocRe     目录正则：第 1 组网址、第 2 组章节名
+ *   contentRe 正文正则：第 1 组正文 HTML
+ *
+ * 为什么用正则：程序里没有 HTML DOM，而 <regex> 是 C++ 标准库自带的，
+ * 加进来不增加任何体积；"抠链接、抠正文容器"这种固定形状的需求一条正则就够，
+ * 用户还能从别处抄规则来改成自己的。
+ *
+ * 两条容错原则：
+ *   1) 规则留空不是错，只是退化成通用做法（链接全收 / 整页剥文本）。
+ *      这样用户填一半也能用，而不是直接报错。
+ *   2) 目录正则匹配出来的名字如果全都不像章节（站点用的是"1""楔子"这类），
+ *      就全收，不要因为过滤把整本清空。
+ */
 
-/* 把宽字符串按 UTF-8 做百分号编码（中文关键词要用它拼搜索网址）。 */
+/* 把宽字符串按 UTF-8 做百分号编码（RFC 3986 的"非保留字符之外全部转义"）。
+ * 为什么必须自己转：WideCharToMultiByte 只做编码转换，不做 URL 转义，
+ * 中文关键词直接拼进网址会被服务器当成非法请求；而 URLMON 的
+ * UrlEscapeW 会把 "/" ":" 也转义掉，用作查询参数同样不合适。
+ * 规则：字母、数字、'-' '_' '.' '~' 原样保留，其余每字节写成 %XX（大写十六进制）。 */
 static std::wstring UrlEncodeU8(const std::wstring& s)
 {
-    int n = WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0, nullptr, nullptr);
-    std::string u8((size_t)(n > 0 ? n : 0), '\0');
-    if (n > 0) WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(), &u8[0], n, nullptr, nullptr);
+    if (s.empty()) return std::wstring();
 
-    static const wchar_t* kHex = L"0123456789ABCDEF";
+    /* 先宽 → UTF-8 字节流 */
+    int need = WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0, nullptr, nullptr);
+    if (need <= 0) return std::wstring();
+    std::string u8((size_t)need, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(), &u8[0], need, nullptr, nullptr);
+
+    static const wchar_t* hex = L"0123456789ABCDEF";
     std::wstring out;
+    out.reserve(u8.size() * 3);
     for (size_t i = 0; i < u8.size(); i++) {
         unsigned char c = (unsigned char)u8[i];
-        bool safe = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+        bool keep = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
                     (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~';
-        if (safe) {
-            out += (wchar_t)c;
+        if (keep) {
+            out.push_back((wchar_t)c);
         } else {
-            out += L'%';
-            out += kHex[c >> 4];
-            out += kHex[c & 15];
+            out.push_back(L'%');
+            out.push_back(hex[(c >> 4) & 0x0F]);
+            out.push_back(hex[c & 0x0F]);
         }
     }
     return out;
-}
-
-/* 域名归一：51shucheng.com → 51shucheng.net（站点自己就这么跳） */
-static std::wstring SourceHostFix(const std::wstring& url)
-{
-    std::wstring s = url;
-    const std::wstring from = L"51shucheng.com";
-    const std::wstring to   = L"51shucheng.net";
-    size_t p = FindCI(s, from, 0);
-    if (p != std::wstring::npos) s.replace(p, from.size(), to);
-    return s;
 }
 
 /* 逐行去掉首尾空白。网页正文习惯用 &nbsp; 缩进，解出来是 U+00A0（不换行空格）
@@ -886,71 +863,49 @@ static std::wstring SourceCleanParagraphs(const std::wstring& t)
     return out;
 }
 
-/* 从搜索结果区里抠出每一本书。传入的 sub 已经限定在 search_result 到 related_search 之间，
- * 所以这里遇到的 <li> 都是书，不会混进"相关搜索"。 */
-static void SourceCollectHits(const std::wstring& sub, std::vector<WebBookHit>& out)
+/* 跑一条正则，把所有匹配的各组内容收进 out（out[i][0] 是整段匹配）。
+ * 返回 false 表示正则本身写错了 —— 这种错要让用户看到，而不是静默返回零条。
+ * maxHits 是护栏：目录页可能匹配上万次（推荐位也算），不收口会吃光内存。 */
+static bool RegexFindAll(const std::wstring& text, const std::wstring& pattern,
+                         std::vector<std::vector<std::wstring> >& out, std::wstring& err,
+                         size_t maxHits)
 {
-    size_t i = 0;
-    while (i + 3 < sub.size()) {
-        size_t li = FindCI(sub, L"<li", i);
-        if (li == std::wstring::npos) break;
-        size_t liEnd = sub.find(L'>', li);
-        if (liEnd == std::wstring::npos) break;
-        size_t close = FindCI(sub, L"</li", liEnd);
-        if (close == std::wstring::npos) break;
-        std::wstring chunk = sub.substr(liEnd + 1, close - liEnd - 1);
-        i = close + 4;
+    out.clear();
+    if (pattern.empty()) return true;
 
-        size_t a = FindCI(chunk, L"<a", 0);
-        if (a == std::wstring::npos) continue;
-        size_t aEnd = chunk.find(L'>', a);
-        if (aEnd == std::wstring::npos) continue;
-        std::wstring href = TagAttr(chunk.substr(a, aEnd - a + 1), L"href");
-        if (href.empty()) continue;
-        std::wstring abs = UrlResolve(L"https://www.51shucheng.net/", href);
-        if (abs.empty()) continue;
-
-        /* 书名优先取 <h3>（结果卡片里书名的位置），没有就用链接文字 */
-        std::wstring title;
-        size_t h3 = FindCI(chunk, L"<h3", 0);
-        if (h3 != std::wstring::npos) {
-            size_t h3e = chunk.find(L'>', h3);
-            if (h3e != std::wstring::npos) {
-                size_t h3c = FindCI(chunk, L"</h3", h3e);
-                if (h3c != std::wstring::npos)
-                    title = LinkTextToPlain(chunk.substr(h3e + 1, h3c - h3e - 1));
-            }
+    try {
+        std::wregex re(pattern, std::regex::ECMAScript | std::regex::optimize);
+        std::wsregex_iterator it(text.begin(), text.end(), re);
+        std::wsregex_iterator end;
+        for (; it != end; ++it) {
+            const std::wsmatch& m = *it;
+            std::vector<std::wstring> groups;
+            groups.reserve(m.size());
+            for (size_t i = 0; i < m.size(); i++) groups.push_back(m[i].str());
+            out.push_back(groups);
+            /* 空匹配会让迭代器原地打转，必须手动跳出 */
+            if (m.length(0) == 0) break;
+            if (out.size() >= maxHits) break;
         }
-        if (title.empty()) {
-            size_t ac = FindCI(chunk, L"</a", aEnd);
-            if (ac != std::wstring::npos)
-                title = LinkTextToPlain(chunk.substr(aEnd + 1, ac - aEnd - 1));
-        }
-        if (title.empty()) continue;
-
-        /* 简介：第一个 <p>…</p>，太长就截断（列表里只用来分辨是哪本书） */
-        std::wstring desc;
-        size_t p = FindCI(chunk, L"<p", 0);
-        if (p != std::wstring::npos) {
-            size_t pe = chunk.find(L'>', p);
-            if (pe != std::wstring::npos) {
-                size_t pc = FindCI(chunk, L"</p", pe);
-                if (pc != std::wstring::npos)
-                    desc = LinkTextToPlain(chunk.substr(pe + 1, pc - pe - 1));
-            }
-        }
-        if (desc.size() > 60) { desc.resize(60); desc += L"…"; }
-
-        WebBookHit h;
-        h.title = title;
-        h.url = abs;
-        h.desc = desc;
-        out.push_back(h);
+    } catch (const std::regex_error&) {
+        err = L"书源里的正则写得不对（括号不配对或转义有误），检查一下规则。";
+        return false;
     }
+    return true;
 }
 
-bool WebSourceSearch(const std::wstring& keyword, std::vector<WebBookHit>& out,
-                     std::wstring& err, int timeoutMs)
+/* 按正文正则抠出正文容器，再剥成纯文本。抠不到返回空串，由调用方决定怎么兜底。 */
+static std::wstring TextFromContentRule(const std::wstring& html, const std::wstring& pattern)
+{
+    std::vector<std::vector<std::wstring> > ms;
+    std::wstring e;
+    if (!RegexFindAll(html, pattern, ms, e, 4)) return std::wstring();
+    if (ms.empty() || ms[0].size() < 2 || ms[0][1].empty()) return std::wstring();
+    return SourceCleanParagraphs(FormatHtmlToText(ms[0][1]));
+}
+
+bool WebSourceSearchEx(const BookSource& src, const std::wstring& keyword,
+                       std::vector<WebBookHit>& out, std::wstring& err, int timeoutMs)
 {
     out.clear();
     err.clear();
@@ -958,111 +913,91 @@ bool WebSourceSearch(const std::wstring& keyword, std::vector<WebBookHit>& out,
     std::wstring kw = TrimW(keyword);
     if (kw.empty()) { err = L"请先在搜索框里输入书名或作者。"; return false; }
 
-    std::wstring url = L"https://www.51shucheng.net/search?q=" + UrlEncodeU8(kw);
+    std::wstring tmpl = TrimW(src.search);
+    if (tmpl.empty()) {
+        err = L"这个书源没有配搜索网址，只能用「文件 → 打开网页小说」贴书籍页网址。";
+        return false;
+    }
+
+    /* 关键词要做 UTF-8 百分号编码：中文关键词直接拼进网址，服务器会当成乱码 */
+    std::wstring enc = UrlEncodeU8(kw);
+    std::wstring url;
+    size_t ph = tmpl.find(L"{kw}");
+    if (ph != std::wstring::npos) url = tmpl.substr(0, ph) + enc + tmpl.substr(ph + 4);
+    else url = tmpl + enc;      /* 忘了写 {kw} 就追加在末尾，不至于完全不能用 */
+
     std::string body;
     std::wstring base = url, e1;
     if (!WebFetchUrl(url, body, base, e1, timeoutMs)) {
-        err = std::wstring(L"连不上无忧书城：") + e1;
+        err = std::wstring(L"连不上这个书源：") + e1;
         return false;
     }
     std::wstring html = BytesToText(body);
     body.clear();
     body.shrink_to_fit();
 
-    /* 结果区边界：从 class="search_result" 到"相关搜索"之前。
-     * 不这么切的话，页面底部的相关搜索词也会被当成书抓进来。 */
-    size_t pos = FindCI(html, L"class=\"search_result\"", 0);
-    if (pos == std::wstring::npos) {
-        err = L"没看懂搜索页的结构（站点可能改版了）。可以用「文件 → 打开网页小说」直接贴目录页网址。";
-        return false;
+    if (TrimW(src.listRe).empty()) {
+        /* 没写结果页规则：把页面里的链接都当候选。
+         * 够用在"搜索结果就是一串书名链接"的站上，长了不像书名的跳过。 */
+        std::vector<RawLink> links;
+        ExtractLinks(html, base, links);
+        for (size_t i = 0; i < links.size(); i++) {
+            std::wstring t = TrimW(LinkTextToPlain(links[i].text));
+            if (t.empty() || t.size() > 40) continue;
+            WebBookHit h;
+            h.title = t;
+            h.url = links[i].url;
+            out.push_back(h);
+            if (out.size() >= 50) break;
+        }
+    } else {
+        std::vector<std::vector<std::wstring> > ms;
+        if (!RegexFindAll(html, src.listRe, ms, err, 200)) return false;
+        for (size_t i = 0; i < ms.size(); i++) {
+            if (ms[i].size() < 3) continue;                 /* 至少要有"网址 + 书名"两组 */
+            std::wstring href = TrimW(ms[i][1]);
+            std::wstring t = TrimW(LinkTextToPlain(ms[i][2]));
+            if (href.empty() || t.empty()) continue;
+            std::wstring abs = UrlResolve(base, href);
+            if (abs.empty()) continue;
+
+            WebBookHit h;
+            h.title = t.size() > 40 ? t.substr(0, 40) : t;
+            h.url = abs;
+            if (ms[i].size() > 3 && !ms[i][3].empty()) {
+                std::wstring d = TrimW(LinkTextToPlain(ms[i][3]));
+                if (d.size() > 60) { d.resize(60); d += L"…"; }
+                h.desc = d;
+            }
+            /* 同一本书在结果页里可能出现两次（列表 + 推荐位），只留第一条 */
+            bool dup = false;
+            for (size_t k = 0; k < out.size(); k++) {
+                if (out[k].url == abs) { dup = true; break; }
+            }
+            if (!dup) out.push_back(h);
+        }
     }
-    size_t end = FindCI(html, L"related_search", pos);
-    std::wstring sub = html.substr(pos, (end == std::wstring::npos ? html.size() : end) - pos);
-    SourceCollectHits(sub, out);
 
     if (out.empty()) {
-        err = L"没搜到这本书。换个书名试试，或者只输入书名的前几个字。";
+        err = L"这个书源没搜到结果。换个书名试试，或者在「书源管理」里检查它的规则。";
         return false;
     }
-    InetCloseAll();     /* 搜完就放掉网络会话，抓书时会重新建 */
+    InetCloseAll();     /* 搜完放掉网络会话，抓书时会重建 */
     return true;
 }
 
-/* 从详情页解析出有序的章节列表。
- * 优先用站点的目录容器 category-toc-list（顺序就是站点顺序，且不含"上一章/推荐"）；
- * 找不到就退回通用规则（ExtractLinks + FilterChapters），站点小改版也不至于整个失效。 */
-static void SourceCollectToc(const std::wstring& html, const std::wstring& base,
-                             std::vector<RawLink>& out)
-{
-    size_t pos = FindCI(html, L"category-toc-list", 0);
-    if (pos == std::wstring::npos) {
-        std::vector<RawLink> all;
-        ExtractLinks(html, base, all);
-        FilterChapters(all, base, out);
-        return;
-    }
-    size_t ulEnd = FindCI(html, L"</ul", pos);
-    std::wstring sub = html.substr(pos, (ulEnd == std::wstring::npos ? html.size() : ulEnd) - pos);
-
-    size_t i = 0;
-    while (i + 3 < sub.size()) {
-        size_t li = FindCI(sub, L"<li", i);
-        if (li == std::wstring::npos) break;
-        size_t liEnd = sub.find(L'>', li);
-        if (liEnd == std::wstring::npos) break;
-        size_t close = FindCI(sub, L"</li", liEnd);
-        if (close == std::wstring::npos) break;
-        std::wstring chunk = sub.substr(liEnd + 1, close - liEnd - 1);
-        i = close + 4;
-
-        size_t a = FindCI(chunk, L"<a", 0);
-        if (a == std::wstring::npos) continue;
-        size_t aEnd = chunk.find(L'>', a);
-        if (aEnd == std::wstring::npos) continue;
-        std::wstring href = TagAttr(chunk.substr(a, aEnd - a + 1), L"href");
-        size_t ac = FindCI(chunk, L"</a", aEnd);
-        if (href.empty() || ac == std::wstring::npos) continue;
-        std::wstring text = LinkTextToPlain(chunk.substr(aEnd + 1, ac - aEnd - 1));
-        if (text.empty()) continue;
-        std::wstring abs = UrlResolve(base, href);
-        if (abs.empty()) continue;
-
-        RawLink lk;
-        lk.url = abs;
-        lk.text = text;
-        out.push_back(lk);
-        if ((int)out.size() >= kMaxChapters) break;    /* 上限保护，见 web.h 的说明 */
-    }
-}
-
-/* 抽正文：只取 div#neirong 里的内容，到第一个 </div> 为止。
- * 这样广告、字号工具栏、"下一章 ›"导航一个都不会进正文 ——
- * 通用的 FormatHtmlToText 是整页剥标签，这些脏东西会混进来。 */
-static std::wstring SourceChapterText(const std::wstring& html)
-{
-    size_t p = FindCI(html, L"id=\"neirong\"", 0);
-    if (p == std::wstring::npos) p = FindCI(html, L"class=\"neirong\"", 0);
-    if (p == std::wstring::npos) return std::wstring();
-    size_t gt = html.find(L'>', p);
-    if (gt == std::wstring::npos) return std::wstring();
-    size_t e = FindCI(html, L"</div>", gt);
-    if (e == std::wstring::npos) e = html.size();
-    std::wstring inner = html.substr(gt + 1, e - gt - 1);
-    return SourceCleanParagraphs(FormatHtmlToText(inner));
-}
-
-bool WebSourceFetchBook(const std::wstring& bookUrl, std::wstring& text, std::wstring& title,
-                        std::wstring& err, WebProgressFn progress, void* ctx,
-                        const std::wstring& knownTitle)
+bool WebSourceFetchBookEx(const BookSource& src, const std::wstring& bookUrl,
+                          std::wstring& text, std::wstring& title, std::wstring& err,
+                          WebProgressFn progress, void* ctx, const std::wstring& knownTitle)
 {
     text.clear();
     title.clear();
     err.clear();
 
-    std::wstring url = SourceHostFix(TrimW(bookUrl));
+    std::wstring url = TrimW(bookUrl);
     if (!WebIsUrl(url)) { err = L"这不像一个网址（要以 http:// 或 https:// 开头）。"; return false; }
 
-    /* 1) 详情页：拿章节列表 + 书名 */
+    /* 1) 书籍页：拿章节列表 + 书名 */
     if (progress && !progress(ctx, 0, 0, L"正在打开书籍页…")) { err = L"已取消。"; return false; }
     std::string body;
     std::wstring base = url, e1;
@@ -1071,14 +1006,61 @@ bool WebSourceFetchBook(const std::wstring& bookUrl, std::wstring& text, std::ws
     body.clear();
     body.shrink_to_fit();
 
+    /* 先按"目录容器起点"把页面切小：书籍页往往还有推荐位、评论、新书榜，
+     * 里面同样会出现"第几章"字样，不切就会混进目录。 */
+    std::wstring seg = html;
+    std::wstring start = TrimW(src.tocStart);
+    if (!start.empty()) {
+        size_t p = FindCI(html, start, 0);
+        if (p != std::wstring::npos) {
+            size_t e = FindCI(html, L"</ul", p);
+            if (e == std::wstring::npos) e = html.size();
+            seg = html.substr(p, e - p);
+        }
+    }
+
     std::vector<RawLink> chapters;
-    SourceCollectToc(html, base, chapters);
+    if (TrimW(src.tocRe).empty()) {
+        /* 没写目录规则：用通用的"目录页识别"（认得第N章、序章、Chapter N…） */
+        std::vector<RawLink> all;
+        ExtractLinks(seg, base, all);
+        FilterChapters(all, base, chapters);
+    } else {
+        std::vector<std::vector<std::wstring> > ms;
+        if (!RegexFindAll(seg, src.tocRe, ms, err, (size_t)kMaxChapters * 2)) return false;
+
+        std::vector<RawLink> all, good;
+        for (size_t i = 0; i < ms.size(); i++) {
+            if (ms[i].size() < 3) continue;
+            std::wstring abs = UrlResolve(base, TrimW(ms[i][1]));
+            std::wstring t = TrimW(LinkTextToPlain(ms[i][2]));
+            if (abs.empty() || t.empty()) continue;
+
+            bool dup = false;
+            for (size_t k = 0; k < all.size(); k++) {
+                if (all[k].url == abs) { dup = true; break; }
+            }
+            if (dup) continue;
+
+            RawLink lk;
+            lk.url = abs;
+            lk.text = t;
+            all.push_back(lk);
+            /* 名字像章节的收进 good：站点目录里常混着"展开全部""返回目录"这类链接 */
+            if (BookLooksLikeChapterTitle(t)) good.push_back(lk);
+            if ((int)all.size() >= kMaxChapters) break;
+        }
+        /* good 为空说明这个站的章节名不是"第N章"这种写法，那就全收 */
+        chapters = good.empty() ? all : good;
+    }
+
     if (chapters.empty()) {
-        err = L"这一页里没找到章节列表。可能不是书籍详情页，试试用「打开网页小说」贴目录页网址。";
+        err = L"这一页里没找到章节列表：可能不是书籍页，或者书源的目录规则要改。"
+              L"也可以试试「文件 → 打开网页小说」直接贴目录页网址。";
         return false;
     }
 
-    /* 书名：调用方给的最干净（搜索结果里的书名），其次详情页 <h1>，最后网页标题 */
+    /* 书名：调用方给的最干净（搜索结果里的书名），其次书籍页 <h1>，最后网页标题 */
     if (!knownTitle.empty()) title = TrimW(knownTitle);
     if (title.empty()) {
         size_t h1 = FindCI(html, L"<h1", 0);
@@ -1096,12 +1078,12 @@ bool WebSourceFetchBook(const std::wstring& bookUrl, std::wstring& text, std::ws
     if (title.size() > 60) title.resize(60);
     html.clear();
 
-    /* 2) 逐章抓正文。一章失败就跳过（站点的个别章经常抽风），
-     *    连续失败太多才整体放弃 —— 与通用抓书同一套策略。
-     *    每章之间故意歇一下：无忧书城挂在 Cloudflare 后面，短时间连发太快会被限流
-     *    （429 / JS 挑战页），歇 250ms 后基本不再触发；遇到失败还会退避重试两次。 */
+    /* 2) 逐章抓正文。个别章失败就跳过，连续失败太多才整体放弃。
+     *    每章之间歇 250ms：很多小说站挂在 Cloudflare 或自带限流后面，
+     *    连发太快会被 429 / 人机验证，歇一下基本就不会触发；失败还会退避重试。 */
     const int total = (int)chapters.size();
     int done = 0, errInARow = 0;
+    const std::wstring contentRe = TrimW(src.contentRe);
     for (int i = 0; i < total; i++) {
         if (text.size() > kMaxTotalChars) break;
         if (i > 0) Sleep(250);
@@ -1114,24 +1096,27 @@ bool WebSourceFetchBook(const std::wstring& bookUrl, std::wstring& text, std::ws
         std::string cb;
         std::wstring cbase = chapters[i].url, e2;
         bool ok = false;
-        /* 最多试 3 次，中间退避 2 秒 / 5 秒：限流往往是几秒钟的事 */
         for (int attempt = 0; attempt < 3 && !ok; attempt++) {
             if (attempt > 0) Sleep(attempt == 1 ? 2000 : 5000);
             ok = WebFetchUrl(chapters[i].url, cb, cbase, e2);
         }
         if (!ok) {
-            if (++errInARow >= kMaxErrInARow) { err = L"连续 5 章抓取失败，已停止。"; break; }
+            if (++errInARow >= kMaxErrInARow) {
+                err = std::wstring(L"连续 ") + std::to_wstring(kMaxErrInARow) + L" 章抓取失败，已停止。";
+                break;
+            }
             continue;
         }
         errInARow = 0;
 
         std::wstring chtml = BytesToText(cb);
-        std::wstring ctext = SourceChapterText(chtml);
+        std::wstring ctext;
+        if (!contentRe.empty()) ctext = TextFromContentRule(chtml, contentRe);
         if (ctext.empty()) ctext = SourceCleanParagraphs(FormatHtmlToText(chtml));   /* 兜底 */
         chtml.clear();
 
-        /* 章节标题单独一行：BookLoad 的"第 N 章"规则靠它分章，
-         * 目录 / 上下章 / 进度百分比全都自动正确。 */
+        /* 章节标题单独一行：BookLoad 靠"第 N 章"这类写法分章，
+         * 标题在，目录、上一章/下一章、进度百分比就全都自动正确。 */
         text += chapters[i].text;
         text += L"\n";
         text += ctext;
@@ -1146,4 +1131,24 @@ bool WebSourceFetchBook(const std::wstring& bookUrl, std::wstring& text, std::ws
         return false;
     }
     return true;
+}
+
+/* 下面两个是"用当前书源"的便捷入口：界面和命令行工具都走它们，
+ * 书源切换后不用改任何调用点。 */
+bool WebSourceSearch(const std::wstring& keyword, std::vector<WebBookHit>& out,
+                     std::wstring& err, int timeoutMs)
+{
+    if (SourceList().empty()) SourceLoad();
+    int idx = SourceCurrent();
+    return WebSourceSearchEx(SourceList()[(size_t)idx], keyword, out, err, timeoutMs);
+}
+
+bool WebSourceFetchBook(const std::wstring& bookUrl, std::wstring& text, std::wstring& title,
+                        std::wstring& err, WebProgressFn progress, void* ctx,
+                        const std::wstring& knownTitle)
+{
+    if (SourceList().empty()) SourceLoad();
+    int idx = SourceCurrent();
+    return WebSourceFetchBookEx(SourceList()[(size_t)idx], bookUrl, text, title, err,
+                                progress, ctx, knownTitle);
 }

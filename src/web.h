@@ -41,14 +41,17 @@ bool WebFetchUrl(const std::wstring& url, std::string& body, std::wstring& final
  * 返回 false 表示用户取消，抓取会尽快停下（已抓到的部分仍然会返回）。 */
 typedef bool (*WebProgressFn)(void* ctx, int done, int total, const std::wstring& msg);
 
-/* ---------------------------- 内置书源 ----------------------------
+/* ---------------------------- 书源 ----------------------------
  * "网页小说"要求用户自己找到目录页网址；对普通用户来说这一步太难
  * （还得知道站点的目录页长什么样）。书源就是把"搜索 + 解析目录 + 抽正文"
- * 这三件事按某个具体站点写死，用户只需要输入书名。
+ * 这三件事按某个站点的具体结构描述出来，用户只需要输入书名。
  *
- * 目前内置一个书源：无忧书城 51shucheng（www.51shucheng.com 会跳到 .net）。
- * 每个书源都是一段独立的解析代码，坏一个不影响别的，也不影响通用的网址抓书。
+ * 书源不是写死在代码里的：每条规则都存在 NovelReader.ini 的 [sources] 段，
+ * 用户可以在「书源管理」里改、加、删（见 source.h）。程序自带一个示例源，
+ * 既可以拿来用，也是写新规则时的模板。
  */
+
+struct BookSource;      /* 定义在 source.h；这里只用引用，避免两处互相包含 */
 
 /* 搜索结果里的一条（一本书）。 */
 struct WebBookHit {
@@ -56,6 +59,19 @@ struct WebBookHit {
     std::wstring url;       /* 书籍详情页网址（绝对地址） */
     std::wstring desc;      /* 简介摘要，截断到几十字，列表里给用户判断是哪本 */
 };
+
+/* 用指定书源搜索（关键字会做 UTF-8 百分号编码）。
+ * 与下面的 WebSourceSearch 的区别：这个明确指定"用哪个源"，
+ * 界面上的书源下拉框、命令行工具都走它。 */
+bool WebSourceSearchEx(const BookSource& src, const std::wstring& keyword,
+                       std::vector<WebBookHit>& out, std::wstring& err, int timeoutMs = 20000);
+
+/* 用指定书源把一本书抓成文本（bookUrl 是书籍页/目录页网址）。
+ * 规则全由调用方给，所以这里不认识任何具体站点。 */
+bool WebSourceFetchBookEx(const BookSource& src, const std::wstring& bookUrl,
+                          std::wstring& text, std::wstring& title, std::wstring& err,
+                          WebProgressFn progress = nullptr, void* ctx = nullptr,
+                          const std::wstring& knownTitle = std::wstring());
 
 /* 在书源里按书名/作者搜索。
  * 参数 keyword：关键词（中文会做 UTF-8 百分号编码）。
@@ -76,13 +92,8 @@ bool WebSourceSearch(const std::wstring& keyword, std::vector<WebBookHit>& out,
 bool WebFetchBook(const std::wstring& url, std::wstring& text, std::wstring& title,
                   std::wstring& err, WebProgressFn progress = nullptr, void* ctx = nullptr);
 
-/* 用书源的口径把一本书抓成文本（bookUrl 是书籍详情页，不是目录页）。
- * 与 WebFetchBook 的区别：
- *   1) 目录按站点的目录容器（category-toc-list）解析，顺序与站点完全一致，
- *      不会把"上一章/下一章/推荐"混进来；
- *   2) 正文只抽章节正文容器（div#neirong）里的段落，广告、"字号/夜间"工具栏、
- *      "下一章 ›"这类导航一个都不带；
- *   3) 书名优先用调用方给的名字（搜索结果里的书名比网页标题干净）。
+/* 用当前书源（SourceCurrent()）把一本书抓成文本（bookUrl 是书籍详情页）。
+ * 规则全部来自书源，所以换源不用改代码；具体规则怎么起作用见 WebSourceFetchBookEx。
  * 参数 knownTitle：搜索结果里的书名，可为空（为空时从网页标题推断）。
  * 返回：成功（至少抓到一章正文）返回 true。 */
 bool WebSourceFetchBook(const std::wstring& bookUrl, std::wstring& text, std::wstring& title,

@@ -44,6 +44,7 @@
 #include "web.h"
 #include "server.h"
 #include "pdf.h"
+#include "source.h"
 #include <commctrl.h>
 #include <commdlg.h>
 #include <shellapi.h>
@@ -1683,26 +1684,51 @@ void UiOpenWebNovel()
     UiOpenFile(path);
 }
 
-/* ---------------- 书源搜索（无忧书城 51shucheng）----------------
+/* ---------------- 书源搜索与书源管理 ----------------
  * 为什么单独做一个对话框：通用的「打开网页小说」要让用户自己找目录页网址，
  * 门槛太高。书源把"输入书名 → 搜索结果里挑一本 → 抓整本"串成一条龙。
  *
- * 界面就是四样东西：关键词输入框、结果列表、下载按钮、关闭按钮。
+ * 界面就是几样东西：书源下拉框（切换用哪个源）、关键词输入框、结果列表、
+ * 下载按钮、关闭按钮，以及一个「管理…」按钮打开书源管理对话框。
  * 列表里一条 = 一本书，显示"书名 · 简介前 60 字"，方便从同名书里挑。
  * 下载期间用 WebProgressCb 把进度写进主窗口状态栏，并按 ESC 可取消。
+ *
+ * 书源本身不写死在代码里（见 source.h）：规则存在 ini 的 [sources] 段，
+ * 用户可以在「书源管理」里改规则、加新源、删源，所以这个对话框里的文字
+ * 一律不提具体站点名。
  */
 #define SRC_EDIT   101      /* 关键词输入框 */
 #define SRC_LIST   102      /* 搜索结果列表 */
 #define SRC_SEARCH 103      /* 搜索按钮 */
 #define SRC_DOWN   104      /* 下载并打开 */
 #define SRC_CLOSE  105      /* 关闭 */
+#define SRC_COMBO  106      /* 书源下拉框 */
+#define SRC_MGR    107      /* 「管理…」按钮 */
 
 static HWND s_srcEdit = nullptr;
 static HWND s_srcList = nullptr;
+static HWND s_srcCombo = nullptr;            /* 书源下拉框 */
 static std::vector<WebBookHit> s_srcHits;    /* 与列表项一一对应 */
 static std::wstring s_srcOpenPath;           /* 关窗后要打开的文件 */
 static bool s_srcBusy = false;               /* 正在联网，挡住重复点击 */
 static bool s_srcReady = false;              /* 窗口类注册过没有 */
+
+static void ShowSourceMgr(HWND parent);      /* 实现在下面，先声明 */
+
+/* 用当前的 SourceList() 重填下拉框，并选中 SourceCurrent()。
+ * 书源管理里改过规则或者加删过源之后都要调一次。 */
+static void SrcRefillCombo()
+{
+    if (!s_srcCombo) return;
+    SendMessageW(s_srcCombo, CB_RESETCONTENT, 0, 0);
+    std::vector<BookSource>& list = SourceList();
+    for (size_t i = 0; i < list.size(); i++) {
+        SendMessageW(s_srcCombo, CB_ADDSTRING, 0, (LPARAM)list[i].name.c_str());
+    }
+    int cur = SourceCurrent();
+    if (cur < 0 || cur >= (int)list.size()) cur = 0;
+    SendMessageW(s_srcCombo, CB_SETCURSEL, (WPARAM)cur, 0);
+}
 
 /* 点「搜索」：问一次站点，把结果灌进列表。 */
 static void SrcDoSearch(HWND dlg)
@@ -1809,26 +1835,38 @@ static LRESULT CALLBACK SourceBoxProc(HWND h, UINT msg, WPARAM w, LPARAM l)
 {
     switch (msg) {
     case WM_CREATE: {
+        /* 第一行：选书源 + 管理按钮。书源可以随时换，所以放在最上面 */
+        CreateWindowExW(0, L"STATIC", L"书源：", WS_CHILD | WS_VISIBLE | SS_LEFT,
+                        S(16), S(20), S(50), S(20), h, nullptr, nullptr, nullptr);
+        s_srcCombo = CreateWindowExW(WS_EX_CLIENTEDGE, L"COMBOBOX", L"",
+                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL |
+                                     CBS_DROPDOWNLIST,
+                                     S(70), S(16), S(300), S(220), h, (HMENU)SRC_COMBO, nullptr, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"管理(&M)...", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                        S(378), S(16), S(90), S(26), h, (HMENU)SRC_MGR, nullptr, nullptr);
+        SrcRefillCombo();
+
+        /* 第二行：关键词 + 搜索 */
         CreateWindowExW(0, L"STATIC", L"书名或作者：", WS_CHILD | WS_VISIBLE | SS_LEFT,
-                        S(16), S(18), S(200), S(20), h, nullptr, nullptr, nullptr);
+                        S(16), S(56), S(200), S(20), h, nullptr, nullptr, nullptr);
         s_srcEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-                                    S(16), S(42), S(400), S(26), h, (HMENU)SRC_EDIT, nullptr, nullptr);
+                                    S(16), S(80), S(400), S(26), h, (HMENU)SRC_EDIT, nullptr, nullptr);
         CreateWindowExW(0, L"BUTTON", L"搜索(&S)", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-                        S(424), S(42), S(86), S(26), h, (HMENU)SRC_SEARCH, nullptr, nullptr);
+                        S(424), S(80), S(86), S(26), h, (HMENU)SRC_SEARCH, nullptr, nullptr);
         s_srcList = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL |
                                     LBS_NOINTEGRALHEIGHT | LBS_NOTIFY,
-                                    S(16), S(78), S(494), S(250), h, (HMENU)SRC_LIST, nullptr, nullptr);
+                                    S(16), S(116), S(494), S(220), h, (HMENU)SRC_LIST, nullptr, nullptr);
         CreateWindowExW(0, L"BUTTON", L"下载并打开(&D)", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                        S(16), S(340), S(140), S(30), h, (HMENU)SRC_DOWN, nullptr, nullptr);
+                        S(16), S(348), S(140), S(30), h, (HMENU)SRC_DOWN, nullptr, nullptr);
         CreateWindowExW(0, L"BUTTON", L"关闭", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                        S(438), S(340), S(72), S(30), h, (HMENU)SRC_CLOSE, nullptr, nullptr);
+                        S(438), S(348), S(72), S(30), h, (HMENU)SRC_CLOSE, nullptr, nullptr);
         CreateWindowExW(0, L"STATIC",
-                        L"书源：无忧书城（51shucheng）。整本少则几十章、多则一两千章，"
-                        L"下载时进度显示在主窗口状态栏，按 ESC 可取消。",
+                        L"书源可以换（「管理…」里能改规则、加新站）。整本少则几十章、"
+                        L"多则一两千章，下载时进度显示在主窗口状态栏，按 ESC 可取消。",
                         WS_CHILD | WS_VISIBLE | SS_LEFT,
-                        S(16), S(376), S(494), S(40), h, nullptr, nullptr, nullptr);
+                        S(16), S(386), S(494), S(44), h, nullptr, nullptr, nullptr);
         if (s_srcEdit) SetFocus(s_srcEdit);
         return 0;
     }
@@ -1838,6 +1876,18 @@ static LRESULT CALLBACK SourceBoxProc(HWND h, UINT msg, WPARAM w, LPARAM l)
         case SRC_SEARCH: SrcDoSearch(h); return 0;
         case SRC_DOWN:   SrcDoDownload(h); return 0;
         case SRC_CLOSE:  DestroyWindow(h); return 0;
+        case SRC_MGR:
+            /* 打开书源管理；关掉之后规则可能变了，重填下拉框 */
+            ShowSourceMgr(h);
+            SrcRefillCombo();
+            return 0;
+        case SRC_COMBO:
+            /* 下拉框换选中项 = 换书源，立刻落盘，下次启动还用这个 */
+            if (HIWORD(w) == CBN_SELCHANGE) {
+                int sel = (int)SendMessageW(s_srcCombo, CB_GETCURSEL, 0, 0);
+                if (sel >= 0) SourceSetCurrent(sel);
+            }
+            return 0;
         case SRC_LIST:
             /* 双击列表项 = 直接下载这一本，省一次点按钮 */
             if (HIWORD(w) == LBN_DBLCLK) { SrcDoDownload(h); return 0; }
@@ -1852,9 +1902,275 @@ static LRESULT CALLBACK SourceBoxProc(HWND h, UINT msg, WPARAM w, LPARAM l)
         NrTrace(L"SRC dlg WM_DESTROY");
         s_srcEdit = nullptr;
         s_srcList = nullptr;
+        s_srcCombo = nullptr;
         return 0;
     }
     return DefWindowProcW(h, msg, w, l);
+}
+
+/* ---------------- 书源管理对话框 ----------------
+ * 一个书源 = 名字 + 五条规则（见 source.h）。这个对话框让用户直接改这几样东西：
+ * 左边是书源列表，右边是当前书源的名字与五条规则。
+ *
+ * 交互约定（都是为了"别把用户改了一半的规则弄丢"）：
+ *   - 切换列表项之前，先把右边编辑框的内容写回内存（否则改一半切走就没了）；
+ *   - 「保存」写回内存并落盘 ini，下次启动还在；
+ *   - 「新增」最多 SourceList 上限（16 个）；「删除」不允许删 0 号内置源；
+ *   - 「恢复内置」把内置源的规则重新塞回 0 号，规则被改坏了能一键还原。
+ */
+#define MGR_LIST     201    /* 左侧书源列表 */
+#define MGR_NAME     202    /* 名称 */
+#define MGR_SEARCH   203    /* 搜索网址模板 */
+#define MGR_LISTRE   204    /* 结果页正则 */
+#define MGR_TOCSTART 205    /* 目录容器起点（可空） */
+#define MGR_TOCRE    206    /* 目录正则 */
+#define MGR_CONTENT  207    /* 正文正则 */
+#define MGR_ADD      210    /* 新增 */
+#define MGR_SAVE     211    /* 保存 */
+#define MGR_DEL      212    /* 删除 */
+#define MGR_RESET    213    /* 恢复内置规则 */
+#define MGR_CLOSE    214    /* 关闭 */
+
+static HWND s_mgrList = nullptr;
+static HWND s_mgrName = nullptr;
+static HWND s_mgrSearch = nullptr;
+static HWND s_mgrListRe = nullptr;
+static HWND s_mgrTocStart = nullptr;
+static HWND s_mgrTocRe = nullptr;
+static HWND s_mgrContent = nullptr;
+static bool s_mgrReady = false;      /* 窗口类注册过没有 */
+static int  s_mgrCur = -1;           /* 右边编辑框里显示的是第几个书源 */
+
+/* 把内存里的书源填进右边编辑框 */
+static void MgrLoad(int idx)
+{
+    std::vector<BookSource>& list = SourceList();
+    if (idx < 0 || idx >= (int)list.size()) { s_mgrCur = -1; return; }
+    const BookSource& s = list[idx];
+    if (s_mgrName)     SetWindowTextW(s_mgrName, s.name.c_str());
+    if (s_mgrSearch)   SetWindowTextW(s_mgrSearch, s.search.c_str());
+    if (s_mgrListRe)   SetWindowTextW(s_mgrListRe, s.listRe.c_str());
+    if (s_mgrTocStart) SetWindowTextW(s_mgrTocStart, s.tocStart.c_str());
+    if (s_mgrTocRe)    SetWindowTextW(s_mgrTocRe, s.tocRe.c_str());
+    if (s_mgrContent)  SetWindowTextW(s_mgrContent, s.contentRe.c_str());
+    s_mgrCur = idx;
+    if (s_mgrList) SendMessageW(s_mgrList, LB_SETCURSEL, (WPARAM)idx, 0);
+}
+
+/* 把右边编辑框的内容写回内存（不落盘，落盘由调用方决定） */
+static void MgrCommit()
+{
+    std::vector<BookSource>& list = SourceList();
+    if (s_mgrCur < 0 || s_mgrCur >= (int)list.size()) return;
+    BookSource& s = list[s_mgrCur];
+    wchar_t buf[2048];
+    if (s_mgrName) {
+        buf[0] = 0; GetWindowTextW(s_mgrName, buf, 2048);
+        std::wstring t = TrimW(buf);
+        if (!t.empty()) s.name = t;      /* 名字留空就保留原名，避免列表里出现空白行 */
+    }
+    if (s_mgrSearch)   { buf[0] = 0; GetWindowTextW(s_mgrSearch, buf, 2048);   s.search = buf; }
+    if (s_mgrListRe)   { buf[0] = 0; GetWindowTextW(s_mgrListRe, buf, 2048);   s.listRe = buf; }
+    if (s_mgrTocStart) { buf[0] = 0; GetWindowTextW(s_mgrTocStart, buf, 2048); s.tocStart = buf; }
+    if (s_mgrTocRe)    { buf[0] = 0; GetWindowTextW(s_mgrTocRe, buf, 2048);    s.tocRe = buf; }
+    if (s_mgrContent)  { buf[0] = 0; GetWindowTextW(s_mgrContent, buf, 2048);  s.contentRe = buf; }
+}
+
+/* 重填左侧列表（名字变了、增删过源之后都要调） */
+static void MgrFillList()
+{
+    if (!s_mgrList) return;
+    SendMessageW(s_mgrList, LB_RESETCONTENT, 0, 0);
+    std::vector<BookSource>& list = SourceList();
+    for (size_t i = 0; i < list.size(); i++) {
+        std::wstring line = list[i].name;
+        if (i == 0) line += L"（内置）";
+        SendMessageW(s_mgrList, LB_ADDSTRING, 0, (LPARAM)line.c_str());
+    }
+    if (s_mgrCur >= 0) SendMessageW(s_mgrList, LB_SETCURSEL, (WPARAM)s_mgrCur, 0);
+}
+
+static LRESULT CALLBACK SourceMgrProc(HWND h, UINT msg, WPARAM w, LPARAM l)
+{
+    switch (msg) {
+    case WM_CREATE: {
+        /* 左侧：书源列表 + 新增/删除 */
+        s_mgrList = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
+                                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL |
+                                    LBS_NOINTEGRALHEIGHT | LBS_NOTIFY,
+                                    S(16), S(16), S(180), S(300), h, (HMENU)MGR_LIST, nullptr, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"新增(&N)", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                        S(16), S(324), S(86), S(28), h, (HMENU)MGR_ADD, nullptr, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"删除(&X)", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                        S(108), S(324), S(86), S(28), h, (HMENU)MGR_DEL, nullptr, nullptr);
+
+        /* 右侧：六项规则。标签在上、输入框在下，一行一行排下来 */
+        struct { const wchar_t* label; int labelY; int editY; int id; } rows[6] = {
+            { L"名称（随便起，方便自己认）",            16,  34, MGR_NAME },
+            { L"搜索网址（关键词处写 {kw}，留空则不能搜）", 64,  82, MGR_SEARCH },
+            { L"结果页正则（第1组网址 / 第2组书名 / 第3组简介可省）", 112, 130, MGR_LISTRE },
+            { L"目录容器起点（普通文字，可留空）",       160, 178, MGR_TOCSTART },
+            { L"目录正则（第1组网址 / 第2组章节名）",     208, 226, MGR_TOCRE },
+            { L"正文正则（第1组正文，可留空）",          256, 274, MGR_CONTENT },
+        };
+        for (int i = 0; i < 6; i++) {
+            CreateWindowExW(0, L"STATIC", rows[i].label, WS_CHILD | WS_VISIBLE | SS_LEFT,
+                            S(212), S(rows[i].labelY), S(430), S(18), h, nullptr, nullptr, nullptr);
+            HWND ed = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                                      S(212), S(rows[i].editY), S(430), S(26), h,
+                                      (HMENU)(INT_PTR)rows[i].id, nullptr, nullptr);
+            switch (rows[i].id) {
+            case MGR_NAME:     s_mgrName = ed; break;
+            case MGR_SEARCH:   s_mgrSearch = ed; break;
+            case MGR_LISTRE:   s_mgrListRe = ed; break;
+            case MGR_TOCSTART: s_mgrTocStart = ed; break;
+            case MGR_TOCRE:    s_mgrTocRe = ed; break;
+            case MGR_CONTENT:  s_mgrContent = ed; break;
+            }
+        }
+
+        CreateWindowExW(0, L"BUTTON", L"保存(&S)", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                        S(212), S(312), S(96), S(30), h, (HMENU)MGR_SAVE, nullptr, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"恢复内置规则(&R)", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                        S(316), S(312), S(140), S(30), h, (HMENU)MGR_RESET, nullptr, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"关闭", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                        S(560), S(312), S(82), S(30), h, (HMENU)MGR_CLOSE, nullptr, nullptr);
+        CreateWindowExW(0, L"STATIC",
+                        L"规则说明：搜索网址里的 {kw} 会被换成书名。三条正则各只用前两组括号 —— "
+                        L"第 1 组是网址、第 2 组是名字。留空的规则会自动退化成"
+                        L"「页面上所有链接」/「整页文字」，所以最省事可以只填搜索网址和目录正则。",
+                        WS_CHILD | WS_VISIBLE | SS_LEFT,
+                        S(212), S(352), S(430), S(80), h, nullptr, nullptr, nullptr);
+
+        MgrFillList();
+        MgrLoad(0);
+        if (s_mgrList) SetFocus(s_mgrList);
+        return 0;
+    }
+    case WM_COMMAND:
+        switch (LOWORD(w)) {
+        case MGR_LIST:
+            if (HIWORD(w) == LBN_SELCHANGE && s_mgrList) {
+                int sel = (int)SendMessageW(s_mgrList, LB_GETCURSEL, 0, 0);
+                if (sel >= 0 && sel != s_mgrCur) {
+                    MgrCommit();          /* 先把改了一半的内容收下 */
+                    MgrLoad(sel);
+                }
+            }
+            return 0;
+        case MGR_ADD: {
+            MgrCommit();
+            int i = SourceAdd();
+            if (i < 0) {
+                MessageBoxW(h, L"书源已经满了（最多 16 个）。先删掉不用的再加。",
+                            L"书源管理", MB_ICONINFORMATION);
+                return 0;
+            }
+            SourceSave();
+            MgrFillList();
+            MgrLoad(i);
+            return 0;
+        }
+        case MGR_SAVE:
+            MgrCommit();
+            SourceSave();
+            MgrFillList();
+            MessageBoxW(h, L"已保存，下次启动还用这些规则。", L"书源管理", MB_ICONINFORMATION);
+            return 0;
+        case MGR_DEL: {
+            if (s_mgrCur <= 0) {
+                MessageBoxW(h, L"第 1 个是内置示例源，删不了；想换成自己的规则可以改它。",
+                            L"书源管理", MB_ICONINFORMATION);
+                return 0;
+            }
+            if (MessageBoxW(h, L"确定删掉这个书源吗？", L"书源管理",
+                            MB_YESNO | MB_ICONQUESTION) != IDYES) return 0;
+            int del = s_mgrCur;
+            s_mgrCur = -1;              /* 先断开，免得删完还往已失效的下标里写 */
+            SourceDelete(del);
+            SourceSave();
+            MgrFillList();
+            MgrLoad(0);
+            return 0;
+        }
+        case MGR_RESET:
+            if (MessageBoxW(h, L"把第 1 个书源（内置示例源）的规则恢复成出厂设置吗？",
+                            L"书源管理", MB_YESNO | MB_ICONQUESTION) != IDYES) return 0;
+            SourceList()[0] = SourceBuiltin();
+            SourceList()[0].builtin = true;
+            SourceSave();
+            MgrFillList();
+            MgrLoad(0);
+            MessageBoxW(h, L"内置规则已恢复。", L"书源管理", MB_ICONINFORMATION);
+            return 0;
+        case MGR_CLOSE:
+            DestroyWindow(h);
+            return 0;
+        }
+        return 0;
+    case WM_CLOSE:
+        DestroyWindow(h);
+        return 0;
+    case WM_DESTROY:
+        s_mgrList = nullptr;
+        s_mgrName = nullptr;
+        s_mgrSearch = nullptr;
+        s_mgrListRe = nullptr;
+        s_mgrTocStart = nullptr;
+        s_mgrTocRe = nullptr;
+        s_mgrContent = nullptr;
+        s_mgrCur = -1;
+        return 0;
+    }
+    return DefWindowProcW(h, msg, w, l);
+}
+
+/* 以模态方式打开书源管理。parent 一般是书源搜索对话框。 */
+static void ShowSourceMgr(HWND parent)
+{
+    HINSTANCE hi = GetModuleHandleW(nullptr);
+    if (!s_mgrReady) {
+        WNDCLASSEXW wc;
+        ZeroMemory(&wc, sizeof(wc));
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = SourceMgrProc;
+        wc.hInstance = hi;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"NRSourceMgr";
+        RegisterClassExW(&wc);
+        s_mgrReady = true;
+    }
+    if (SourceList().empty()) SourceLoad();
+
+    RECT wr;
+    GetWindowRect(parent ? parent : g_hMain, &wr);
+    int wpx = S(664), hpx = S(460);
+    int x = (wr.left + wr.right - wpx) / 2;
+    int y = (wr.top + wr.bottom - hpx) / 2;
+
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"NRSourceMgr",
+                               L"书源管理（改规则 / 加新站）",
+                               WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+                               x, y, wpx, hpx, parent ? parent : g_hMain, nullptr, hi, nullptr);
+    if (!dlg) return;
+
+    if (parent) EnableWindow(parent, FALSE);
+    else EnableWindow(g_hMain, FALSE);
+    ShowWindow(dlg, SW_SHOW);
+    SetForegroundWindow(dlg);
+
+    MSG msg;
+    while (IsWindow(dlg) && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (!IsDialogMessageW(dlg, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    if (parent) EnableWindow(parent, TRUE);
+    else EnableWindow(g_hMain, TRUE);
+    SetForegroundWindow(parent ? parent : g_hMain);
 }
 
 /* 菜单「文件 → 书源搜索」的入口。对话框关掉之后再去打开文件 ——
@@ -1874,6 +2190,7 @@ void UiSourceSearch()
         RegisterClassExW(&wc);
         s_srcReady = true;
     }
+    if (SourceList().empty()) SourceLoad();   /* 第一次用：把内置源读/写进 ini */
 
     s_srcHits.clear();
     s_srcOpenPath.clear();
@@ -1881,12 +2198,12 @@ void UiSourceSearch()
 
     RECT wr;
     GetWindowRect(g_hMain, &wr);
-    int wpx = S(526), hpx = S(430);
+    int wpx = S(526), hpx = S(466);
     int x = (wr.left + wr.right - wpx) / 2;
     int y = (wr.top + wr.bottom - hpx) / 2;
 
     HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"NRSourceBox",
-                               L"书源搜索 — 无忧书城（输入书名，下载整本）",
+                               L"书源搜索（输入书名，下载整本）",
                                WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
                                x, y, wpx, hpx, g_hMain, nullptr, hi, nullptr);
     if (!dlg) return;
@@ -2010,8 +2327,10 @@ static HMENU BuildMenu()
     AppendMenuW(f, MF_STRING, IDM_CLOSEFILE, L"关闭当前书(&C)\tCtrl+W");
     AppendMenuW(f, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(f, MF_STRING, IDM_OPEN_URL, L"打开网页小说(&U)...\tCtrl+U");
-    /* 书源搜索：内置无忧书城，输入书名就能搜到并下载整本，不用自己找目录页网址 */
-    AppendMenuW(f, MF_STRING, IDM_SOURCE, L"书源搜索（无忧书城）(&S)...\tCtrl+S");
+    /* 书源搜索：按书源规则输入书名就能搜到并下载整本，不用自己找目录页网址。
+     * 书源可以在「书源管理」里换，所以菜单里不提具体站点名 */
+    AppendMenuW(f, MF_STRING, IDM_SOURCE, L"书源搜索(&S)...\tCtrl+S");
+    AppendMenuW(f, MF_STRING, IDM_SOURCE_MGR, L"书源管理(&B)...");
     AppendMenuW(f, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(f, MF_STRING, IDM_EXIT, L"退出(&X)");
     AppendMenuW(h, MF_POPUP, (UINT_PTR)f, L"文件(&F)");
@@ -2108,7 +2427,7 @@ static void ShowKeys()
         L"  F5           重新载入当前文件\n"
         L"  F9           PDF：文字重排 / 原始版式（整页渲染）切换\n"
         L"  Ctrl+U       打开网页小说（输入目录页网址，自动抓全书）\n"
-        L"  Ctrl+S       书源搜索（内置无忧书城：输入书名 → 选书 → 下载整本）\n"
+        L"  Ctrl+S       书源搜索（输入书名 → 选书 → 下载整本）\n"
         L"\n"
         L"书签与外观\n"
         L"  Ctrl+D       给当前位置加书签（同一段再加会更新标题）\n"
@@ -2483,6 +2802,7 @@ static void OnCommand(int id, int code, HWND ctl)
     case IDM_PDF_MODE:    UiTogglePdfMode(); break;
     case IDM_OPEN_URL:    UiOpenWebNovel(); break;
     case IDM_SOURCE:      UiSourceSearch(); break;
+    case IDM_SOURCE_MGR:  ShowSourceMgr(g_hMain); break;   /* 主窗口直接开管理 */
     case IDM_PICK_FONT:   UiPickFont(); break;
     case IDM_IMPORT_FONT: UiImportFont(); break;
     case IDM_PICK_COLORS: UiPickColors(); break;
@@ -2833,6 +3153,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdLine, int)
     /* 用户导入过的字体文件要在这里私有加载一遍，必须早于第一次建字体
      * （否则第一帧会用回退字体画，等换页才"突然变成"用户选的字体）。 */
     FontsLoadImported();
+
+    /* 书源也在这里读一遍：不等到用户第一次点「书源搜索」才读，
+     * 这样 ini 里的 [sources] 段从第一次启动就是完整的（用户想直接改 ini
+     * 也有东西可改），书源管理打开时列表也立刻是齐的。 */
+    SourceLoad();
 
     /* 状态栏属于通用控件，必须先 InitCommonControlsEx 才能 CreateWindowExW 成功 */
     INITCOMMONCONTROLSEX icc;

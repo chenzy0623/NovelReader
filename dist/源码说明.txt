@@ -1,9 +1,9 @@
-﻿NovelReader 1.3.0 —— 源码说明与编译方法
+﻿NovelReader 1.4.0 —— 源码说明与编译方法
 ==========================================
 
 这个文件夹里是阅读器的全部源码：纯 C++17 + Win32 API，没有任何第三方库
 （zip 解压、DEFLATE、PDF 解析、HTTP 服务全是自己写的），编译出来就是一个
-约 513 KB 的独立 exe（静态链接，不带 DLL）。
+约 860 KB 的独立 exe（静态链接，不带 DLL）。
 
 源码里每个文件的开头都有一段中文说明，讲这个文件负责什么、关键决定为什么这么做；
 重要函数和容易踩坑的地方都有逐段注释。
@@ -34,6 +34,9 @@
   源码\src\web.cpp      网页抓书 + 书源搜索：WinInet 抓取（系统代理失败自动直连重试）、
                         失败后 curl.exe 兜底通道（对付 Cloudflare 的指纹拦截）、
                         目录页链接识别、逐章下载、去导航行、写缓存文件
+  源码\src\source.h      书源数据结构的声明（BookSource + 存取接口）
+  源码\src\source.cpp    书源的读写与增删：六项规则存进 ini 的 [sources] 段、
+                        内置示例源、最多 16 个、删源时清掉旧键
   源码\src\server.h     手机阅读服务的声明
   源码\src\server.cpp   局域网 HTTP 服务：书架页 / 目录页 / 分页阅读页，
                         手机端进度写回同一份 ini
@@ -41,7 +44,8 @@
                         书签标记、侧栏折叠条、自定义配色
   源码\src\ini.cpp      配置与阅读进度的读写（NovelReader.ini）、书架数据、书签
   源码\src\ui.cpp       主窗口、菜单、目录、搜索条、搜索面板、状态栏、
-                        自动下滑、字体/配色对话框、网页与手机入口、单实例
+                        自动下滑、字体/配色对话框、书源搜索与书源管理、
+                        网页与手机入口、单实例
   源码\src\trace.cpp    调试用日志（只在定义 NR_TRACE 时编入，正式版不包含）
   源码\res\app.rc       资源脚本（图标 + manifest，必须保持纯 ASCII）
   源码\res\app.manifest 清单：视觉样式 6.0、DPI 感知、长路径支持
@@ -70,7 +74,7 @@ build.bat 会做两件事：
       -municode -mwindows -ffunction-sections -fdata-sections -Wall -Wextra ^
       -Wl,--gc-sections -Wl,-s -static -static-libgcc -static-libstdc++ ^
       src\book.cpp src\ini.cpp src\view.cpp src\ui.cpp src\zip.cpp ^
-      src\format.cpp src\web.cpp src\pdf.cpp src\pdfrender.cpp src\server.cpp ^
+      src\format.cpp src\web.cpp src\source.cpp src\pdf.cpp src\pdfrender.cpp src\server.cpp ^
       build\app.res -o build\NovelReader.exe ^
       -lcomctl32 -lcomdlg32 -lshell32 -lole32 -lgdi32 -luser32 -ladvapi32 ^
       -lgdiplus -lshcore -lruntimeobject -lwininet -lws2_32 -liphlpapi
@@ -118,21 +122,29 @@ build.bat 会做两件事：
    一个坑：渲染出的位图归页面缓存所有，视图里千万不能 DeleteObject，否则下一帧
    拿去 StretchBlt 的是个野句柄（表现是"翻页后整块变背景色，只剩页码"）。
 
-6. 网页抓书怎么判断"哪一行是章节标题"
+6. 书源为什么做成可配置规则，而不是写死某个站
+   写死意味着站一改版程序就废，用户也没法换源。现在一个书源就是六项：
+   名字、搜索网址（{kw} 占位）、结果页正则、目录容器起点、目录正则、正文正则，
+   全部存在 ini 的 [sources] 段，界面能改、能加、能删。规则留空则退化成通用抓法，
+   所以"没配好"也不会崩，只是抓得粗一点。用标准库 <regex> 而不是 CSS 选择器，
+   是因为程序里没有 HTML DOM，一条正则够用，用户还能直接抄别处的规则；
+   代价是 exe 涨了约 300 KB（模板实例化）。
+
+7. 网页抓书怎么判断"哪一行是章节标题"
    复用分章规则 BookLooksLikeChapterTitle()，和本地文件的分章逻辑完全一致；
    抓完一章后先丢导航行（上一章/下一章/目录/返回目录…），再丢掉"与章节标题
    重复的那一行"，最后连续空行压成一行。
 
-7. 手机阅读为什么是网页而不是 APK
+8. 手机阅读为什么是网页而不是 APK
    开发环境没有 Java / Android SDK，打包不出能装到手机上的 APK；局域网网页
    方案不用安装、不受应用商店限制，进度还能和电脑共用同一份 ini。
 
-8. 进度与书架
+9. 进度与书架
    NovelReader.ini 里每本书一个段（段名是路径的 FNV-1a 哈希），记 off（字符
    偏移）+ chname（章名）+ ch/chn（第几章/共几章）+ pct（千分数）+ title。
    书架就是把这些段按最近打开顺序读出来。
 
-9. 为什么限制单实例
+10. 为什么限制单实例
    两个窗口同时写同一份 ini 会互相覆盖进度。现在第二个实例用 WM_COPYDATA
    把文件参数转发给第一个就退出。
 
@@ -152,10 +164,11 @@ trace 覆盖：菜单命令分发、搜索链路、自动下滑的定时器、�
   pdf.cpp      900 行      PDF 解析
   pdfrender.cpp 590 行     PDF 原始版式渲染（WinRT + GDI+）
   server.cpp   650 行      局域网阅读服务
-  web.cpp      1130 行     网页抓书 + 书源搜索
+  web.cpp      1120 行     网页抓书 + 书源搜索（规则驱动）
+  source.cpp    250 行     书源模型与 ini 存取
   format.cpp   640 行      EPUB/DOCX/HTML/MD 抽正文
   zip.cpp      645 行      zip + DEFLATE
   book.cpp     560 行      解码、分章、搜索
   ini.cpp      300 行      配置、进度、书架、书签
   common.h     320 行      数据结构与接口
-  合计约 8600 行，注释约占 28%
+  合计约 8900 行，注释约占 28%
