@@ -1,0 +1,49 @@
+﻿Android 开发环境说明（2026-10 由 NovelReader 项目准备）
+====================================================
+
+这个目录是给以后做「手机端 NovelReader」准备的 Android 工具链。
+东西都已经下好、解压好、许可协议也接受完了，不用再联网安装。
+
+一、目录结构
+------------
+E:\Android\
+    jdk\jdk-17.0.13+11\        JDK 17（Android Gradle Plugin 8.x 要求 17）
+    sdk\cmdline-tools\latest\   sdkmanager / avdmanager（命令行 SDK 管理器）
+    sdk\platform-tools\        adb、fastboot 等
+    sdk\platforms\android-34\  Android 14 平台（编译用）
+    sdk\build-tools\34.0.0\    aapt2、d8、zipalign、apksigner
+    sdk\licenses\              已接受的许可协议
+    downloads\                 三个原始安装包，留着备用，可以删
+
+二、使用前设置的环境变量（只对当前 PowerShell 窗口有效）
+--------------------------------------------------------
+$env:JAVA_HOME     = "E:\Android\jdk\jdk-17.0.13+11"
+$env:ANDROID_HOME  = "E:\Android\sdk"
+$env:ANDROID_SDK_ROOT = "E:\Android\sdk"
+$env:PATH += ";$env:JAVA_HOME\bin;$env:ANDROID_HOME\platform-tools;$env:ANDROID_HOME\build-tools\34.0.0"
+
+永久生效（用户级）可以这样写一次：
+[Environment]::SetEnvironmentVariable("JAVA_HOME", "E:\Android\jdk\jdk-17.0.13+11", "User")
+[Environment]::SetEnvironmentVariable("ANDROID_HOME", "E:\Android\sdk", "User")
+
+三、验证是否可用
+----------------
+& "$env:JAVA_HOME\bin\java.exe" -version
+& "$env:ANDROID_HOME\platform-tools\adb.exe" version
+& "$env:ANDROID_HOME\cmdline-tools\latest\bin\sdkmanager.bat" --list_installed
+
+四、以后要加装/补装组件
+------------------------
+& "$env:ANDROID_HOME\cmdline-tools\latest\bin\sdkmanager.bat" "platforms;android-35" "build-tools;35.0.0"
+（cmd 里设变量要写 set "JAVA_HOME=..."，等号后的空格会被吃进变量值，
+  否则会报 ERROR: JAVA_HOME is set to an invalid directory）
+
+五、关于 NovelReader 的手机端
+----------------------------
+现在的方案是「电脑端内置局域网网页服务」：
+  在电脑上按 Ctrl+G 打开「手机阅读」，同一 WiFi 下用手机浏览器访问那个地址即可，
+  进度会自动写回电脑上的 ini，回到电脑后 Ctrl+Shift+G 可以跳到手机上读到的位置。
+真正的 APK（离线、独立运行）还没做，按你的要求先放一放；工具链已经就绪，
+以后要做的话直接建一个 Android 工程即可，无需再下载任何东西。
+
+磁盘占用：JDK 约 300 MB，SDK 约 1.6 GB。

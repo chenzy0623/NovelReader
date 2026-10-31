@@ -1,4 +1,4 @@
-﻿NovelReader 1.2.0 —— 源码说明与编译方法
+﻿NovelReader 1.3.0 —— 源码说明与编译方法
 ==========================================
 
 这个文件夹里是阅读器的全部源码：纯 C++17 + Win32 API，没有任何第三方库
@@ -29,8 +29,10 @@
   源码\src\pdfrender.cpp 用系统 Windows.Data.Pdf 把整页渲染成位图：
                         手写 IPdfDocument / IPdfPage / IPdfPageRenderOptions 的
                         WinRT 接口，RoGetActivationFactory 取工厂，GDI+ 解 PNG
-  源码\src\web.h        网页抓书的声明（WebFetchUrl / WebFetchBook / WebIsUrl）
-  源码\src\web.cpp      网页抓书：WinInet 抓取（系统代理失败自动直连重试）、
+  源码\src\web.h        网页抓书与书源搜索的声明（WebFetchUrl / WebFetchBook /
+                        WebSourceSearch / WebSourceFetchBook / WebIsUrl）
+  源码\src\web.cpp      网页抓书 + 书源搜索：WinInet 抓取（系统代理失败自动直连重试）、
+                        失败后 curl.exe 兜底通道（对付 Cloudflare 的指纹拦截）、
                         目录页链接识别、逐章下载、去导航行、写缓存文件
   源码\src\server.h     手机阅读服务的声明
   源码\src\server.cpp   局域网 HTTP 服务：书架页 / 目录页 / 分页阅读页，
@@ -150,7 +152,7 @@ trace 覆盖：菜单命令分发、搜索链路、自动下滑的定时器、�
   pdf.cpp      900 行      PDF 解析
   pdfrender.cpp 590 行     PDF 原始版式渲染（WinRT + GDI+）
   server.cpp   650 行      局域网阅读服务
-  web.cpp      700 行      网页抓书
+  web.cpp      1130 行     网页抓书 + 书源搜索
   format.cpp   640 行      EPUB/DOCX/HTML/MD 抽正文
   zip.cpp      645 行      zip + DEFLATE
   book.cpp     560 行      解码、分章、搜索

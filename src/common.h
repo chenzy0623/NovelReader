@@ -346,6 +346,10 @@ void UiCloseFile();
 /* 打开网页小说：弹网址输入框 → 抓整本 → 存成缓存 txt → 打开（实现见 ui.cpp）。 */
 void UiOpenWebNovel();
 
+/* 书源搜索：内置无忧书城（51shucheng）。弹窗里输入书名 → 选结果 → 下载整本
+ * → 存成缓存 txt → 打开。比"打开网页小说"省掉"自己找目录页网址"这一步。 */
+void UiSourceSearch();
+
 /* 手机阅读：启动局域网服务并弹出地址提示窗（已经启动就只弹地址）*/
 void UiShowPhone();
 

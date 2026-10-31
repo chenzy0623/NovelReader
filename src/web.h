@@ -41,6 +41,30 @@ bool WebFetchUrl(const std::wstring& url, std::string& body, std::wstring& final
  * 返回 false 表示用户取消，抓取会尽快停下（已抓到的部分仍然会返回）。 */
 typedef bool (*WebProgressFn)(void* ctx, int done, int total, const std::wstring& msg);
 
+/* ---------------------------- 内置书源 ----------------------------
+ * "网页小说"要求用户自己找到目录页网址；对普通用户来说这一步太难
+ * （还得知道站点的目录页长什么样）。书源就是把"搜索 + 解析目录 + 抽正文"
+ * 这三件事按某个具体站点写死，用户只需要输入书名。
+ *
+ * 目前内置一个书源：无忧书城 51shucheng（www.51shucheng.com 会跳到 .net）。
+ * 每个书源都是一段独立的解析代码，坏一个不影响别的，也不影响通用的网址抓书。
+ */
+
+/* 搜索结果里的一条（一本书）。 */
+struct WebBookHit {
+    std::wstring title;     /* 书名，例如"斗破苍穹" */
+    std::wstring url;       /* 书籍详情页网址（绝对地址） */
+    std::wstring desc;      /* 简介摘要，截断到几十字，列表里给用户判断是哪本 */
+};
+
+/* 在书源里按书名/作者搜索。
+ * 参数 keyword：关键词（中文会做 UTF-8 百分号编码）。
+ * 参数 out    ：输出，按站点返回顺序排列（通常相关度从高到低）。
+ * 参数 err    ：输出，失败原因（中文）。
+ * 返回：至少搜到一条返回 true；一条都没有也返回 false 并给出原因。 */
+bool WebSourceSearch(const std::wstring& keyword, std::vector<WebBookHit>& out,
+                     std::wstring& err, int timeoutMs = 20000);
+
 /* 从目录页网址抓整本书。
  * 参数 url      ：目录页网址（也可以是某一章的网址 —— 页面上没有章节链接时，
  *                 就把这一页当全书）。
@@ -51,6 +75,19 @@ typedef bool (*WebProgressFn)(void* ctx, int done, int total, const std::wstring
  * 返回：成功（至少抓到一章正文）返回 true。 */
 bool WebFetchBook(const std::wstring& url, std::wstring& text, std::wstring& title,
                   std::wstring& err, WebProgressFn progress = nullptr, void* ctx = nullptr);
+
+/* 用书源的口径把一本书抓成文本（bookUrl 是书籍详情页，不是目录页）。
+ * 与 WebFetchBook 的区别：
+ *   1) 目录按站点的目录容器（category-toc-list）解析，顺序与站点完全一致，
+ *      不会把"上一章/下一章/推荐"混进来；
+ *   2) 正文只抽章节正文容器（div#neirong）里的段落，广告、"字号/夜间"工具栏、
+ *      "下一章 ›"这类导航一个都不带；
+ *   3) 书名优先用调用方给的名字（搜索结果里的书名比网页标题干净）。
+ * 参数 knownTitle：搜索结果里的书名，可为空（为空时从网页标题推断）。
+ * 返回：成功（至少抓到一章正文）返回 true。 */
+bool WebSourceFetchBook(const std::wstring& bookUrl, std::wstring& text, std::wstring& title,
+                        std::wstring& err, WebProgressFn progress = nullptr, void* ctx = nullptr,
+                        const std::wstring& knownTitle = std::wstring());
 
 /* 网页抓下来的书要落盘成一个 txt（缓存目录里），这样书架、进度、书签、
  * 重新打开全都能复用现有机制。

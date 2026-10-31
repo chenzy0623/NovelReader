@@ -1,13 +1,13 @@
 # 小说阅读器 NovelReader
 
 一个**单文件、免安装、零依赖**的 Windows 小说阅读器。用 C++17 + Win32 从零写成，
-**530 KB** 一个 exe，双击就能用，不写注册表、不装运行库、不需要联网。
+**569 KB** 一个 exe，双击就能用，不写注册表、不装运行库、不需要联网。
 
 支持 **TXT / EPUB / PDF / DOCX / HTML / Markdown**，自动识别章节，全文搜索，
 记忆阅读位置，自动下滑，书签，换字体，自定义配色，还能直接把网页小说抓成本地书。
 
-![版本](https://img.shields.io/badge/version-1.2.0-blue)
-![体积](https://img.shields.io/badge/size-530%20KB-brightgreen)
+![版本](https://img.shields.io/badge/version-1.3.0-blue)
+![体积](https://img.shields.io/badge/size-569%20KB-brightgreen)
 ![平台](https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-lightgrey)
 ![依赖](https://img.shields.io/badge/dependencies-none-success)
 ![许可](https://img.shields.io/badge/license-MIT-orange)
@@ -20,8 +20,8 @@
 
 到 [Releases](https://github.com/chenzy0623/NovelReader/releases) 下载最新版：
 
-- **[NovelReader-1.2.0-win64.zip](https://github.com/chenzy0623/NovelReader/releases/download/v1.2.0/NovelReader-1.2.0-win64.zip)**（推荐，含使用说明和示例小说）
-- [单个 NovelReader.exe](https://github.com/chenzy0623/NovelReader/releases/download/v1.2.0/NovelReader.exe)（只要程序本体）
+- **[NovelReader-1.3.0-win64.zip](https://github.com/chenzy0623/NovelReader/releases/download/v1.3.0/NovelReader-1.3.0-win64.zip)**（推荐，含使用说明和示例小说）
+- [单个 NovelReader.exe](https://github.com/chenzy0623/NovelReader/releases/download/v1.3.0/NovelReader.exe)（只要程序本体）
 
 解压任意目录，双击 `NovelReader.exe` 即可。**绿色版**：阅读进度存在 exe 同目录的
 `NovelReader.ini`（目录不可写时自动改用 `%APPDATA%\NovelReader\`），删掉 ini 就等于恢复出厂。
@@ -44,6 +44,7 @@
 | 多格式 | TXT、EPUB、PDF、DOCX、HTML、Markdown，以及任意扩展名的纯文本 |
 | PDF 两种看法 | 默认抽文字重排（能搜索、能换字体）；`F9` 切「原始版式」，整页按原样渲染，图表、分栏、字体效果一点不走样 |
 | 网页抓书 | `Ctrl+U` 输入目录页网址，自动找目录、逐章抓取，存成本地书 |
+| 书源搜索 | `Ctrl+S` 直接在无忧书城（51shucheng）搜书名/作者，选中就下载整本，分好章直接读 |
 | 手机阅读 | 局域网 HTTP 服务，手机浏览器直接读（菜单位置：帮助 → 手机阅读） |
 | 大文件 | 14.7 MB / 8794 章实测 0.8 秒载入，只渲染可视区域，滚动不掉帧 |
 | 目录收起 | 点侧栏底部「‹ 收起目录」或 `Ctrl+T`，正文占满整屏 |
@@ -105,6 +106,14 @@ EPUB：
 
 ![网页](https://github.com/chenzy0623/NovelReader/raw/main/screenshots/15-web.png)
 
+书源搜索（Ctrl+S，内置无忧书城，搜到就下载整本）：
+
+![书源搜索](https://github.com/chenzy0623/NovelReader/raw/main/screenshots/15-source-search.png)
+
+下载完直接读（目录已经分好章）：
+
+![书源下载](https://github.com/chenzy0623/NovelReader/raw/main/screenshots/16-source-book.png)
+
 ---
 
 ## 支持的格式
@@ -128,7 +137,7 @@ EPUB：
 | 按键 | 功能 | 按键 | 功能 |
 |---|---|---|---|
 | `Ctrl+O` | 打开文件 | `Ctrl+W` | 关闭当前书，回书架 |
-| `Ctrl+U` | 打开网页小说 | `Ctrl+G` | 手机阅读（局域网地址） |
+| `Ctrl+S` | 书源搜索（无忧书城） | `Ctrl+U` | 打开网页小说（任意网址） |
 | `Ctrl+F` | 搜索 | `F3` | 下一个命中 |
 | `Ctrl+B` | 书签列表 | `Ctrl+D` | 添加书签 |
 | `Ctrl+T` | 收起 / 展开目录 | `F2` | 日间 / 夜间切换 |
@@ -138,7 +147,8 @@ EPUB：
 | `↑` `↓` `←` `→` | 逐行 / 逐字滚动 | `Home` / `End` | 全书开头 / 结尾 |
 | `Alt+←` / `Alt+→` | 上一章 / 下一章 | `F5` | 重新加载当前书 |
 | `Ctrl+C` / `Ctrl+A` | 复制选中 / 全选 | `F1` | 快捷键说明 |
-| `F9` | PDF：文字重排 / 原始版式切换 | `Ctrl+Shift+G` | 跳到手机上读到的位置 |
+| `F9` | PDF：文字重排 / 原始版式切换 | `Ctrl+G` | 手机阅读（局域网地址） |
+| `Ctrl+Shift+G` | 跳到手机上读到的位置 |  |  |
 
 鼠标：滚轮滚动，拖滚动条，点目录跳章，双击页边距快速翻页，拖动即可选中文字（松开自动复制）。
 
@@ -180,6 +190,24 @@ PDF / EPUB / DOCX / HTML / Markdown 会**先抽出纯文本**，再走同一套�
 3. 存到 `%LOCALAPPDATA%\NovelReader\web\书名.txt`，然后像本地书一样读、搜、记进度。
 
 如果给了只有一章的单页网址，就把这一页当全书。抓取时可随时按 `ESC` 取消。
+
+---
+
+## 书源搜索（无忧书城）
+
+`Ctrl+S`（或 文件 → 书源搜索）输入书名或作者，直接搜站内：
+
+1. 搜索走 `https://www.51shucheng.net/search?q=关键词`（`.com` 会自动换成 `.net`，两个域名都认）；
+2. 结果列表每条显示 `书名 · 简介`，双击或选中后点「下载并打开」；
+3. 程序读详情页的章节目录，按顺序逐章下载，拼成一本本地 TXT，存到
+   `%LOCALAPPDATA%\NovelReader\web\书名.txt`，然后直接打开阅读。
+
+抓取时进度显示在主窗口状态栏，`ESC` 可中途取消 —— 取消后会问要不要把已抓到的部分存下来。
+
+> 这个站挂在 Cloudflare 后面，会拿 TLS 指纹和请求头判断是不是机器人：WinInet 的请求
+> 一律 403，所以代码里给"不支持 WinInet 的站点"留了 `curl.exe`（Win10 1803 起系统自带）
+> 兜底通道；每章之间还会歇 250 ms，失败重试带退避。
+> 如果提示「站点触发人机验证」，通常是自己搜得太密被临时限流，等一两分钟再试即可。
 
 ---
 
@@ -234,7 +262,7 @@ NovelReader/
 │  ├─ zip.cpp/.h         自写 zip 容器 + DEFLATE (RFC1951) 解压
 │  ├─ pdf.cpp/.h         自写 PDF 解析：对象扫描、FlateDecode、ToUnicode、文本重建
 │  ├─ pdfrender.cpp/.h   用系统 Windows.Data.Pdf 把整页渲染成位图（原始版式）
-│  ├─ web.cpp/.h         网页小说抓取（WinInet + 目录识别 + 逐章下载）
+│  ├─ web.cpp/.h         网页抓取 + 书源搜索（WinInet / curl 兜底 + 目录识别）
 │  ├─ server.cpp/.h      手机阅读：局域网 HTTP 服务
 │  ├─ ini.cpp            ini 读写、设置与阅读进度、书架数据
 │  ├─ view.cpp           阅读视图：排版、换行、滚动、选择、绘制
@@ -262,6 +290,10 @@ NovelReader/
   于是按 Windows 元数据把 `IPdfDocument`、`IPdfPage`、`IPdfPageRenderOptions` 的虚表
   逐个手写出来，再用 `RoGetActivationFactory` 拿工厂 —— 只花了几百行，省掉一个 MSVC
   工具链，也不用多带任何 DLL。
+- **为什么书源要多一条 `curl.exe` 通道**：无忧书城挂在 Cloudflare 后面，会按 TLS 指纹
+  判断客户端，WinInet / WinHTTP 的请求一律 403（`Just a moment...` 挑战页），而系统自带
+  的 `curl.exe` 能过。所以 `WebFetchUrl` 的尝试顺序是「系统代理 → 直连 → `curl.exe`」，
+  一旦某站被判定只能走 curl 就记住它，后续每章直接走那条路，省掉注定失败的两次往返。
 - **为什么限制单实例**：两个实例同时写同一份 ini 会互相覆盖进度，用户会看到
   "读到一半的进度莫名其妙回退"。现在第二个实例把自己的文件参数转发给第一个就退出。
 
@@ -276,7 +308,7 @@ NovelReader/
 | 全文搜索 7 万字 | 即时（`< 20 ms`） |
 | 全文搜索 14.7 MB | 约 120 ms（一次性扫完，结果可到 4000 条） |
 | 内存占用（14.7 MB 的书） | 约 60 MB（正文 + 段落索引 + 章节表） |
-| 程序体积 | 530 KB（静态链接，无 DLL 依赖） |
+| 程序体积 | 569 KB（静态链接，无 DLL 依赖） |
 
 ---
 

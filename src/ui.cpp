@@ -1682,6 +1682,232 @@ void UiOpenWebNovel()
     }
     UiOpenFile(path);
 }
+
+/* ---------------- 书源搜索（无忧书城 51shucheng）----------------
+ * 为什么单独做一个对话框：通用的「打开网页小说」要让用户自己找目录页网址，
+ * 门槛太高。书源把"输入书名 → 搜索结果里挑一本 → 抓整本"串成一条龙。
+ *
+ * 界面就是四样东西：关键词输入框、结果列表、下载按钮、关闭按钮。
+ * 列表里一条 = 一本书，显示"书名 · 简介前 60 字"，方便从同名书里挑。
+ * 下载期间用 WebProgressCb 把进度写进主窗口状态栏，并按 ESC 可取消。
+ */
+#define SRC_EDIT   101      /* 关键词输入框 */
+#define SRC_LIST   102      /* 搜索结果列表 */
+#define SRC_SEARCH 103      /* 搜索按钮 */
+#define SRC_DOWN   104      /* 下载并打开 */
+#define SRC_CLOSE  105      /* 关闭 */
+
+static HWND s_srcEdit = nullptr;
+static HWND s_srcList = nullptr;
+static std::vector<WebBookHit> s_srcHits;    /* 与列表项一一对应 */
+static std::wstring s_srcOpenPath;           /* 关窗后要打开的文件 */
+static bool s_srcBusy = false;               /* 正在联网，挡住重复点击 */
+static bool s_srcReady = false;              /* 窗口类注册过没有 */
+
+/* 点「搜索」：问一次站点，把结果灌进列表。 */
+static void SrcDoSearch(HWND dlg)
+{
+    if (s_srcBusy) return;
+    wchar_t buf[256];
+    buf[0] = 0;
+    if (s_srcEdit) GetWindowTextW(s_srcEdit, buf, 256);
+    std::wstring kw = TrimW(buf);
+    NrTrace(L"SRC search enter kw='%s' edit=%p", kw.c_str(), (void*)s_srcEdit);
+    if (kw.empty()) {
+        MessageBoxW(dlg, L"先输入书名或作者。", L"书源搜索", MB_ICONINFORMATION);
+        return;
+    }
+
+    if (s_srcList) SendMessageW(s_srcList, LB_RESETCONTENT, 0, 0);
+    s_srcHits.clear();
+
+    s_srcBusy = true;
+    HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+    std::vector<WebBookHit> hits;
+    std::wstring err;
+    bool ok = WebSourceSearch(kw, hits, err);
+    SetCursor(old);
+    s_srcBusy = false;
+    NrTrace(L"SRC search done ok=%d hits=%d err='%s'", (int)ok, (int)hits.size(), err.c_str());
+
+    if (!ok) {
+        MessageBoxW(dlg, err.c_str(), L"没搜到", MB_ICONINFORMATION);
+        return;
+    }
+    s_srcHits = hits;
+    for (size_t i = 0; i < hits.size(); i++) {
+        std::wstring line = hits[i].title;
+        if (!hits[i].desc.empty()) {
+            line += L"  ·  ";
+            line += hits[i].desc;
+        }
+        SendMessageW(s_srcList, LB_ADDSTRING, 0, (LPARAM)line.c_str());
+    }
+    SendMessageW(s_srcList, LB_SETCURSEL, 0, 0);
+}
+
+/* 点「下载并打开」：抓整本 → 存 txt → 问要不要马上看。 */
+static void SrcDoDownload(HWND dlg)
+{
+    int idx0 = s_srcList ? (int)SendMessageW(s_srcList, LB_GETCURSEL, 0, 0) : -1;
+    NrTrace(L"SRC dl enter busy=%d idx=%d hits=%d list=%p", (int)s_srcBusy, idx0,
+            (int)s_srcHits.size(), (void*)s_srcList);
+    (void)idx0;                 /* release 版里 NrTrace 是空宏，避免"未使用变量"警告 */
+    if (s_srcBusy) return;
+    int idx = s_srcList ? (int)SendMessageW(s_srcList, LB_GETCURSEL, 0, 0) : -1;
+    if (idx < 0 || idx >= (int)s_srcHits.size()) {
+        MessageBoxW(dlg, L"先在列表里选一本书。", L"书源搜索", MB_ICONINFORMATION);
+        return;
+    }
+    const WebBookHit hit = s_srcHits[idx];
+
+    s_srcBusy = true;
+    if (s_srcEdit) EnableWindow(s_srcEdit, FALSE);
+    HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+    std::wstring text, title, err;
+    bool ok = WebSourceFetchBook(hit.url, text, title, err, WebProgressCb, nullptr, hit.title);
+    SetCursor(old);
+    if (s_srcEdit) EnableWindow(s_srcEdit, TRUE);
+    s_srcBusy = false;
+    UiUpdateStatus();           /* 把状态栏从"正在抓…"恢复成正常内容 */
+
+    if (!ok) {
+        std::wstring m = L"下载失败：\n\n";
+        m += err.empty() ? std::wstring(L"未知原因。") : err;
+        m += L"\n\n";
+        m += hit.url;
+        MessageBoxW(dlg, m.c_str(), L"下载失败", MB_ICONWARNING);
+        return;
+    }
+
+    /* 抓取被 ESC 打断时 err 非空但 text 有内容：让用户决定要不要留半本。
+     * 不问就直接存，用户会以为"整本抓完了"，其实后面几十章都没有。 */
+    if (!err.empty()) {
+        std::wstring m = err + L"\n\n已抓到的部分要保存成文件吗？";
+        if (MessageBoxW(dlg, m.c_str(), L"抓取中断", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+    }
+
+    std::wstring path = WebCachePath(title);
+    if (!WriteTextFileUtf8Bom(path, text)) {
+        std::wstring m = L"抓到了内容，但写文件失败：\n\n";
+        m += path;
+        MessageBoxW(dlg, m.c_str(), L"保存失败", MB_ICONWARNING);
+        return;
+    }
+    IniSetStr(PosSectionFor(path).c_str(), L"src", hit.url.c_str());
+
+    wchar_t msg[1400];
+    swprintf(msg, 1400, L"抓完了：《%s》\n共 %d 字\n已保存到：\n%s\n\n现在打开阅读吗？",
+             title.c_str(), (int)text.size(), path.c_str());
+    if (MessageBoxW(dlg, msg, L"下载完成", MB_YESNO | MB_ICONINFORMATION) == IDYES) {
+        s_srcOpenPath = path;
+        DestroyWindow(dlg);
+    }
+}
+
+static LRESULT CALLBACK SourceBoxProc(HWND h, UINT msg, WPARAM w, LPARAM l)
+{
+    switch (msg) {
+    case WM_CREATE: {
+        CreateWindowExW(0, L"STATIC", L"书名或作者：", WS_CHILD | WS_VISIBLE | SS_LEFT,
+                        S(16), S(18), S(200), S(20), h, nullptr, nullptr, nullptr);
+        s_srcEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                                    S(16), S(42), S(400), S(26), h, (HMENU)SRC_EDIT, nullptr, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"搜索(&S)", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                        S(424), S(42), S(86), S(26), h, (HMENU)SRC_SEARCH, nullptr, nullptr);
+        s_srcList = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
+                                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL |
+                                    LBS_NOINTEGRALHEIGHT | LBS_NOTIFY,
+                                    S(16), S(78), S(494), S(250), h, (HMENU)SRC_LIST, nullptr, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"下载并打开(&D)", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                        S(16), S(340), S(140), S(30), h, (HMENU)SRC_DOWN, nullptr, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"关闭", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                        S(438), S(340), S(72), S(30), h, (HMENU)SRC_CLOSE, nullptr, nullptr);
+        CreateWindowExW(0, L"STATIC",
+                        L"书源：无忧书城（51shucheng）。整本少则几十章、多则一两千章，"
+                        L"下载时进度显示在主窗口状态栏，按 ESC 可取消。",
+                        WS_CHILD | WS_VISIBLE | SS_LEFT,
+                        S(16), S(376), S(494), S(40), h, nullptr, nullptr, nullptr);
+        if (s_srcEdit) SetFocus(s_srcEdit);
+        return 0;
+    }
+    case WM_COMMAND:
+        NrTrace(L"SRC dlg cmd id=%d code=%d", (int)LOWORD(w), (int)HIWORD(w));
+        switch (LOWORD(w)) {
+        case SRC_SEARCH: SrcDoSearch(h); return 0;
+        case SRC_DOWN:   SrcDoDownload(h); return 0;
+        case SRC_CLOSE:  DestroyWindow(h); return 0;
+        case SRC_LIST:
+            /* 双击列表项 = 直接下载这一本，省一次点按钮 */
+            if (HIWORD(w) == LBN_DBLCLK) { SrcDoDownload(h); return 0; }
+            return 0;
+        }
+        return 0;
+    case WM_CLOSE:
+        NrTrace(L"SRC dlg WM_CLOSE");
+        DestroyWindow(h);
+        return 0;
+    case WM_DESTROY:
+        NrTrace(L"SRC dlg WM_DESTROY");
+        s_srcEdit = nullptr;
+        s_srcList = nullptr;
+        return 0;
+    }
+    return DefWindowProcW(h, msg, w, l);
+}
+
+/* 菜单「文件 → 书源搜索」的入口。对话框关掉之后再去打开文件 ——
+ * 下载过程中主窗口一直是禁用的，边下边开书容易把状态搞乱。 */
+void UiSourceSearch()
+{
+    HINSTANCE hi = GetModuleHandleW(nullptr);
+    if (!s_srcReady) {
+        WNDCLASSEXW wc;
+        ZeroMemory(&wc, sizeof(wc));
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = SourceBoxProc;
+        wc.hInstance = hi;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"NRSourceBox";
+        RegisterClassExW(&wc);
+        s_srcReady = true;
+    }
+
+    s_srcHits.clear();
+    s_srcOpenPath.clear();
+    s_srcBusy = false;
+
+    RECT wr;
+    GetWindowRect(g_hMain, &wr);
+    int wpx = S(526), hpx = S(430);
+    int x = (wr.left + wr.right - wpx) / 2;
+    int y = (wr.top + wr.bottom - hpx) / 2;
+
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"NRSourceBox",
+                               L"书源搜索 — 无忧书城（输入书名，下载整本）",
+                               WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+                               x, y, wpx, hpx, g_hMain, nullptr, hi, nullptr);
+    if (!dlg) return;
+
+    EnableWindow(g_hMain, FALSE);
+    ShowWindow(dlg, SW_SHOW);
+    SetForegroundWindow(dlg);
+
+    MSG msg;
+    while (IsWindow(dlg) && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (!IsDialogMessageW(dlg, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    EnableWindow(g_hMain, TRUE);
+    SetForegroundWindow(g_hMain);
+
+    if (!s_srcOpenPath.empty()) UiOpenFile(s_srcOpenPath);
+}
+
 /* 弹「打开文件」对话框，返回选中路径；用户取消返回空串。
  * 细节：过滤器给两组（txt 默认 + 所有文件），末尾的 "\0\0" 是必需的收尾，
  * 漏了会把相邻内存当成字符串读出一串乱码；OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST
@@ -1784,6 +2010,8 @@ static HMENU BuildMenu()
     AppendMenuW(f, MF_STRING, IDM_CLOSEFILE, L"关闭当前书(&C)\tCtrl+W");
     AppendMenuW(f, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(f, MF_STRING, IDM_OPEN_URL, L"打开网页小说(&U)...\tCtrl+U");
+    /* 书源搜索：内置无忧书城，输入书名就能搜到并下载整本，不用自己找目录页网址 */
+    AppendMenuW(f, MF_STRING, IDM_SOURCE, L"书源搜索（无忧书城）(&S)...\tCtrl+S");
     AppendMenuW(f, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(f, MF_STRING, IDM_EXIT, L"退出(&X)");
     AppendMenuW(h, MF_POPUP, (UINT_PTR)f, L"文件(&F)");
@@ -1880,6 +2108,7 @@ static void ShowKeys()
         L"  F5           重新载入当前文件\n"
         L"  F9           PDF：文字重排 / 原始版式（整页渲染）切换\n"
         L"  Ctrl+U       打开网页小说（输入目录页网址，自动抓全书）\n"
+        L"  Ctrl+S       书源搜索（内置无忧书城：输入书名 → 选书 → 下载整本）\n"
         L"\n"
         L"书签与外观\n"
         L"  Ctrl+D       给当前位置加书签（同一段再加会更新标题）\n"
@@ -2253,6 +2482,7 @@ static void OnCommand(int id, int code, HWND ctl)
     case IDM_BM_DEL:      UiDelBookmark(); break;
     case IDM_PDF_MODE:    UiTogglePdfMode(); break;
     case IDM_OPEN_URL:    UiOpenWebNovel(); break;
+    case IDM_SOURCE:      UiSourceSearch(); break;
     case IDM_PICK_FONT:   UiPickFont(); break;
     case IDM_IMPORT_FONT: UiImportFont(); break;
     case IDM_PICK_COLORS: UiPickColors(); break;
@@ -2489,6 +2719,7 @@ static HACCEL BuildAccel()
         { FVIRTKEY | FCONTROL,             'T',         IDM_TOC },
         { FVIRTKEY | FCONTROL,             'D',         IDM_BM_ADD },
             { FVIRTKEY | FCONTROL,             'U',         IDM_OPEN_URL },
+            { FVIRTKEY | FCONTROL,             'S',         IDM_SOURCE },
             { FVIRTKEY | FCONTROL,             'G',         IDM_PHONE },
             { FVIRTKEY | FCONTROL | FSHIFT,    'G',         IDM_PHONE_JUMP },
 { FVIRTKEY | FCONTROL,             'B',         IDM_BM_LIST },
