@@ -1,9 +1,9 @@
-﻿﻿NovelReader 1.6.0 —— 源码说明与编译方法
+﻿﻿NovelReader 1.7.0 —— 源码说明与编译方法
 ==========================================
 
 这个文件夹里是阅读器的全部源码：纯 C++17 + Win32 API，没有任何第三方库
 （zip 解压、DEFLATE、PDF 解析、HTTP 服务全是自己写的），编译出来就是一个
-约 947 KB 的独立 exe（静态链接，不带 DLL）。
+约 1013 KB 的独立 exe（静态链接，不带 DLL）。
 
 源码里每个文件的开头都有一段中文说明，讲这个文件负责什么、关键决定为什么这么做；
 重要函数和容易踩坑的地方都有逐段注释。
@@ -152,7 +152,29 @@ build.bat 会做两件事：
    把文件参数转发给第一个就退出。
 
 
-11. 界面为什么全部自绘（1.6.0）
+11. 安卓端与局域网同步（1.7.0）
+---------------------------------
+同步模块在同目录的 sync.h / sync.cpp，安卓端在仓库根目录的 android/。
+
+  · 没有服务端：两端各自监听一个 TCP 端口（默认 8233，被占用就往上找）和一个
+    UDP 发现端口（8234）。UDP 广播报文是 "NR1|<tcp端口>|pc|手机|<selfId>"，
+    收到自己的 selfId 直接丢（否则自己广播会被自己收下，然后连自己）。
+  · 书的身份是"正文指纹"：FNV-1a 64 哈希 书名 + '|' + 正文字数 + '|' + 前 4096 字，
+    输出 16 位十六进制。指纹算出来要读正文，所以保存进度时顺手写进 ini 的 skey，
+    手机每次拉 /peer/books 只读 ini，不用把每本书重新读一遍。
+  · 协议是最小号 HTTP/1.1：GET /peer/ping、/peer/books、/peer/book?key=、
+    POST /peer/progress。记录行 key<TAB>title<TAB>off<TAB>pct<TAB>ts<TAB>chapter，
+    字段里只转义 % \t \n \r 四个字符（PctEncode/PctDecode）。
+  · 同步默认关闭（settings 的 phoneSrv），只有用户点了菜单才监听端口；
+    界面线程只负责"发现到对端后拉一次记录、比对、问用户"，网络都在后台线程。
+
+安卓端（android/）刻意不用 Gradle：
+  aapt2 compile/link → javac → d8 → 把 classes.dex 塞回 APK → zipalign → apksigner。
+  构建脚本 android/build_apk.ps1（PowerShell 5.1 保存时必须带 UTF-8 BOM），
+  JDK 与 SDK 路径写在脚本开头（E:\Android\jdk\...、E:\Android\sdk）。
+  签名密钥 android/novelreader.keystore（口令 novelreader，别名 novelreader）
+  也提交进仓库：自己重新打包时用同一把密钥，手机才能覆盖安装。
+12. 界面为什么全部自绘（1.6.0）
     系统控件的灰底、3D 边框、菜单栏在米色纸面和夜间深底上都很扎眼，所以顶栏
     （NRToolbar）、状态栏（NRStatus）、目录/搜索结果列表（LBS_OWNERDRAWFIXED）、
     搜索条三个按钮（BS_OWNERDRAW）全部自己画。要点有三个：

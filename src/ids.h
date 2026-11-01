@@ -72,6 +72,7 @@
 /* ---- 网页小说（1280~1299，预留） ---- */
 #define IDM_OPEN_URL    1280    /* 从网址打开：抓网页正文（后续做成整本抓取） */
 #define IDM_PHONE        1290   /* 手机阅读：开局域网服务并显示地址 */
+#define IDM_PHONE_SYNC 1295   /* 手机同步总开关（用户手动开启） */
 #define IDM_PHONE_JUMP   1291   /* 跳到手机端最近读到的位置 */
 #define IDM_PDF_MODE     1292   /* PDF 原始版式 / 文字重排 切换（F9，仅 PDF 有效） */
 #define IDM_SOURCE       1293   /* 书源搜索：按书源规则搜书并下载整本（Ctrl+S） */

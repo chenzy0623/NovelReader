@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "common.h"
+#include <ctime>
 
 
 namespace {
@@ -40,6 +41,9 @@ namespace {
 const int kDefaultPort = 8231;   // 默认端口：8231 不常见，撞车概率低
 const int kPageChars = 1400;     // 手机上"一屏"大概的字数（可自适应）
 const int kMaxReq = 8192;        // 单个请求头上限，防止恶意大包
+/* App 用的 JSON 接口的 Content-Type。Android 的 HttpURLConnection 看到这个头
+ * 才会按 UTF-8 解码，否则中文会被当成 ISO-8859-1 变成问号。 */
+const char* const kJsonType = "application/json; charset=utf-8";
 
 SOCKET g_listen = INVALID_SOCKET;
 int g_port = 0;
@@ -373,6 +377,227 @@ int QueryInt(const std::string& q, const char* key, int defVal)
     return any ? v : defVal;
 }
 
+// ---- 手机 App 用的 JSON 接口 ----------------------------------------------
+// 这组接口是给 Android 客户端（android/ 目录，纯 Java）用的，返回 UTF-8 JSON。
+// 为什么另开一套而不是让 App 去解析 HTML：手机端只要"书目 / 目录 / 一页正文 /
+// 上报进度"四件事，JSON 比抓 <p> 稳得多，也不用跟着网页改版活着。
+//
+// 注意：上报进度故意做成 GET（/api/report?id=0&off=1234）。HandleOne 只读到
+// 请求头就分发，不解析 body；GET 带查询串最省事，局域网里也没什么安全问题。
+
+/* 把宽字符串转成 JSON 字符串字面量（含引号），转义 " \ 和换行/制表。
+ * 中文直接以 UTF-8 原样放进去 —— JSON 允许，体积也最小。 */
+std::string JsonStr(const std::wstring& s)
+{
+    std::string u = ToUtf8(s);
+    std::string o;
+    o.reserve(u.size() + 2);
+    o += '"';
+    for (size_t i = 0; i < u.size(); i++)
+    {
+        unsigned char c = (unsigned char)u[i];
+        if (c == '"')       o += "\\\"";
+        else if (c == '\\') o += "\\\\";
+        else if (c == '\n') o += "\\n";
+        else if (c == '\r') o += "\\r";
+        else if (c == '\t') o += "\\t";
+        else if (c < 0x20)  { char b[8]; wsprintfA(b, "\\u%04x", (unsigned)c); o += b; }
+        else                o += (char)c;
+    }
+    o += '"';
+    return o;
+}
+
+/* 数字转字符串的小工具（wsprintfA 的 %d 够用，但包一层省得每处都写 buf）。 */
+std::string Num(int v) { char b[32]; wsprintfA(b, "%d", v); return std::string(b); }
+
+/* 取一页的起止偏移：从 off 起最多 kPageChars 个字，并尽量在下一段段首收住。
+ * 网页版和 App 共用这段规则，保证同一位置两边看到的是同一页。 */
+void CalcPageRange(const Book& bk, int off, int* pEnd)
+{
+    int total = (int)bk.text.size();
+    int end = off + kPageChars;
+    if (end > total) end = total;
+    if (end < total)
+    {
+        int p = BookCharToPara(bk, end);
+        int limit = p + 2;
+        if (limit > bk.ParaCount() - 1) limit = bk.ParaCount() - 1;
+        if (p < limit) end = (int)bk.paraOff[(size_t)limit];
+    }
+    if (end <= off) end = (off + kPageChars < total) ? off + kPageChars : total;
+    *pEnd = end;
+}
+
+/* 把一段正文里的换行压成空格，得到"一页纯文本"。App 用一个 TextView 显示，
+ * 段落之间用空行分开 —— 不用 HTML，也就没有标签转义问题。 */
+std::wstring PlainFromSeg(const std::wstring& seg)
+{
+    std::wstring out;
+    out.reserve(seg.size() + 16);
+    size_t pos = 0;
+    while (pos <= seg.size())
+    {
+        size_t nl = seg.find(L'\n', pos);
+        std::wstring line = (nl == std::wstring::npos) ? seg.substr(pos) : seg.substr(pos, nl - pos);
+        size_t a = 0, z = line.size();
+        while (a < z && (line[a] == L' ' || line[a] == L'\t' || line[a] == L'\r')) a++;
+        while (z > a && (line[z - 1] == L' ' || line[z - 1] == L'\t' || line[z - 1] == L'\r')) z--;
+        if (z > a)
+        {
+            if (!out.empty()) out += L'\n';
+            out.append(line, a, z - a);
+        }
+        if (nl == std::wstring::npos) break;
+        pos = nl + 1;
+    }
+    return out;
+}
+
+/* 记一次"手机读到这儿"。除了照常写 off（电脑端 Ctrl+G 能跳过来），
+ * 还另存 poff / ppct / phts：
+ *   电脑端自己的进度键是 off + ts，手机的是 poff + phts，
+ *   两个时间戳比大小，谁读得更晚就听谁的 —— 这样两边交替读也不会互相踩。 */
+void SavePhoneProgress(const Book& bk, int off)
+{
+    int total = (int)bk.text.size();
+    int para = BookCharToPara(bk, off);
+    int ch = BookChapterAtPara(bk, para);
+    std::wstring chName = (ch >= 0) ? BookChapterTitle(bk, ch) : std::wstring();
+    int pct = total > 0 ? (int)((long long)off * 1000 / total) : 0;
+
+    PosSaveMeta(bk.path, off, chName, ch, (int)bk.chapters.size(), pct);
+
+    std::wstring sec = PosSectionFor(bk.path);
+    IniSetInt(sec.c_str(), L"poff", off);
+    IniSetInt(sec.c_str(), L"ppct", pct);
+    IniSetInt(sec.c_str(), L"phts", (int)time(nullptr));
+
+    g_phonePath = bk.path;
+    g_phoneOff = off;
+    g_phoneChapter = chName;
+    g_phonePct = pct;
+}
+
+// GET /api/shelf —— 书架（最多 10 本，和电脑端一致）
+std::string ApiShelf()
+{
+    /* 先刷一遍书架：手机每翻一页都会 /api/report 写进度，而内存里的书架快照
+     * 是启动时建的，不刷的话手机上看到的百分比永远停在打开程序那一刻。
+     * ShelfRefresh 只读 ini 的几个键，开销可以忽略。 */
+    ShelfRefresh();
+    std::vector<ShelfItem> items = ShelfItems();
+    std::string b = "{\"ok\":1,\"count\":";
+    b += Num((int)items.size());
+    b += ",\"books\":[";
+    for (size_t i = 0; i < items.size(); i++)
+    {
+        if (i) b += ',';
+        b += "{\"id\":" + Num((int)i);
+        b += ",\"title\":" + JsonStr(items[i].title);
+        b += ",\"chapter\":" + JsonStr(items[i].chapter);
+        /* pct 是千分数；没读过（-1）时给 0，免得手机端显示 "-0.1%" */
+        b += ",\"pct\":" + Num(items[i].pct < 0 ? 0 : items[i].pct);
+        b += ",\"chn\":" + Num(items[i].chn);
+        b += ",\"missing\":" + Num(items[i].missing ? 1 : 0);
+        b += '}';
+    }
+    b += "]}";
+    return b;
+}
+
+// GET /api/chapters?id=0 —— 目录
+std::string ApiChapters(int id, std::wstring& err)
+{
+    std::vector<ShelfItem> items = ShelfItems();
+    if (id < 0 || id >= (int)items.size()) { err = L"没有这本书"; return std::string(); }
+    if (!ServerOpenBook(items[(size_t)id].path, err)) return std::string();
+
+    std::string b = "{\"ok\":1,\"title\":" + JsonStr(g_srvBook.title);
+    b += ",\"chapters\":[";
+    const std::vector<Chapter>& chs = g_srvBook.chapters;
+    for (size_t i = 0; i < chs.size(); i++)
+    {
+        if (i) b += ',';
+        b += "{\"i\":" + Num((int)i);
+        b += ",\"off\":" + Num((int)chs[i].off);
+        b += ",\"title\":" + JsonStr(BookChapterTitle(g_srvBook, (int)i));
+        b += '}';
+    }
+    b += "]}";
+    return b;
+}
+
+// GET /api/page?id=0&off=1234 —— 一页正文（纯文本）
+std::string ApiPage(int id, int off, std::wstring& err)
+{
+    std::vector<ShelfItem> items = ShelfItems();
+    if (id < 0 || id >= (int)items.size()) { err = L"没有这本书"; return std::string(); }
+    if (!ServerOpenBook(items[(size_t)id].path, err)) return std::string();
+
+    const Book& bk = g_srvBook;
+    int total = (int)bk.text.size();
+    if (total <= 0) { err = L"这本书是空的"; return std::string(); }
+    off = AlignToPara(bk, off);
+    if (off < 0) off = 0;
+    if (off >= total) off = total - 1;
+
+    int end = off;
+    CalcPageRange(bk, off, &end);
+    std::wstring plain = PlainFromSeg(bk.text.substr((size_t)off, (size_t)(end - off)));
+
+    int para = BookCharToPara(bk, off);
+    int ch = BookChapterAtPara(bk, para);
+    std::wstring chName = (ch >= 0) ? BookChapterTitle(bk, ch) : std::wstring();
+    int pct = (int)((long long)off * 1000 / total);
+
+    int prev = off - kPageChars;
+    if (prev < 0) prev = 0;
+    int next = end;
+    if (next >= total) next = -1;          /* -1 = 到头了，App 据此禁用"下一页" */
+
+    std::string b = "{\"ok\":1";
+    b += ",\"id\":" + Num(id);
+    b += ",\"off\":" + Num(off);
+    b += ",\"next\":" + Num(next);
+    b += ",\"prev\":" + Num(prev);
+    b += ",\"pct\":" + Num(pct);
+    b += ",\"chapter\":" + JsonStr(chName);
+    b += ",\"title\":" + JsonStr(bk.title);
+    b += ",\"text\":" + JsonStr(plain);
+    b += '}';
+    return b;
+}
+
+// GET /api/report?id=0&off=1234 —— 手机上报"读到这儿"，顺手把进度写回 ini
+std::string ApiReport(int id, int off, std::wstring& err)
+{
+    std::vector<ShelfItem> items = ShelfItems();
+    if (id < 0 || id >= (int)items.size()) { err = L"没有这本书"; return std::string(); }
+    if (!ServerOpenBook(items[(size_t)id].path, err)) return std::string();
+
+    const Book& bk = g_srvBook;
+    int total = (int)bk.text.size();
+    if (total <= 0) { err = L"这本书是空的"; return std::string(); }
+    off = AlignToPara(bk, off);
+    if (off < 0) off = 0;
+    if (off >= total) off = total - 1;
+    SavePhoneProgress(bk, off);
+
+    int pct = (int)((long long)off * 1000 / total);
+    return "{\"ok\":1,\"off\":" + Num(off) + ",\"pct\":" + Num(pct) + "}";
+}
+
+// GET /api/ping —— App 用来测试"地址填对没有"
+std::string ApiPing()
+{
+    std::string b = "{\"ok\":1,\"app\":\"NovelReader\",\"port\":" + Num(g_port);
+    b += ",\"book\":" + JsonStr(g_book.Ok() ? g_book.title : std::wstring());
+    b += ",\"total\":" + Num(g_book.Ok() ? (int)ShelfItems().size() : 0);
+    b += '}';
+    return b;
+}
+
 // ---- 处理一个请求 --------------------------------------------------------
 void HandleOne(SOCKET c)
 {
@@ -424,6 +649,33 @@ void HandleOne(SOCKET c)
     else if (path == "/favicon.ico")
     {
         Respond(c, 404, "Not Found", "", "image/x-icon");
+    }
+    /* ---- App 用的 JSON 接口 ---- */
+    else if (path == "/api/ping")
+    {
+        Respond(c, 200, "OK", ApiPing(), kJsonType);
+    }
+    else if (path == "/api/shelf")
+    {
+        Respond(c, 200, "OK", ApiShelf(), kJsonType);
+    }
+    else if (path == "/api/chapters")
+    {
+        body = ApiChapters(QueryInt(query, "id", -1), err);
+        if (body.empty()) Respond(c, 404, "Not Found", "{\"ok\":0,\"err\":" + JsonStr(err) + "}", kJsonType);
+        else Respond(c, 200, "OK", body, kJsonType);
+    }
+    else if (path == "/api/page")
+    {
+        body = ApiPage(QueryInt(query, "id", -1), QueryInt(query, "off", 0), err);
+        if (body.empty()) Respond(c, 404, "Not Found", "{\"ok\":0,\"err\":" + JsonStr(err) + "}", kJsonType);
+        else Respond(c, 200, "OK", body, kJsonType);
+    }
+    else if (path == "/api/report")
+    {
+        body = ApiReport(QueryInt(query, "id", -1), QueryInt(query, "off", 0), err);
+        if (body.empty()) Respond(c, 404, "Not Found", "{\"ok\":0,\"err\":" + JsonStr(err) + "}", kJsonType);
+        else Respond(c, 200, "OK", body, kJsonType);
     }
     else
     {
@@ -611,6 +863,39 @@ bool ServerStart(int port, std::wstring& err)
 
 bool ServerRunning() { return g_running; }
 
+/* 关掉服务（1.7.0：给"手机同步"开关用）。
+ *
+ * 关的顺序有讲究：
+ *  1. 先立停止标志 —— 接收线程的循环条件看的是它，置位后线程处理完手上
+ *     这一个请求就会退出，不会再去 accept 新连接；
+ *  2. 再关监听套接字 —— 阻塞在 accept 上的线程会被唤醒（accept 返回
+ *     INVALID_SOCKET），从而立刻跳出循环，不必等 5 秒超时；
+ *  3. 最后等线程退出并 WSACleanup，避免线程还在用 ws2_32 的句柄。
+ * 顺序反过来的话（先关套接字再置标志），线程会以为只是"临时失败"，
+ * Sleep(20) 之后再 accept 一个已经关掉的句柄。 */
+void ServerStop()
+{
+    if (!g_running) return;
+
+    InterlockedExchange(&g_stopFlag, 1);
+
+    if (g_listen != INVALID_SOCKET)
+    {
+        closesocket(g_listen);
+        g_listen = INVALID_SOCKET;
+    }
+    if (g_thread)
+    {
+        WaitForSingleObject(g_thread, 3000);
+        CloseHandle(g_thread);
+        g_thread = nullptr;
+    }
+
+    g_running = false;
+    g_port = 0;
+    WSACleanup();
+}
+
 int ServerPort() { return g_running ? g_port : 0; }
 
 std::vector<std::wstring> ServerUrls()
@@ -628,5 +913,21 @@ bool ServerLastPhoneProgress(std::wstring& path, int& off, std::wstring& chapter
     off = g_phoneOff;
     chapter = g_phoneChapter;
     pct = g_phonePct;
+    return true;
+}
+
+/* 从 ini 里读某本书的"手机读到哪"：poff / ppct / phts。
+ * 和内存里的 g_phone* 不同，这三个键是**跨进程**活着的 —— 电脑关掉再开，
+ * 也能知道上次是手机读到哪儿、什么时候读的。 */
+bool ServerPhoneProgress(const std::wstring& path, int* off, int* pct, int* ts)
+{
+    if (path.empty()) return false;
+    std::wstring sec = PosSectionFor(path);
+    int o = IniGetInt(sec.c_str(), L"poff", -1);
+    int t = IniGetInt(sec.c_str(), L"phts", 0);
+    if (o < 0 || t <= 0) return false;
+    if (off) *off = o;
+    if (pct) *pct = IniGetInt(sec.c_str(), L"ppct", 0);
+    if (ts)  *ts = t;
     return true;
 }

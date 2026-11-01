@@ -22,3 +22,8 @@ src_snapshot/
 *.user
 Thumbs.db
 desktop.ini
+
+# 安卓构建中间产物（保留签名密钥本身，见源码说明）
+android/build/
+android/*.apk
+!android/novelreader.keystore

@@ -295,6 +295,7 @@ void SettingsLoad()
     g_set.privacy = IniGetInt(S0, L"privacy", 0);
     g_set.bossKey = IniGetStr(S0, L"bossKey", L"Ctrl+Alt+H");
     if (g_set.bossKey.empty()) g_set.bossKey = L"Ctrl+Alt+H";   /* 空串会注册成"无修饰的键"，太危险 */
+    g_set.phoneSrv = IniGetInt(S0, L"phoneSrv", 0);   /* 手机同步：0 关（默认） 1 开 */
 
     /* 窗口位置：四个值缺一不可，而且要有意义的大小（right>left、bottom>top）。
      * 用 -100000 当"没有记录"的哨兵，比 0 更安全（多显示器可能出现负数坐标）。 */
@@ -332,6 +333,7 @@ void SettingsSave()
     /* 1.6.0：隐私模式与老板键（老板键可以在 Ctrl+F12 里改，改完要能记住） */
     IniSetInt(S0, L"privacy", g_set.privacy);
     IniSetStr(S0, L"bossKey", g_set.bossKey);
+    IniSetInt(S0, L"phoneSrv", g_set.phoneSrv);
     if (g_set.hasRect) {
         IniSetInt(S0, L"winL", g_set.winRect.left);
         IniSetInt(S0, L"winT", g_set.winRect.top);

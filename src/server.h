@@ -20,6 +20,8 @@ bool ServerStart(int port, std::wstring& err);
 
 // 服务是否在跑
 bool ServerRunning();
+/* 关闭服务（1.7.0 手机同步开关用）：先置停止标志再关监听套接字 */
+void ServerStop();
 
 // 正在监听的端口（没跑返回 0）
 int ServerPort();
@@ -29,5 +31,8 @@ std::vector<std::wstring> ServerUrls();
 
 // 最近一次手机保存的进度（没有则返回 false）
 bool ServerLastPhoneProgress(std::wstring& path, int& off, std::wstring& chapter, int& pct);
+/* 从 ini 里读某本书"手机读到哪"（poff / ppct / phts）。
+ * 电脑端打开这本书时用它和本机进度（off / ts）比时间戳，谁更新听谁的。 */
+bool ServerPhoneProgress(const std::wstring& path, int* off, int* pct, int* ts);
 
 #endif // NR_SERVER_H

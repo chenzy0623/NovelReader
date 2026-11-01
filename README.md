@@ -1,13 +1,13 @@
 # 小说阅读器 NovelReader
 
 一个**单文件、免安装、零依赖**的 Windows 小说阅读器。用 C++17 + Win32 从零写成，
-**947 KB** 一个 exe，双击就能用，不写注册表、不装运行库、不需要联网。
+**1013 KB** 一个 exe，双击就能用，不写注册表、不装运行库、不需要联网。
 
 支持 **TXT / EPUB / PDF / DOCX / HTML / Markdown**，自动识别章节，全文搜索，
 记忆阅读位置，自动下滑，书签，换字体，自定义配色，还能直接把网页小说抓成本地书。
 
-![版本](https://img.shields.io/badge/version-1.6.0-blue)
-![体积](https://img.shields.io/badge/size-947%20KB-brightgreen)
+![版本](https://img.shields.io/badge/version-1.7.0-blue)
+![体积](https://img.shields.io/badge/size-1013%20KB-brightgreen)
 ![平台](https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-lightgrey)
 ![依赖](https://img.shields.io/badge/dependencies-none-success)
 ![许可](https://img.shields.io/badge/license-MIT-orange)
@@ -20,8 +20,9 @@
 
 到 [Releases](https://github.com/chenzy0623/NovelReader/releases) 下载最新版：
 
-- **[NovelReader-1.6.0-win64.zip](https://github.com/chenzy0623/NovelReader/releases/download/v1.6.0/NovelReader-1.6.0-win64.zip)**（推荐，含使用说明和示例小说）
-- [单个 NovelReader.exe](https://github.com/chenzy0623/NovelReader/releases/download/v1.6.0/NovelReader.exe)（只要程序本体）
+- **[NovelReader-1.7.0-win64.zip](https://github.com/chenzy0623/NovelReader/releases/download/v1.7.0/NovelReader-1.7.0-win64.zip)**（推荐，含使用说明和示例小说）
+- [单个 NovelReader.exe](https://github.com/chenzy0623/NovelReader/releases/download/v1.7.0/NovelReader.exe)（只要程序本体）
+- **[NovelReader-1.7.0.apk](https://github.com/chenzy0623/NovelReader/releases/download/v1.7.0/NovelReader-1.7.0.apk)**（安卓端，69 KB，Android 5.0+ 直接装）
 
 解压任意目录，双击 `NovelReader.exe` 即可。**绿色版**：阅读进度存在 exe 同目录的
 `NovelReader.ini`（目录不可写时自动改用 `%APPDATA%\NovelReader\`），删掉 ini 就等于恢复出厂。
@@ -51,6 +52,7 @@
 | 高亮与笔记 | 4 种颜色标重点（`Ctrl+H`），每处可写笔记、列表里带 ✎、一键导出 Markdown |
 | 快捷键自定义 | `Ctrl+F12` 里逐条改键，按一下新组合就生效，可恢复默认 |
 | 老板键 / 隐私模式 | `Ctrl+Alt+H` 一键藏窗口（全局热键，切走也能召回）；隐私模式把书名换成「文档」 |
+| 手机同步 | 手机装 APK，和电脑在同一个 WiFi 里各自打开「同步」，两边读到哪互相比对，进度差得多会先问你要不要跳 |
 | 书源搜索 | `Ctrl+S` 按书源搜书名/作者，选中就下载整本、分好章直接读；书源可整套替换（见下） |
 | 手机阅读 | 局域网 HTTP 服务，手机浏览器直接读（菜单位置：帮助 → 手机阅读） |
 | 大文件 | 14.7 MB / 8794 章实测 0.8 秒载入，只渲染可视区域，滚动不掉帧 |
@@ -145,6 +147,39 @@ EPUB：
 - **状态栏**：书名 / 章节 / 进度三段，底部一条通栏进度线；自动下滑时右侧多一个 `▸自动 4`。
 - **搜索条**：输入框和三个按钮都跟着配色走，没有系统灰和立体边框。
 - 菜单栏被拿掉了（系统灰条在夜间配色下是全场唯一亮色），改成「菜单」按钮 + 右键弹出的弹出式菜单。
+
+---
+
+## 1.7.0 新功能：安卓端 + 局域网阅读同步
+
+电脑上读到第三章，出门用手机接着读；回家打开电脑，它问你「手机读到 30% 了，要跳过去吗」。
+
+### 怎么用
+
+1. 电脑端：菜单（左上三条横线）→ 帮助 → **开启手机同步（局域网）**，状态栏会显示「阅读同步已开启，正在局域网里找手机…」。
+2. 手机端：装 `NovelReader-1.7.0.apk`，打开后点右上角 **同步** 开关。
+3. 两端在同一个 WiFi 下，几秒内互相就能看到（UDP 广播发现，不用填 IP、不用连同一个账号）。
+4. 电脑上打开一本书 → 手机上点开同一本 → 两边各自读；换到另一台设备打开同一本书时，进度差超过约半屏，会弹一句问话：
+   - 点「同步」：跳过去，按对方的位置继续；
+   - 点「不用」：留在本机，并把本机进度推给对方（下次对方打开就会问它）。
+
+对话示例（纸感消息框，跟着主题走）：
+
+![手机同步问句](screenshots/22-sync-dialog.png)
+
+### 三条设计取舍
+
+- **没有服务器，也没有账号**。两端各自监听一个 TCP 端口（8233，被占用就往上找）和一个 UDP 端口（8234，只做发现），谁都不当"固定服务端"——这样电脑关机、手机换 WiFi 都不会让另一边变成孤儿。
+- **靠正文指纹认书，不靠文件名**。`FNV-1a 64` 哈希「书名 + 正文长度 + 前 4096 字」，两端算出同样的 16 位 key 才认为是同一本书。所以手机上那本叫「斗破苍穹.txt」、电脑上叫「斗破苍穹_utf8.txt」，照样能对上；而两本不同的书恰好同名也不会串。
+- **同步是"用户自己开启"的**。默认关闭，不开就不监听任何端口；开着时也只是局域网内的点对点直连，没有云端中转。
+
+### 安卓端
+
+- 纯 Java + 原生控件（无 AndroidX、无 Gradle），APK 69 KB；用 `aapt2` + `javac` + `d8` + `zipalign` + `apksigner` 手工构建，把构建脚本和源码一起放进了仓库的 `android/`。
+- 手机端能读的书来自电脑：电脑这边**读过**的书（书架上有记录的）每一本都带指纹，手机点开时按指纹把正文要过去，缓存在自己 `filesDir/books/` 里，之后离线也能看。
+- 手机端也会把自己的阅读位置报给电脑（每次翻页上报页首字符下标，与电脑端同一套坐标）。
+
+> 没有模拟器也没有真机，所以安卓端只做到「编译通过 + 签名校验 + 协议用 JVM 直接跑通（`/peer/ping`、`/peer/books`、`/peer/book`、`/peer/progress` 全部与电脑端互通）」；界面截图欠奉，问题请在 Issues 里反馈。
 
 ---
 
@@ -321,7 +356,7 @@ PDF / EPUB / DOCX / HTML / Markdown 会**先抽出纯文本**，再走同一套�
 - **示例书源删不掉**：它是 0 号，想换成自己的站，直接改它的六项、点「保存」即可，也能随时「恢复内置规则」。
 
 > 为什么用正则而不是 CSS 选择器：程序里没有 HTML DOM 解析器，标准库 `<regex>` 体积零成本，
-> 一条正则够用，而且你可以直接从别处抄规则改。代价是 exe 从 582 KB 涨到 947 KB（模板实例化）。
+> 一条正则够用，而且你可以直接从别处抄规则改。代价是 exe 从 582 KB 涨到 1013 KB（模板实例化）。
 
 > 有些站挂在 Cloudflare 后面，会拿 TLS 指纹和请求头判断是不是机器人：WinInet 的请求一律 403，
 > 所以代码里给这类站点留了 `curl.exe`（Win10 1803 起系统自带）兜底通道；每章之间还会歇 250 ms，
@@ -431,7 +466,7 @@ NovelReader/
 | 全文搜索 7 万字 | 即时（`< 20 ms`） |
 | 全文搜索 14.7 MB | 约 120 ms（一次性扫完，结果可到 4000 条） |
 | 内存占用（14.7 MB 的书） | 约 15 MB 私有内存（正文一次性解码进内存，段落索引只多几 MB） |
-| 程序体积 | 947 KB（静态链接，无 DLL 依赖） |
+| 程序体积 | 1013 KB（静态链接，无 DLL 依赖） |
 
 ---
 

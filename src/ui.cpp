@@ -43,6 +43,8 @@
 #include "common.h"
 #include "web.h"
 #include "server.h"
+/* 1.7.0：局域网 P2P 阅读进度同步（电脑和手机各开监听、互相广播发现） */
+#include "sync.h"
 #include "pdf.h"
 #include "source.h"
 #include <commctrl.h>
@@ -124,6 +126,9 @@ static int  s_lastPct = 0;
  */
 #define TIMER_POS  1
 #define TIMER_AUTO 2
+/* 打开书后"等对面出现"的轮询定时器。刚开机、刚开同步那几秒手机上还没答话，
+ * 一次性检查必然扑空，所以给一个短轮询窗口（最多约 12 秒）。 */
+#define TIMER_SYNC 3
 
 /* ---- 自动下滑状态 ---- */
 /* s_autoOn / s_lastSave：自动下滑的权威状态与落盘时间戳
@@ -142,6 +147,13 @@ static void AutoSyncMenu();
 /* 侧栏切页：书签面板（UiShowBookmarks）的代码放在 ShowPanel 定义之前，
  * 所以这里先声明一下；s_panel 的取值 0 目录 / 1 搜索命中 / 2 书签。 */
 static void ShowPanel(int which);
+static void SyncCheckOnOpen();          /* 打开书后对账进度 */
+static void SyncTryPending();           /* 等对面出现后再对账（见 TIMER_SYNC） */
+static bool s_syncPending = false;      /* 有"待对账"没做完 */
+static int  s_syncTries = 0;            /* 已经轮询了几次 */
+
+static void SyncPushCurrent();           /* 把本机进度推给对端 */
+static void UiShowSyncStatus();          /* 同步状态对话框 */
 /* 1.6.0：下面三个都在文件后半段定义，但导出笔记、快捷键对话框在前面就要用，
  * 所以原型提前（C++ 不允许调用未声明的函数）。 */
 static std::wstring ClipToWidth(HDC dc, const std::wstring& s, int maxW);
@@ -473,6 +485,328 @@ static void UiRoundRect(HDC dc, const RECT& r, int rad, COLORREF fill, COLORREF 
     DeleteObject(pen);
     DeleteObject(br);
 }
+
+/* =====================================================================
+ * 主题化消息框（1.7.0）
+ *
+ * 为什么不用系统的 MessageBoxW：
+ *   1. 它是灰底 + 系统字体，在米色纸感和夜间深色界面里非常突兀，
+ *      而且字号跟正文毫无关系（正文 17 磅，弹窗却是 9 磅系统字）；
+ *   2. 它只会出现在自己创建的那个线程里，一旦被别的东西遮住，
+ *      用户根本不知道该往哪看（这次联调"同步问句看不见"就是这个观感问题）；
+ *   3. 按钮文案是系统的"是/否/确定"，跟界面里其它按钮（我自绘的圆角按钮）
+ *      完全不是一个风格。
+ *
+ * 自己画的好处：纸色卡片、强调色按钮、Enter/Esc 直接生效、
+ * 标题用章节标题那种褐色加粗体，跟正文是一个家族。
+ *
+ * 用法上保持和 MessageBoxW 一样的调用形状（见文件末尾的 NrMessageBoxW），
+ * 这样原来 50 多处调用点不用逐个改，也不会漏掉某处。
+ * ===================================================================== */
+
+#define NRMB_OK     0
+#define NRMB_YESNO  1
+
+struct NrMsgState
+{
+    std::wstring title;
+    std::wstring text;
+    int  kind;                  /* NRMB_OK / NRMB_YESNO */
+    int  result;                /* 对话框返回值 */
+    bool done;
+    int  hover;                 /* 悬停的按钮：0 主按钮、1 次按钮、-1 无 */
+    bool tracking;              /* 是否已经 TrackMouseEvent(TME_LEAVE) */
+    RECT rcMain;                /* 主按钮（确定 / 同步） */
+    RECT rcSub;                 /* 次按钮（取消），NRMB_OK 时为空 */
+    HFONT fTitle, fBody, fBtn;
+};
+
+static LRESULT CALLBACK NrMsgProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    NrMsgState* st = (NrMsgState*)GetWindowLongPtrW(h, GWLP_USERDATA);
+
+    switch (m) {
+    case WM_CREATE:
+        return 0;
+
+    case WM_ERASEBKGND:
+        return 1;               /* 全部在 WM_PAINT 里双缓冲画，别闪 */
+
+    case WM_PAINT:
+    {
+        if (!st) break;
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        RECT rc;
+        GetClientRect(h, &rc);
+        int W = rc.right, H = rc.bottom;
+
+        /* 双缓冲：先画到内存位图再一次贴过去，避免按钮悬停时闪烁 */
+        HDC mem = CreateCompatibleDC(dc);
+        HBITMAP bmp = CreateCompatibleBitmap(dc, W, H);
+        HGDIOBJ ob = SelectObject(mem, bmp);
+        const Theme& th = CurTheme();
+
+        /* 整块卡片 */
+        HBRUSH bg = CreateSolidBrush(th.bg);
+        FillRect(mem, &rc, bg);
+        DeleteObject(bg);
+
+        /* 顶部一条强调色细线，跟工具栏/状态栏呼应 */
+        RECT acc = { 0, 0, W, S(3) };
+        HBRUSH ab = CreateSolidBrush(th.accent);
+        FillRect(mem, &acc, ab);
+        DeleteObject(ab);
+
+        /* 标题 */
+        int padX = S(24);
+        int y = S(20);
+        SetBkMode(mem, TRANSPARENT);
+        SetTextColor(mem, th.title);
+        HGDIOBJ of = SelectObject(mem, st->fTitle);
+        RECT rt = { padX, y, W - padX, y + S(28) };
+        DrawTextW(mem, st->title.c_str(), -1, &rt, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+        y += S(32);
+
+        /* 标题下的分隔线 */
+        RECT ln = { padX, y, W - padX, y + 1 };
+        HBRUSH lb = CreateSolidBrush(th.line);
+        FillRect(mem, &ln, lb);
+        DeleteObject(lb);
+        y += S(14);
+
+        /* 正文（自动换行，多段用 \n） */
+        SetTextColor(mem, th.fg);
+        SelectObject(mem, st->fBody);
+        RECT rbody = { padX, y, W - padX, H - S(64) };
+        DrawTextW(mem, st->text.c_str(), -1, &rbody, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX);
+
+        /* 按钮：主按钮用强调色底 + 白字，次按钮用卡片色 + 描边 */
+        int bh = S(30);
+        int by = H - S(16) - bh;
+        int bw = S(96);
+        int bx = W - padX - bw;
+
+        RECT rSub = { 0, 0, 0, 0 };
+        if (st->kind == NRMB_YESNO) {
+            rSub.left = bx - S(10) - bw;
+            rSub.top = by;
+            rSub.right = rSub.left + bw;
+            rSub.bottom = by + bh;
+            UiRoundRect(mem, rSub, S(6), (st->hover == 1) ? th.hov : th.card, th.line);
+        }
+
+        RECT rMain = { bx, by, bx + bw, by + bh };
+        UiRoundRect(mem, rMain, S(6),
+                    (st->hover == 0) ? th.accent : UiMix(th.accent, th.bg, 14), th.accent);
+
+        SetBkMode(mem, TRANSPARENT);
+        SelectObject(mem, st->fBtn);
+        const wchar_t* mainTxt = (st->kind == NRMB_YESNO) ? L"同步" : L"知道了";
+        const wchar_t* subTxt  = L"不用";
+
+        SetTextColor(mem, RGB(255, 255, 255));
+        DrawTextW(mem, mainTxt, -1, &rMain, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+        if (st->kind == NRMB_YESNO) {
+            SetTextColor(mem, th.fg);
+            DrawTextW(mem, subTxt, -1, &rSub, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
+
+        /* 把算好的矩形存回状态，鼠标消息直接用（避免两处算法不一致） */
+        st->rcMain = rMain;
+        st->rcSub = rSub;
+
+        SelectObject(mem, of);
+        BitBlt(dc, 0, 0, W, H, mem, 0, 0, SRCCOPY);
+        SelectObject(mem, ob);
+        DeleteObject(bmp);
+        DeleteDC(mem);
+        EndPaint(h, &ps);
+        return 0;
+    }
+
+    case WM_MOUSEMOVE:
+    {
+        if (!st) break;
+        int x = GET_X_LPARAM(l), y = GET_Y_LPARAM(l);
+        int hv = -1;
+        if (PtInRect(&st->rcMain, POINT{ x, y })) hv = 0;
+        else if (st->kind == NRMB_YESNO && PtInRect(&st->rcSub, POINT{ x, y })) hv = 1;
+        if (hv != st->hover) {
+            st->hover = hv;
+            InvalidateRect(h, nullptr, FALSE);
+        }
+        if (!st->tracking) {
+            TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, h, 0 };
+            TrackMouseEvent(&tme);
+            st->tracking = true;
+        }
+        /* 手型光标：让"能点"这件事一眼看出来 */
+        SetCursor(LoadCursorW(nullptr, (hv >= 0) ? IDC_HAND : IDC_ARROW));
+        return 0;
+    }
+
+    case WM_MOUSELEAVE:
+        if (st) { st->hover = -1; st->tracking = false; InvalidateRect(h, nullptr, FALSE); }
+        return 0;
+
+    case WM_SETCURSOR:
+        return 0;               /* 光标已在 WM_MOUSEMOVE 里按命中设好 */
+
+    case WM_LBUTTONDOWN:
+    {
+        if (!st) break;
+        int x = GET_X_LPARAM(l), y = GET_Y_LPARAM(l);
+        POINT pt = { x, y };
+        if (PtInRect(&st->rcMain, pt)) {
+            st->result = (st->kind == NRMB_YESNO) ? IDYES : IDOK;
+            st->done = true;
+        } else if (st->kind == NRMB_YESNO && PtInRect(&st->rcSub, pt)) {
+            st->result = IDNO;
+            st->done = true;
+        }
+        if (st->done) DestroyWindow(h);
+        return 0;
+    }
+
+    case WM_KEYDOWN:
+        if (!st) break;
+        if (w == VK_RETURN) {
+            st->result = (st->kind == NRMB_YESNO) ? IDYES : IDOK;
+            st->done = true;
+            DestroyWindow(h);
+            return 0;
+        }
+        if (w == VK_ESCAPE) {
+            st->result = (st->kind == NRMB_YESNO) ? IDNO : IDOK;
+            st->done = true;
+            DestroyWindow(h);
+            return 0;
+        }
+        if (st->kind == NRMB_YESNO && (w == 'Y' || w == 'y')) {
+            st->result = IDYES; st->done = true; DestroyWindow(h); return 0;
+        }
+        if (st->kind == NRMB_YESNO && (w == 'N' || w == 'n')) {
+            st->result = IDNO; st->done = true; DestroyWindow(h); return 0;
+        }
+        break;
+
+    case WM_CLOSE:
+        if (st) { st->result = (st->kind == NRMB_YESNO) ? IDNO : IDOK; st->done = true; }
+        DestroyWindow(h);
+        return 0;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+/* 真正干活的消息框。owner 为空时用主窗口，title 为空时用"提示"。
+ * 返回 IDOK / IDYES / IDNO，与 MessageBoxW 的返回值保持兼容。 */
+static int NrMsgBox(HWND owner, const wchar_t* title, const std::wstring& text, int kind)
+{
+    static bool s_clsReady = false;
+    HINSTANCE inst = (HINSTANCE)GetWindowLongPtrW(g_hMain, GWLP_HINSTANCE);
+    if (!s_clsReady) {
+        WNDCLASSEXW wc;
+        ZeroMemory(&wc, sizeof(wc));
+        wc.cbSize = sizeof(wc);
+        wc.style = CS_DROPSHADOW;
+        wc.lpfnWndProc = NrMsgProc;
+        wc.hInstance = inst;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.lpszClassName = L"NRMsgBox";
+        RegisterClassExW(&wc);
+        s_clsReady = true;
+    }
+
+    /* 先量正文需要多宽多高：宽度固定，高度按字算 */
+    NrMsgState st;
+    st.title = (title && *title) ? title : L"提示";
+    st.text = text;
+    st.kind = kind;
+    st.result = (kind == NRMB_YESNO) ? IDNO : IDOK;
+    st.done = false;
+    st.hover = -1;
+    st.tracking = false;
+    SetRectEmpty(&st.rcMain);
+    SetRectEmpty(&st.rcSub);
+
+    st.fTitle = MakeUiFont(12, true);
+    st.fBody  = MakeUiFont(10, false);
+    st.fBtn   = MakeUiFont(10, false);
+
+    int W = S(460);
+    HDC sdc = GetDC(g_hMain);
+    HGDIOBJ of = SelectObject(sdc, st.fBody);
+    RECT rcT = { 0, 0, W - S(48), 0 };
+    DrawTextW(sdc, st.text.c_str(), -1, &rcT,
+              DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX | DT_CALCRECT);
+    SelectObject(sdc, of);
+    ReleaseDC(g_hMain, sdc);
+
+    int textH = rcT.bottom - rcT.top;
+    int H = S(20) + S(32) + S(14) + textH + S(20) + S(30) + S(16);
+    if (H < S(150)) H = S(150);
+    if (H > S(520)) H = S(520);
+
+    /* 居中到 owner（owner 不在就用主窗口），再夹到工作区里 */
+    RECT ro;
+    HWND ref = owner ? owner : g_hMain;
+    GetWindowRect(ref, &ro);
+    int x = ro.left + ((ro.right - ro.left) - W) / 2;
+    int y = ro.top + ((ro.bottom - ro.top) - H) / 2;
+    RECT wa;
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    if (x < wa.left + S(8)) x = wa.left + S(8);
+    if (y < wa.top + S(8)) y = wa.top + S(8);
+    if (x + W > wa.right - S(8)) x = wa.right - S(8) - W;
+    if (y + H > wa.bottom - S(8)) y = wa.bottom - S(8) - H;
+
+    HWND h = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
+                             L"NRMsgBox", L"", WS_POPUP,
+                             x, y, W, H, ref, nullptr, inst, nullptr);
+    if (!h) {
+        /* 自绘窗口创建失败时退回系统消息框，至少别让提示丢掉 */
+        DeleteObject(st.fTitle); DeleteObject(st.fBody); DeleteObject(st.fBtn);
+        return MessageBoxW(owner ? owner : g_hMain, text.c_str(),
+                          st.title.c_str(), (kind == NRMB_YESNO) ? MB_YESNO : MB_OK);
+    }
+    SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)&st);
+
+    ShowWindow(h, SW_SHOW);
+    UpdateWindow(h);
+    SetForegroundWindow(h);
+    SetFocus(h);
+
+    EnableWindow(ref, FALSE);
+    MSG msg;
+    while (!st.done && GetMessageW(&msg, nullptr, 0, 0)) {
+        if (msg.hwnd == h && msg.message == WM_KEYDOWN) {
+            SendMessageW(h, WM_KEYDOWN, msg.wParam, msg.lParam);
+            continue;
+        }
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    if (IsWindow(h)) DestroyWindow(h);
+    EnableWindow(ref, TRUE);
+    DeleteObject(st.fTitle);
+    DeleteObject(st.fBody);
+    DeleteObject(st.fBtn);
+    return st.result;
+}
+
+/* 和 MessageBoxW 一模一样形状的薄壳：这样原来 50 多处调用点不用改，
+ * 也不会漏掉某处。MB_YESNO 映射成两个按钮，其它样式（图标）忽略。 */
+static int NrMessageBoxW(HWND owner, LPCWSTR text, LPCWSTR caption, UINT type)
+{
+    int kind = ((type & MB_TYPEMASK) == MB_YESNO) ? NRMB_YESNO : NRMB_OK;
+    return NrMsgBox(owner, caption, text ? text : L"", kind);
+}
+
+/* 从这里开始，文件里所有 MessageBoxW(...) 自动走主题化消息框。
+ * 注意：宏必须放在 NrMessageBoxW 定义之后，否则会把自己的函数体也替换掉。 */
+#define MessageBoxW NrMessageBoxW
 
 /* 「菜单」按钮（三条横线，像常见的汉堡按钮）的矩形：贴左上角、垂直居中。
  * 为什么不把菜单项塞进右边那组胶囊：菜单是"整个应用"的入口，和"当前这本书"的操作
@@ -2547,6 +2881,20 @@ void UiOpenFile(const std::wstring& path)
     if (off > 0 && off < (int)g_book.text.size()) ViewGotoOffset(off, 0);
     else ViewGotoOffset(0, 0);
 
+    /* 1.7.0：手机同步 —— 如果手机上读得比这台电脑更晚，就跳到手机上那个位置。
+     * 判断依据是两个时间戳：本机的 ts（每次本机保存进度时写）、手机的 phts
+     * （手机上报进度时写）。同一份 ini，两边各用各的键，谁晚听谁的，
+     * 这样"电脑读一段、手机接着读、回头再用电脑"也不会把进度倒回老地方。 */
+    /* 1.7.0：和手机对账（谁读得靠后听谁的，改位置前先问用户）。
+     * 放在本地恢复之后：先站到自己上次的位置，再决定要不要挪。 */
+    /* 打开书就立刻对账是扑空的：手机那边的广播可能还没来。
+     * 所以先记一个"待对账"，由 TIMER_SYNC 每 1.2 秒探一次，看到对端再真正比。 */
+    if (g_set.phoneSrv) {
+        s_syncPending = true;
+        s_syncTries = 0;
+        SetTimer(g_hMain, TIMER_SYNC, 1200, nullptr);
+    }
+
     std::wstring cap = L"小说阅读器 - ";
     cap += UiDisplayTitle();
     SetWindowTextW(g_hMain, cap.c_str());
@@ -2844,6 +3192,277 @@ static LRESULT CALLBACK PhoneBoxProc(HWND h, UINT m, WPARAM w, LPARAM l)
         return 0;
     }
     return DefWindowProcW(h, m, w, l);
+}
+
+/* ======================= 1.7.0 阅读同步（P2P） ==========================
+ *
+ * 三个小工具，配合 sync.cpp 用：
+ *   SyncPushCurrent  —— 把本机进度推给对端（后台线程，失败静默）
+ *   SyncCheckOnOpen  —— 打开书后对账，谁读得靠后听谁的，改位置前先问用户
+ *   UiShowSyncStatus —— 给用户看"找到谁了、两边各读到哪"
+ */
+
+/* 推本机进度给对端。
+ *
+ * 失败**不弹窗**：同步是锦上添花，手机没开、Wi-Fi 断了、对面锁屏了，
+ * 都不该在用户读得正入神时跳个对话框出来。
+ * 用后台线程发，是因为 TCP 连接可能卡到 4 秒超时，不能让界面线程等。 */
+static void SyncPushCurrent()
+{
+    if (!SyncRunning()) return;
+    std::wstring url = SyncPeerUrl();
+    if (url.empty()) return;
+
+    SyncRec rec;
+    if (!SyncLocalRecord(rec)) return;
+
+    /* 线程只认一个裸指针，参数打包在堆上，线程自己负责 delete */
+    struct Job { std::wstring url; SyncRec rec; };
+    Job* job = new Job();
+    job->url = url;
+    job->rec = rec;
+
+    HANDLE th = CreateThread(nullptr, 0, [](LPVOID p) -> DWORD {
+        Job* j = (Job*)p;
+        std::wstring err;
+        SyncPush(j->url, j->rec, err);
+        delete j;
+        return 0;
+    }, job, 0, nullptr);
+    if (th) CloseHandle(th);
+    else delete job;
+}
+
+/* 打开一本书之后对账。
+ *
+ * 规则（按用户要求）：两边比进度，**读得更靠后的那一方赢**；如果对面更靠后
+ * 就直接改用户的阅读位置是不礼貌的 —— 用户可能就是想翻回前面重读一段 ——
+ * 所以这里先弹问句，点"是"才跳。
+ *
+ * 只有差距超过 200 个字符（大约半屏）才打扰用户：差几个字就弹窗是噪音。 */
+/* 每 1.2 秒看一眼：对面出现了没有？出现就立刻对账并收工。
+ * 最多等 10 轮（约 12 秒），等不到就把待办撤掉——不无限期地空转定时器。 */
+static void SyncTryPending()
+{
+    if (!s_syncPending) { KillTimer(g_hMain, TIMER_SYNC); return; }
+    NrTrace(L"SYNCTRY tries=%d running=%d peer='%s'", s_syncTries, SyncRunning() ? 1 : 0, SyncPeerUrl().c_str());
+    NrTrace(L"SYNCTRY tries=%d running=%d peer='%s'", s_syncTries, SyncRunning() ? 1 : 0, SyncPeerUrl().c_str());
+    if (!SyncRunning() || !g_book.Ok()) {
+        s_syncPending = false;
+        KillTimer(g_hMain, TIMER_SYNC);
+        return;
+    }
+    if (SyncPeerUrl().empty()) {
+        if (++s_syncTries > 10) {
+            s_syncPending = false;
+            KillTimer(g_hMain, TIMER_SYNC);
+        }
+        return;
+    }
+    s_syncPending = false;
+    KillTimer(g_hMain, TIMER_SYNC);
+    SyncCheckOnOpen();
+}
+
+static void SyncCheckOnOpen()
+{
+    NrTrace(L"SYNCCHECK enter peer='%s'", SyncPeerUrl().c_str());
+    if (!SyncRunning()) return;
+
+    SyncRec mine;
+    if (!SyncLocalRecord(mine)) return;         /* 没开书，或者书太短不参与同步 */
+    NrTrace(L"SYNC local key=%s off=%d pct=%d", mine.key.c_str(), mine.off, mine.pct);
+
+    std::wstring url = SyncPeerUrl();
+    if (url.empty())
+    {
+        s_statusExtra = L"阅读同步：还没找到手机（手机端也要打开同步）";
+        UiUpdateStatus();
+        return;
+    }
+
+    std::vector<SyncRec> theirs;
+    std::wstring err;
+    NrTrace(L"SYNC peer url=%s", url.c_str());
+    if (!SyncFetch(url, theirs, err))
+    {
+        NrTrace(L"SYNC fetch failed: %s", err.c_str());
+        s_statusExtra = L"阅读同步：" + err;
+        UiUpdateStatus();
+        return;
+    }
+
+    NrTrace(L"SYNC fetch ok count=%u", (unsigned)theirs.size());
+    for (size_t z = 0; z < theirs.size(); z++)
+        NrTrace(L"SYNC   peer rec key=%s off=%d pct=%d", theirs[z].key.c_str(), theirs[z].off, theirs[z].pct);
+
+    /* 按指纹找同一本书 */
+    const SyncRec* hit = nullptr;
+    for (size_t i = 0; i < theirs.size(); i++)
+    {
+        if (theirs[i].key == mine.key) { hit = &theirs[i]; break; }
+    }
+
+    if (!hit)
+    {
+        /* 对面没有这本书：把本机进度推过去，手机下次打开就有位置可跳 */
+        SyncPushCurrent();
+        return;
+    }
+
+    NrTrace(L"SYNC hit off=%d mine=%d diff=%d", hit->off, mine.off, hit->off - mine.off);
+    if (hit->off - mine.off <= 200)
+    {
+        /* 本机不比手机落后（甚至更靠后）：把本机进度推过去让手机跟上 */
+        SyncPushCurrent();
+        wchar_t buf[192];
+        wsprintfW(buf, L"阅读同步：本机 %d.%d%% · 手机 %d.%d%%",
+                  mine.pct / 10, mine.pct % 10, hit->pct / 10, hit->pct % 10);
+        s_statusExtra = buf;
+        UiUpdateStatus();
+        return;
+    }
+
+    /* 手机读得更靠后 —— 问用户 */
+    std::wstring q = L"这本书两边的进度不一样：\n\n  本机：";
+    wchar_t buf[256];
+    wsprintfW(buf, L"%d.%d%%", mine.pct / 10, mine.pct % 10);
+    q += buf;
+    if (!mine.chapter.empty()) { q += L"  "; q += mine.chapter; }
+    q += L"\n  手机：";
+    wsprintfW(buf, L"%d.%d%%", hit->pct / 10, hit->pct % 10);
+    q += buf;
+    if (!hit->chapter.empty()) { q += L"  "; q += hit->chapter; }
+    q += L"\n\n手机读得更靠后。要跳到手机上那个位置继续读吗？\n";
+    q += L"（选“否”就留在本机，并把本机进度推给手机）";
+
+    if (MessageBoxW(g_hMain, q.c_str(), L"阅读同步", MB_YESNO | MB_ICONQUESTION) != IDYES)
+    {
+        SyncPushCurrent();
+        return;
+    }
+
+    ViewGotoOffset(hit->off, 0);
+    /* 立刻按新位置落盘：否则关窗口时会把旧位置写回去，等于白跳 */
+    UiSaveProgress();
+
+    /* 不写手机自报的百分比：两边文本长度可能微差（对端可能是不同版本、或做过清洗），
+     * 用本机真实位置算出来的百分比才不会前后矛盾。 */
+    int tlen = (int)g_book.text.size();
+    int minePct = (tlen > 0) ? (int)((__int64)hit->off * 1000 / tlen) : 0;
+    wsprintfW(buf, L"已按手机的位置同步到 %d.%d%%", minePct / 10, minePct % 10);
+    s_statusExtra = buf;
+    UiUpdateStatus();
+}
+
+/* 给用户看的同步状态：找到谁、两边各读到哪、协议端口是多少。
+ * 第一次开启同步时自动弹一次 —— 用户需要知道"接下来该做什么"（去手机上也打开）。 */
+static void UiShowSyncStatus()
+{
+    std::wstring s;
+
+    if (!SyncRunning())
+    {
+        s = L"阅读同步：未开启。\n\n"
+            L"开启后，电脑和手机会在同一个局域网里互相发现，\n"
+            L"读到哪里都会互相对账（两边都不需要联网服务器）。";
+        MessageBoxW(g_hMain, s.c_str(), L"阅读同步", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    s = L"阅读同步：已开启（端口 8233，局域网内互相发现）\n\n";
+
+    std::vector<std::wstring> peers = SyncPeers();
+    if (peers.empty())
+    {
+        s += L"暂时没发现别的设备。\n"
+             L"· 手机要和电脑连同一个 Wi-Fi（不能是手机热点、也不能是访客网络）；\n"
+             L"· 手机上的应用也要打开「阅读同步」；\n"
+             L"· 两台机器都开着广播，一般 2~3 秒内就能看到对方。";
+    }
+    else
+    {
+        s += L"发现的设备：\n";
+        for (size_t i = 0; i < peers.size(); i++)
+        {
+            s += L"  ";
+            s += peers[i];
+            s += L"\n";
+        }
+        s += L"\n";
+    }
+
+    SyncRec mine;
+    if (SyncLocalRecord(mine))
+    {
+        s += L"\n当前这本书：";
+        s += mine.title;
+        s += L"\n  本机：";
+        wchar_t num[64];
+        wsprintfW(num, L"%d.%d%%", mine.pct / 10, mine.pct % 10);
+        s += num;
+        if (!mine.chapter.empty()) { s += L"  "; s += mine.chapter; }
+
+        /* 顺带把对面的记录也拉一次，让用户当场看到差距 */
+        std::wstring url = SyncPeerUrl();
+        std::vector<SyncRec> theirs;
+        std::wstring err;
+        if (!url.empty() && SyncFetch(url, theirs, err))
+        {
+            for (size_t i = 0; i < theirs.size(); i++)
+            {
+                if (theirs[i].key != mine.key) continue;
+                s += L"\n  手机：";
+                wsprintfW(num, L"%d.%d%%", theirs[i].pct / 10, theirs[i].pct % 10);
+                s += num;
+                if (!theirs[i].chapter.empty()) { s += L"  "; s += theirs[i].chapter; }
+                break;
+            }
+        }
+    }
+
+    MessageBoxW(g_hMain, s.c_str(), L"阅读同步", MB_OK | MB_ICONINFORMATION);
+}
+/* 手机同步的总开关（用户可以关掉）。默认关：没开时连端口都不监听，
+ * 局域网里别的设备扫不到这台机器 —— 这就是"由用户自己开启"的实际含义。
+ *
+ * 1.7.0 起同步改成 P2P：电脑和手机各开一个监听、各往局域网广播，
+ * 互相发现后直接对话，谁都不是"服务端"（用户明确不要电脑当服务器）。 */
+void UiTogglePhoneSync()
+{
+    if (SyncRunning())
+    {
+        SyncStop();
+        g_set.phoneSrv = 0;
+        SettingsSave();
+        s_statusExtra = L"阅读同步已关闭";
+        UiUpdateStatus();
+        return;
+    }
+
+    std::wstring err;
+    if (!SyncStart(err))
+    {
+        MessageBoxW(g_hMain, (L"开启阅读同步失败：" + err).c_str(),
+                    L"阅读同步", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    g_set.phoneSrv = 1;
+    SettingsSave();
+
+    s_statusExtra = L"阅读同步已开启，正在局域网里找手机…";
+    UiUpdateStatus();
+
+    /* 刚开同步时书往往早就打开了（Opening 那一刻还没同步在跑，那时排不到检查），
+     * 所以这里补排一次"等对端出现再对账"。 */
+    if (g_book.Ok()) {
+        s_syncPending = true;
+        s_syncTries = 0;
+        SetTimer(g_hMain, TIMER_SYNC, 1200, nullptr);
+    }
+    /* 开着书时不弹"地址提示"：紧接着还会弹"要不要同步"的问句，
+     * 两个模态框叠在一起既挡视线又难关闭。地址信息在「帮助 → 手机阅读」里随时能看。 */
+    if (!g_book.Ok()) UiShowSyncStatus();
 }
 
 /* 弹出手机阅读提示窗；同时确保服务已经启动 */
@@ -3796,6 +4415,8 @@ static HMENU BuildMenu()
     AppendMenuW(hp, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(hp, MF_STRING, IDM_PHONE, L"手机阅读（局域网）(&P)...\tCtrl+G");
     AppendMenuW(hp, MF_STRING, IDM_PHONE_JUMP, L"跳到手机读到的位置\tCtrl+Shift+G");
+    /* 1.7.0：总开关。默认关，开了才监听端口；勾选状态由 AutoSyncMenu 维护 */
+    AppendMenuW(hp, MF_STRING, IDM_PHONE_SYNC, L"开启手机同步（局域网）");
     AppendMenuW(hp, MF_SEPARATOR, 0, nullptr);
     /* 1.6.0：隐私与老板键。放在帮助菜单里是因为它们属于"环境设置"，
      * 和阅读/排版不是一类；但都是随时要能按到的东西，所以放最显眼的位置。 */
@@ -3912,6 +4533,33 @@ void UiSaveProgress()
         if (ch >= 0) name = BookChapterTitle(g_book, ch);
     }
     PosSaveMeta(g_book.path, off, name, ch, chn, pct);
+
+    /* 1.7.0：把这本书的"身份指纹"也写进 ini。
+     * 指纹要把正文前 4096 字算进去，只有此刻书在内存里才能顺手算；
+     * 手机那边每次拉 /peer/books 都要用，写到 ini 里就只算这一次。 */
+    {
+        std::wstring sk = SyncBookKey(g_book.title, g_book.text);
+        if (!sk.empty())
+        {
+            std::wstring sec = PosSectionFor(g_book.path);
+            IniSetStr(sec.c_str(), L"skey", sk.c_str());
+        }
+    }
+
+    /* 1.7.0：顺手把新进度推给手机。
+     * 节流到 5 秒一次 —— 滚动时 UiSaveProgress 由 2.5 秒防抖定时器调用，
+     * 不节流的话每滚一下就开一个后台线程去连手机，太浪费。
+     * 手机没开/掉线时 SyncPush 会失败，但这里是静默的，不打扰阅读。 */
+    static DWORD s_lastPush = 0;
+    if (SyncRunning())
+    {
+        DWORD now = GetTickCount();
+        if (now - s_lastPush > 5000)
+        {
+            s_lastPush = now;
+            SyncPushCurrent();
+        }
+    }
 }
 
 /* 关窗口前的「保存一切」：阅读位置 + 窗口矩形 + 所有设置。无参数、无返回值。
@@ -4251,6 +4899,7 @@ static void OnCommand(int id, int code, HWND ctl)
     }
     case IDM_PHONE:       UiShowPhone(); break;
     case IDM_PHONE_JUMP:  UiJumpPhoneProgress(); break;
+    case IDM_PHONE_SYNC:  UiTogglePhoneSync(); AutoSyncMenu(); break;
     case IDM_AUTO_TOGGLE: UiAutoToggle(); break;
     case IDM_AUTO_FAST:   UiAutoFaster(); break;
     case IDM_AUTO_SLOW:   UiAutoSlower(); break;
@@ -4525,6 +5174,10 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l)
         /* 自动下滑的一拍：往下滚一行。若状态已被别处关掉（s_autoOn 为假）或书没了，
          * 立刻停掉，防止定时器空转。
          */
+        /* 等对面出现：只在对账待办存在时会真的做事，做完自己 KillTimer。 */
+        } else if (w == TIMER_SYNC) {
+            SyncTryPending();
+            return 0;
         } else if (w == TIMER_AUTO) {
             if (!s_autoOn || !g_book.Ok()) { UiAutoStop(); return 0; }
             /* 记下滚动前后的锚点偏移：如果滚不动了（到全书末尾），两者相等 —— 这是判断

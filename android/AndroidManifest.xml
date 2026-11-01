@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  小说阅读器 手机端（1.7.0）
+
+  设计要点：
+    * 不做账号、不做云。手机和电脑在同一个 Wi-Fi 里互相广播发现，
+      谁的进度靠后就问"要不要同步"，用户点了才动。
+    * 所以必须开网络权限；UDP 广播还要组播/广播锁（CHANGE_WIFI_MULTICAST_STATE），
+      否则很多机型上收不到 255.255.255.255 的包。
+    * usesCleartextTraffic=true：局域网里是 http://，不加密也没关系（内容只在自己家网里走）。
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.chenzy0623.novelreader"
+    android:versionCode="1"
+    android:versionName="1.7.0">
+
+    <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="34" />
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+
+    <application
+        android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:theme="@android:style/Theme.Material.NoActionBar"
+        android:usesCleartextTraffic="true"
+        android:allowBackup="true">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:configChanges="orientation|screenSize|keyboardHidden">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".ReaderActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
+    </application>
+</manifest>

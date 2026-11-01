@@ -112,6 +112,11 @@ struct Settings {
     /* 老板键：任意时刻按下就立刻把窗口藏起来，再按一下恢复。
      * 存成 "Ctrl+Alt+H" 这种字符串，空串表示不启用。 */
     std::wstring bossKey = L"Ctrl+Alt+H";
+
+    /* ---- 1.7.0 新增 ---- */
+    /* 手机同步总开关。默认 0（关）—— 不开就不监听任何端口，
+     * 局域网里的其他设备根本扫不到这台机器；用户从菜单里手动打开才生效。 */
+    int phoneSrv = 0;
 };
 
 /* 一本书的排版设置（1.6.0 新增：每本书可以有不同的排版）。
@@ -504,6 +509,8 @@ void UiSourceSearch();
 
 /* 手机阅读：启动局域网服务并弹出地址提示窗（已经启动就只弹地址）*/
 void UiShowPhone();
+/* 1.7.0：手机同步总开关（用户手动开启后才监听端口） */
+void UiTogglePhoneSync();
 
 /* 跳到手机端最近保存的阅读位置（控制键 Ctrl+G）*/
 void UiJumpPhoneProgress();
