@@ -77,6 +77,29 @@
 #define IDM_SOURCE       1293   /* 书源搜索：按书源规则搜书并下载整本（Ctrl+S） */
 #define IDM_SOURCE_MGR   1294   /* 书源管理：改规则 / 加新站 / 删源 */
 
+/* ---- 1.6.0：排版（1300~1309） ---- */
+#define IDM_LAY_MARGIN_BASE 1300 /* 页边距档位起始 ID，实际用 1300+i（i=0 窄 / 1 标准 / 2 宽） */
+#define IDM_LAY_MARGIN_MAX  3    /* 档位个数 */
+#define IDM_LAY_INDENT   1303    /* 首行缩进两字：开 / 关 */
+#define IDM_LAY_PAGED    1304    /* 阅读方式：连续滚动 / 分页（Ctrl+Shift+P） */
+#define IDM_LAY_COLS     1305    /* 栏数：单栏 / 双栏（Ctrl+Shift+C，双栏强制分页） */
+#define IDM_LAY_FORCE_FONT 1306  /* 强制字体：目录 / 状态栏 / 工具栏也用正文字体 */
+#define IDM_LAY_RESET    1307    /* 把这本书的排版恢复成出厂默认 */
+
+/* ---- 1.6.0：高亮与笔记（1310~1319） ---- */
+#define IDM_HL_ADD       1310    /* 给选区加高亮（Ctrl+H），已有则切换掉 */
+#define IDM_HL_COLOR_BASE 1311   /* 4 个颜色：1311+i（i=0 黄 1 绿 2 蓝 3 粉） */
+#define IDM_HL_COLOR_MAX 4
+#define IDM_HL_NOTE      1315    /* 给选区写笔记（Ctrl+Shift+N） */
+#define IDM_HL_LIST      1316    /* 高亮与笔记列表（Ctrl+L） */
+#define IDM_HL_DEL       1317    /* 删掉与选区相交的高亮 */
+#define IDM_HL_EXPORT    1318    /* 导出全部高亮与笔记为 Markdown */
+
+/* ---- 1.6.0：快捷键 / 隐私（1320~1329） ---- */
+#define IDM_KEYS_EDIT    1320    /* 快捷键设置对话框（Ctrl+F12） */
+#define IDM_BOSS         1321    /* 立即隐藏窗口（老板键，默认 Ctrl+Alt+H，可在对话框里改） */
+#define IDM_PRIVACY      1322    /* 隐私模式：标题栏 / 顶栏 / 状态栏不显示书名（Ctrl+Shift+H） */
+
 /* ---- 子控件 ID ---- */
 #define IDC_TOC         2001    /* 左侧章节目录 LISTBOX */
 #define IDC_HITS        2002    /* 左侧搜索结果 LISTBOX（与目录互斥显示） */

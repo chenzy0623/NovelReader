@@ -1,13 +1,13 @@
 # 小说阅读器 NovelReader
 
 一个**单文件、免安装、零依赖**的 Windows 小说阅读器。用 C++17 + Win32 从零写成，
-**893 KB** 一个 exe，双击就能用，不写注册表、不装运行库、不需要联网。
+**947 KB** 一个 exe，双击就能用，不写注册表、不装运行库、不需要联网。
 
 支持 **TXT / EPUB / PDF / DOCX / HTML / Markdown**，自动识别章节，全文搜索，
 记忆阅读位置，自动下滑，书签，换字体，自定义配色，还能直接把网页小说抓成本地书。
 
-![版本](https://img.shields.io/badge/version-1.5.0-blue)
-![体积](https://img.shields.io/badge/size-893%20KB-brightgreen)
+![版本](https://img.shields.io/badge/version-1.6.0-blue)
+![体积](https://img.shields.io/badge/size-947%20KB-brightgreen)
 ![平台](https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-lightgrey)
 ![依赖](https://img.shields.io/badge/dependencies-none-success)
 ![许可](https://img.shields.io/badge/license-MIT-orange)
@@ -20,8 +20,8 @@
 
 到 [Releases](https://github.com/chenzy0623/NovelReader/releases) 下载最新版：
 
-- **[NovelReader-1.5.0-win64.zip](https://github.com/chenzy0623/NovelReader/releases/download/v1.5.0/NovelReader-1.5.0-win64.zip)**（推荐，含使用说明和示例小说）
-- [单个 NovelReader.exe](https://github.com/chenzy0623/NovelReader/releases/download/v1.5.0/NovelReader.exe)（只要程序本体）
+- **[NovelReader-1.6.0-win64.zip](https://github.com/chenzy0623/NovelReader/releases/download/v1.6.0/NovelReader-1.6.0-win64.zip)**（推荐，含使用说明和示例小说）
+- [单个 NovelReader.exe](https://github.com/chenzy0623/NovelReader/releases/download/v1.6.0/NovelReader.exe)（只要程序本体）
 
 解压任意目录，双击 `NovelReader.exe` 即可。**绿色版**：阅读进度存在 exe 同目录的
 `NovelReader.ini`（目录不可写时自动改用 `%APPDATA%\NovelReader\`），删掉 ini 就等于恢复出厂。
@@ -46,6 +46,11 @@
 | 网页抓书 | `Ctrl+U` 输入目录页网址，自动找目录、逐章抓取，存成本地书 |
 | 界面 | 顶栏胶囊按钮 + 书架卡片 + 自绘状态栏进度线，不是系统控件拼的 |
 | 升级不丢书 | 新版本放在新目录里也能自动找回旧书架与阅读进度 |
+| 每本书独立排版 | 字号、行距、页边距、首行缩进、分页、双栏、强制字体都按书名分别记，读网文和读古籍互不干扰 |
+| 分页 / 双栏 | 按「本章第几页 / 共几页」翻页，可切双栏横排（自动开分页）；`Ctrl+Shift+P` / `Ctrl+Shift+C` |
+| 高亮与笔记 | 4 种颜色标重点（`Ctrl+H`），每处可写笔记、列表里带 ✎、一键导出 Markdown |
+| 快捷键自定义 | `Ctrl+F12` 里逐条改键，按一下新组合就生效，可恢复默认 |
+| 老板键 / 隐私模式 | `Ctrl+Alt+H` 一键藏窗口（全局热键，切走也能召回）；隐私模式把书名换成「文档」 |
 | 书源搜索 | `Ctrl+S` 按书源搜书名/作者，选中就下载整本、分好章直接读；书源可整套替换（见下） |
 | 手机阅读 | 局域网 HTTP 服务，手机浏览器直接读（菜单位置：帮助 → 手机阅读） |
 | 大文件 | 14.7 MB / 8794 章实测 0.8 秒载入，只渲染可视区域，滚动不掉帧 |
@@ -143,6 +148,51 @@ EPUB：
 
 ---
 
+## 1.6.0 新功能：按书排版 / 高亮笔记 / 改键 / 老板键
+
+### 每本书独立的排版
+
+同一份程序里，读网文可能想要大字号、宽行距、双栏；读古籍或 PDF 抽出来的文本又想要小字号、单栏、不缩进。1.5.0 之前这些是全局设置，来回切书就得来回改。
+
+1.6.0 把排版记到**每本书自己的 ini 段**里：打开哪本，就套哪本上次的排版。
+
+| 设置 | 键名 | 取值 |
+| --- | --- | --- |
+| 字号 | `lay_fontPt` | 9 ~ 72 磅 |
+| 行距 | `lay_spacing` | 0 紧凑 / 1 标准 / 2 宽松 |
+| 页边距 | `lay_margin` | 0 窄 / 1 标准 / 2 宽 |
+| 首行缩进 | `lay_indent` | 0 关 / 1 开（两字） |
+| 分页模式 | `lay_paged` | 0 连续滚动 / 1 按页翻 |
+| 分栏 | `lay_cols` | 1 单栏 / 2 双栏 |
+| 强制字体 | `lay_force` | 0 用导入的字体优先 / 1 强制用系统字体 |
+| 字体名 | `lay_face` | 任意已装或已导入的字体 |
+
+新书第一次打开时继承「设置」里的默认字号/行距/字体（也就是你上次调整的那套），之后各记各的。
+
+![每本书独立排版](screenshots/18-layout-cols.png)
+
+> 双栏会自动开分页——连续滚动时两栏没法同步位置，硬做只会更别扭。
+
+### 高亮与笔记
+
+- 选中一段文字按 `Ctrl+H`（或菜单「阅读 → 高亮与笔记」）标高亮，颜色四种：黄 / 绿 / 蓝 / 粉；没选中时整段标。
+- 高亮块用「主色 + 纸色」混色画，所以夜间、护眼绿、自定义配色下都不会刺眼。
+- 同一处再按 `Ctrl+Shift+N` 写笔记；列表里带 ✎ 标记。
+- `Ctrl+L` 打开高亮 / 笔记列表，点一条就跳过去。
+- 「导出笔记」生成 `<书名>-笔记.md`，按章节分组，可以直接贴进 Obsidian。
+
+![高亮与笔记列表](screenshots/19-highlight.png)
+
+### 快捷键随便改
+
+`Ctrl+F12` 打开快捷键设置：选中一条，直接按新的组合（比如 `Ctrl+Shift+1`、`Alt+K`、`F12`），立刻生效并存盘。`Esc` / `Delete` 清空该条（清掉就等于不用快捷键）。要字母键的话必须带 `Ctrl` 或 `Alt`，防止打字时误触。
+
+25 条命令都能改，老板键也在里面（默认 `Ctrl+Alt+H`）。
+
+### 老板键与隐私模式
+
+- **老板键**：`Ctrl+Alt+H` 立刻把窗口藏起来。这是系统级热键（`RegisterHotKey`），窗口藏起来、焦点在别的程序上也能按回来。注册失败（被别的软件占了）会在状态栏提示。
+- **隐私模式**：`Ctrl+Shift+H`，窗口标题里的书名换成「文档」，任务栏和 Alt+Tab 里也不露出你在读什么。开关状态记在 ini 里。
 ## 升级 / 换目录之后，书架不会空
 
 旧版把书架记在 exe 同目录的 `NovelReader.ini` 里，于是"把新版解压到新文件夹"看起来就像丢书
@@ -191,6 +241,11 @@ EPUB：
 | `Ctrl+C` / `Ctrl+A` | 复制选中 / 全选 | `F1` | 快捷键说明 |
 | `F9` | PDF：文字重排 / 原始版式切换 | `Ctrl+G` | 手机阅读（局域网地址） |
 | `Ctrl+Shift+G` | 跳到手机上读到的位置 | `Ctrl+F10` | 弹出主菜单（界面上没有菜单栏） |
+| `Ctrl+H` | 高亮当前段（沿用上次颜色） | `Ctrl+Shift+N` | 给高亮写笔记 |
+| `Ctrl+L` | 高亮 / 笔记列表 | `Ctrl+Shift+X` | 删除当前段的高亮 |
+| `Ctrl+Shift+P` | 分页模式开关 | `Ctrl+Shift+C` | 双栏开关 |
+| `Ctrl+Shift+I` | 首行缩进开关 | `Ctrl+Shift+H` | 隐私模式（书名显示为「文档」） |
+| `Ctrl+Alt+H` | 老板键：隐藏 / 唤回窗口 | `Ctrl+F12` | 快捷键设置 |
 
 鼠标：滚轮滚动，拖滚动条，点目录跳章，双击页边距快速翻页，拖动即可选中文字（松开自动复制）。
 
@@ -266,7 +321,7 @@ PDF / EPUB / DOCX / HTML / Markdown 会**先抽出纯文本**，再走同一套�
 - **示例书源删不掉**：它是 0 号，想换成自己的站，直接改它的六项、点「保存」即可，也能随时「恢复内置规则」。
 
 > 为什么用正则而不是 CSS 选择器：程序里没有 HTML DOM 解析器，标准库 `<regex>` 体积零成本，
-> 一条正则够用，而且你可以直接从别处抄规则改。代价是 exe 从 582 KB 涨到 893 KB（模板实例化）。
+> 一条正则够用，而且你可以直接从别处抄规则改。代价是 exe 从 582 KB 涨到 947 KB（模板实例化）。
 
 > 有些站挂在 Cloudflare 后面，会拿 TLS 指纹和请求头判断是不是机器人：WinInet 的请求一律 403，
 > 所以代码里给这类站点留了 `curl.exe`（Win10 1803 起系统自带）兜底通道；每章之间还会歇 250 ms，
@@ -376,7 +431,7 @@ NovelReader/
 | 全文搜索 7 万字 | 即时（`< 20 ms`） |
 | 全文搜索 14.7 MB | 约 120 ms（一次性扫完，结果可到 4000 条） |
 | 内存占用（14.7 MB 的书） | 约 15 MB 私有内存（正文一次性解码进内存，段落索引只多几 MB） |
-| 程序体积 | 893 KB（静态链接，无 DLL 依赖） |
+| 程序体积 | 947 KB（静态链接，无 DLL 依赖） |
 
 ---
 

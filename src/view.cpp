@@ -274,11 +274,18 @@ static void InvalidCounts()
    字体变了，所有缓存行数全部失效。 */
 static void EnsureFonts()
 {
-    int px = -MulDiv(g_set.fontPt, g_dpi, 72);
+    /* 字号 / 字体族都从 g_lay（每本书的排版）取，不再从全局 g_set：
+     * 1.6.0 起排版是"每本书一份"，g_set 里那两项只当新书的默认值。 */
+    int px = -MulDiv(g_lay.fontPt, g_dpi, 72);
     if (px > -S(11)) px = -S(11);
     /* 字体名：用户在「阅读 → 选择字体」里挑的、或从导入的字体文件里选的；
-     * 空串时退回内置默认字体，保证任何时候都有字可画。 */
-    std::wstring face = g_set.fontFace.empty() ? std::wstring(L"Microsoft YaHei") : g_set.fontFace;
+     * 空串时退回内置默认字体，保证任何时候都有字可画。
+     * 1.6.0：「强制字体」打开时忽略本书的字体，统一用全局 g_set.fontFace。
+     * 这是给"某本书设了本机没有的字体、每次打开都退回默认"这种情况准备的，
+     * 打开强制字体就不用一本书一本书去改。 */
+    std::wstring face = g_lay.forceFont ? g_set.fontFace
+                                       : (g_lay.fontFace.empty() ? g_set.fontFace : g_lay.fontFace);
+    if (face.empty()) face = L"Microsoft YaHei";
     if (s_fontN && px == s_fontPx && face == s_fontFace) return;
     if (s_fontN) DeleteObject(s_fontN);
     if (s_fontB) DeleteObject(s_fontB);
@@ -302,7 +309,7 @@ static void EnsureFonts()
     s_fontPx = px;
     s_fontFace = face;
     /* 行距档位来自 ini，属于用户可改数据，用前先夹到合法区间，否则 kSpacing[] 会越界读到一个随机系数。 */
-    int sp = g_set.spacing; if (sp < 0) sp = 0; if (sp > 2) sp = 2;
+    int sp = g_lay.spacing; if (sp < 0) sp = 0; if (sp > 2) sp = 2;
     s_lineH = (int)((-px) * kSpacing[sp] + 0.5f);
     s_paraGap = (int)((-px) * 0.42f + 0.5f);
     s_titleGap = (int)((-px) * 0.85f + 0.5f);
@@ -342,6 +349,10 @@ void FontsLoadImported()
 }
 
 /* ---------------- 行排版 ---------------- */
+
+/* 前置声明：排版助手在下面"每本书的排版：档位换算"小节的实体里，
+ * 但 LayoutPara 已经要用 IndentW（首行缩进宽度）。 */
+static int IndentW();
 
 /* 标点禁则（行首禁则）：这些字符不允许出现在一行开头 —— 中文排版硬规则，句号、逗号、右括号、右引号挂在
    上一行末尾才好看，单独掉到下一行行首很难看。表里是常见中文标点，外加省略号、破折号、间隔号和百分号。
@@ -397,14 +408,23 @@ static void LayoutPara(int para, std::vector<int>& starts)
     /* maxW 兜底 8 像素：客户区算成 0 或负数时（窗口刚建、最小化），GetTextExtentExPointW 传 0
        宽度行为不可靠，给个正数更安全。 */
     int maxW = s_textW > 8 ? s_textW : 8;
+    /* 首行缩进：正文段（不是章节标题）的第 0 行左边空两个字，所以那一行可用宽度
+     * 要少两字，否则首行会挤到右边距外面去。缩进由调用方在绘制时按 FlowLine.x
+     * 平移，这里只负责"少放两个字"。 */
+    int indW = 0;
+    if (!BookIsChapterPara(g_book, para)) indW = IndentW();
+    if (indW * 2 > maxW) indW = 0;
     int i = 0;
     while (i < len) {
         int nFit = 0;
         SIZE sz;
         sz.cx = sz.cy = 0;
-        /* 一次问出"maxW 宽度里能塞下几个字"（nFit），顺便拿到实际占用宽度。这比自己逐字调用
+        /* 第 0 行要扣掉缩进宽度；其余行用满宽。 */
+        int lineW = (i == 0 && indW > 0) ? (maxW - indW) : maxW;
+        if (lineW < 8) lineW = 8;
+        /* 一次问出"lineW 宽度里能塞下几个字"（nFit），顺便拿到实际占用宽度。这比自己逐字调用
            GetTextExtentPoint32W 累加少 N 次 GDI 调用，对几万段的书是决定性的性能差别。 */
-        GetTextExtentExPointW(s_dc, s + i, len - i, maxW, &nFit, nullptr, &sz);
+        GetTextExtentExPointW(s_dc, s + i, len - i, lineW, &nFit, nullptr, &sz);
         if (nFit <= 0) nFit = 1;
         /* 剩下的文字一次全放得下：这就是最后一行，直接收尾。此时不做禁则 / 单词调整 ——
            调整只会让本行更短，没有收益。 */
@@ -446,6 +466,127 @@ static int ParaLineCount(int para)
         s_lineCnt[(size_t)para] = n;
     }
     return s_lineCnt[(size_t)para];
+}
+
+/* ---------------- 每本书的排版：档位换算 ---------------- */
+
+/* 页边距档位取 0/1/2 时的左右/上下边距（设计像素）。
+ *
+ * 只给三档而不是让用户拖滑块：阅读器的边距本质是"一行放多少字"，三档已经够用，
+ * 而连续可调会让每本书的排版记录变成一堆魔法数字，换 DPI 之后更难对齐。
+ * 窄窗口（侧栏展开后正文只剩几百像素）在 UpdateMetrics 里另有收窄逻辑。 */
+static int MarginX()
+{
+    static const int k[] = { 16, 28, 56 };   /* 窄 / 标准 / 宽 */
+    int m = g_lay.margin;
+    if (m < 0) m = 0;
+    if (m > 2) m = 2;
+    return S(k[m]);
+}
+
+/* 上下边距比左右小：中文正文顶部留白太多会显得"页面被截断了一段"，
+ * 底部留白同样只需要够看清最后一行。 */
+static int MarginY()
+{
+    static const int k[] = { 8, 12, 24 };
+    int m = g_lay.margin;
+    if (m < 0) m = 0;
+    if (m > 2) m = 2;
+    return S(k[m]);
+}
+
+/* 双栏之间的空档。单独给 26 而不是和页边距共用：栏间太窄两栏会黏在一起，
+ * 太宽又让每栏宽度掉得厉害。 */
+static int GutterW() { return S(26); }
+
+/* 是否双栏。PDF 原始版式是整页位图，跟栏数无关，所以那种情况下强制单栏。 */
+static bool TwoColumns() { return g_lay.cols >= 2 && !s_pdfMode; }
+
+/* 是否分页模式。双栏只可能出现在分页模式下（见 layout.cpp 的 LayoutLoad），
+ * 这里再兜一次底，避免手改 ini 弄出"双栏 + 连续滚动"这种没法实现的组合。 */
+static bool PagedMode() { return g_lay.paged != 0 || TwoColumns(); }
+
+/* 首行缩进宽度：两个全角字的宽度。用 -s_fontPx（即字号像素）乘 2 —— 中文字形
+ * 基本是方的，字号像素≈字宽，比拿 GetTextExtentPoint32W 量"　　"两个全角空格
+ * 更稳（有些字体里 U+3000 的宽度并不是 1 em）。 */
+static int IndentW() { return g_lay.indent ? (-s_fontPx * 2) : 0; }
+
+/* 一屏的"排版流"：把从锚点开始、能放进画面的每一行摊平成数组。
+ *
+ * 为什么要有这个东西：绘制（PaintAll）、命中测试（HitTestChar）、行数统计
+ * （LinesInView）三处必须用**完全相同**的规则往下走，否则点到的字会偏、翻页会
+ * 漏行。以前这段规则被复制了两遍（注释里就写着"改动时务必两处一起改"），
+ * 加了双栏、首行缩进之后复制第三遍必然出错，所以改成只写一次、三处共用。
+ *
+ * 每行记下：字符区间 [start,end)、左上角 (x,y)、段落号、是否标题、是否段落首行
+ * （首行要缩进、并且是书签竖条的位置）。 */
+struct FlowLine {
+    int  start, end;      /* 本行的字符区间（全文偏移） */
+    int  x, y;            /* 本行左端 / 基线顶部 */
+    int  para;            /* 所属段落 */
+    bool title;           /* 是否章标题（标题用粗体、标题色） */
+    bool firstLine;       /* 是否该段第 0 行（首行缩进 + 书签竖条） */
+};
+
+/* 把 (p0, line0) 起的内容按当前栏宽/栏数铺到 (W, H) 里。
+ *
+ * 双栏的规则是"左栏从上到下填满，接着右栏从上到下"——这就是分页阅读器里
+ * 一页两栏的翻页顺序。连续滚动模式一定是单栏（由 PagedMode/TwoColumns 保证）。
+ * guard 6000 与原来一致：正常一屏几十行就停了，这个上限只防数据异常死循环。 */
+static void BuildFlow(int p0, int line0, int H, std::vector<FlowLine>& out)
+{
+    out.clear();
+    if (!g_book.Ok() || !s_dc) return;
+    const bool twoCol = TwoColumns();
+    /* 分页模式下右下角要画「第 n/m 页」，正文不能压在它上面：
+     * 这里统一从可用高度里扣掉一条，绘制、行数统计、命中测试都走同一个 BuildFlow，
+     * 所以三处永远不会错开。 */
+    const int flowH = H - (PagedMode() ? S(20) : 0);
+    const int colW = s_textW;
+    const int xLeft = s_padL;
+    const int xRight = twoCol ? s_padL + colW + GutterW() : s_padL;
+    int x = xLeft;
+    int y = s_padT;
+    int p = p0, line = line0, guard = 0;
+    std::vector<int> st;
+    while (p < g_book.ParaCount() && guard++ < 6000) {
+        bool title = BookIsChapterPara(g_book, p);
+        /* 量宽度之前必须先选对该段的字体，粗体标题按正文字体量出来会偏窄 */
+        SelectObject(s_dc, title ? s_fontB : s_fontN);
+        LayoutPara(p, st);
+        int nl = (int)st.size() - 1;
+        if (nl <= 0) {
+            /* 空段落占半行高。顶行特判和原来一致：第一屏的第一段如果是空段，
+             * 不要再往上加半行，否则看起来像顶部边距突然变大。 */
+            if (p > p0 || line > 0) y += s_lineH / 2;
+            if (twoCol && x == xLeft && y + s_lineH > flowH) { x = xRight; y = s_padT; }
+            p++; line = 0;
+            continue;
+        }
+        if (line >= nl) line = nl - 1;
+        if (title && line == 0) y += s_titleGap;
+        int indW = (!title) ? IndentW() : 0;
+        if (indW * 2 > colW) indW = 0;   /* 栏太窄就不缩进了，否则首行只剩一两个字 */
+        for (int l = line; l < nl; l++) {
+            if (y + s_lineH > flowH) {
+                /* 这一栏满了：还在左栏就换到右栏重来一次，否则整页画完 */
+                if (twoCol && x == xLeft) { x = xRight; y = s_padT; }
+                else { out.shrink_to_fit(); return; }
+            }
+            FlowLine fl;
+            fl.start = st[(size_t)l];
+            fl.end = st[(size_t)l + 1];
+            fl.x = x + ((l == 0) ? indW : 0);
+            fl.y = y;
+            fl.para = p;
+            fl.title = title;
+            fl.firstLine = (l == 0);
+            out.push_back(fl);
+            y += s_lineH;
+        }
+        y += s_paraGap;
+        p++; line = 0;
+    }
 }
 
 /* ---------------- 尺寸换算 ---------------- */
@@ -511,14 +652,23 @@ static void UpdateMetrics(bool layoutDirty)
     if (!s_wnd) return;
     RECT rc;
     GetClientRect(s_wnd, &rc);
-    int pad = S(28);
-    if (rc.right < S(320)) pad = S(14);
-    int w = rc.right - pad * 2;
+    int pad = MarginX();
+    /* 窄窗口把边距收窄：侧栏展开后正文区域只剩几百像素，还按 56 的宽边距
+     * 算的话每行只剩五六个字。 */
+    if (rc.right < S(320) && pad > S(14)) pad = S(14);
+    int usable = rc.right - pad * 2;
+    int w = usable;
+    /* 双栏：正文宽度减掉栏间空档后对半分。分完之后每栏太窄（< 80 设计像素）
+     * 就放弃双栏效果，按单栏宽度排 —— 否则一行只能放两三个字，比单栏还难读。 */
+    if (TwoColumns()) {
+        int per = (usable - GutterW()) / 2;
+        if (per >= S(80)) w = per;
+    }
     /* 宽度下限：窗口极窄时 w 可能 <= 0，交给 LayoutPara 的 maxW 兜底之前先在这里给个 80
        使排版结果至少是"每行几个字"，不会算出 0 行。 */
     if (w < S(80)) w = S(80);
     s_padL = pad;
-    s_padT = S(12);
+    s_padT = MarginY();
     if (w != s_textW || layoutDirty) {
         s_textW = w;
         InvalidCounts();
@@ -575,38 +725,91 @@ static void ClampAnchor()
    guard 5000：段落数据异常时防止死循环。 */
 static int LinesInView(int* chars)
 {
-    int cnt = 0, chs = 0;
     if (!g_book.Ok() || !s_wnd) { if (chars) *chars = 1; return 1; }
     EnsureFonts();
     RECT rc; GetClientRect(s_wnd, &rc);
     int H = rc.bottom;
-    int y = s_padT;
-    std::vector<int> st;
-    int p = s_aPara, line = s_aLine, guard = 0;
-    while (p < g_book.ParaCount() && guard++ < 5000) {
-        bool title = BookIsChapterPara(g_book, p);
-        /* 排版前必须选中该段真正会用到的字体，否则粗体标题会被按正文字体量宽度，行数偏少，一屏能装的字符数也就
-           跟着算错。 */
-        SelectObject(s_dc, title ? s_fontB : s_fontN);
-        LayoutPara(p, st);
-        int nl = (int)st.size() - 1;
-        /* 空段落不占整行，只占半行高（大约等于一个段间距）。这个规则必须和 PaintAll
-           里逐字一致，否则"可见行数"会偏大。 */
-        if (nl <= 0) { y += s_lineH / 2; p++; line = 0; continue; }
-        /* 章标题上方额外留白，只在"该段第 0 行可见"时加。滚动到标题中间时不再加，避免滚动过程中高度突然跳变。 */
-        if (title && line == 0) y += s_titleGap;
-        for (int l = line; l < nl; l++) {
-            /* 放不下整行就停：宁可少算一行，也不要"半行"，否则 nPage 会偏大，滚动条滑块偏短。 */
-            if (y + s_lineH > H) { if (chars) *chars = chs; return cnt > 0 ? cnt : 1; }
-            cnt++;
-            chs += st[(size_t)l + 1] - st[(size_t)l];
-            y += s_lineH;
-        }
-        y += s_paraGap;
-        p++; line = 0;
-    }
+    /* 直接用 BuildFlow 摊一屏：绘制、命中、行数统计共用同一套规则，
+     * 行数就不会和实际画出来的对不上（翻页重复/漏行就是这么来的）。 */
+    std::vector<FlowLine> flow;
+    BuildFlow(s_aPara, s_aLine, H, flow);
+    int cnt = (int)flow.size();
+    int chs = 0;
+    for (size_t i = 0; i < flow.size(); i++) chs += flow[i].end - flow[i].start;
     if (chars) *chars = chs > 0 ? chs : 1;
     return cnt > 0 ? cnt : 1;
+}
+
+/* 一页能装几行。分页模式下"一页"= 左栏满（双栏时是两栏合起来的行数），
+ * 连续滚动模式下这个值就是"一屏行数"，翻页步长也用它。
+ * 减 1 的重叠行留给 ViewScrollPages 处理，这里返回足额行数。 */
+int ViewLinesPerPage()
+{
+    int n = LinesInView(nullptr);
+    return n > 0 ? n : 1;
+}
+
+/* 算出"本章第几页 / 共几页"（分页模式右下角那行字）。
+ *
+ * 实现：先查当前段落在哪一章，再把这一章从头到尾的行数数一遍 —— 靠的是
+ * ParaLineCount 的行数缓存，同一章第二次问几乎不花时间。
+ * 返回 false 表示这本书没有章节，调用方就别画页码了。
+ * 边界：双栏时一页 = 两栏，所以除数是 linesPerPage * 2。 */
+static bool ChapterPageInfo(int* cur, int* total)
+{
+    if (!g_book.Ok()) return false;
+    if (g_book.chapters.empty()) return false;
+    int ci = BookChapterAtPara(g_book, s_aPara);
+    /* 位置在第一章之前（书名、作者、楔子这些"开篇"内容）时按第 1 章算：
+     * 以前这里直接 return false，结果整本书开头的分页阅读看不到页码，
+     * 用户会以为分页模式没生效。 */
+    if (ci < 0) ci = 0;
+    if (ci >= (int)g_book.chapters.size()) return false;
+
+    int pStart = g_book.chapters[(size_t)ci].para;
+    int pEnd = g_book.ParaCount();
+    if (ci + 1 < (int)g_book.chapters.size()) pEnd = g_book.chapters[(size_t)ci + 1].para;
+    if (pStart < 0) pStart = 0;
+    if (pEnd > pStart + 4000) pEnd = pStart + 4000;   /* 一章几千段的怪书就别数了 */
+
+    int perPage = ViewLinesPerPage();
+    if (TwoColumns()) perPage *= 2;
+    if (perPage < 1) perPage = 1;
+
+    int before = 0, lines = 0;
+    for (int p = pStart; p < pEnd; p++) {
+        int n = ParaLineCount(p);
+        if (p < s_aPara) before += n;
+        lines += n;
+    }
+    before += s_aLine;
+    if (lines < 1) lines = 1;
+    int pages = (lines + perPage - 1) / perPage;
+    if (pages < 1) pages = 1;
+    int curPage = before / perPage + 1;
+    if (curPage > pages) curPage = pages;
+    if (curPage < 1) curPage = 1;
+    if (cur) *cur = curPage;
+    if (total) *total = pages;
+    return true;
+}
+
+/* 当前选区（ui.cpp 里做高亮/笔记/复制要用）。
+ * 返回 false 表示"没有选择"（没选中任何文字），此时两个出参保持原样。 */
+bool ViewSelection(int* a, int* b)
+{
+    if (s_selB <= s_selA) return false;
+    if (a) *a = s_selA;
+    if (b) *b = s_selB;
+    return true;
+}
+
+/* 选中一段并滚过去（高亮列表里点条目时用）。做法就是 ViewGotoOffset：
+ * 它会定位、设选区、顺便把自动下滑停掉。 */
+void ViewSelectRange(int a, int b)
+{
+    if (b <= a) { ViewGotoOffset(a, 0); return; }
+    ViewGotoOffset(a, b - a);
 }
 
 /* 把锚点状态同步到垂直滚动条。range / pos 都用字符偏移（理由见文件头第四节），
@@ -700,6 +903,8 @@ void ViewScrollPages(int n)
 {
     int cnt = LinesInView(nullptr);
     int step = cnt > 1 ? cnt - 1 : 1;
+    /* 双栏模式下"一页"是两栏，按这个步长才不会只翻半页。 */
+    if (TwoColumns()) step *= 2;
     ViewScrollLines(n * step);
 }
 
@@ -990,6 +1195,29 @@ void ViewSelectAll()
    文字精确对齐（中文全角等宽，但英文、数字、标点不是，必须实测而不能按字数乘）。然后
    分三段画：选中前（正常色）-> 选中段（高亮色）-> 选中后（正常色），x 依次累加
    pre.cx / sel.cx；没有选区时走最后的"整行一次画完"快路径。 */
+/* 高亮的 4 种基准色（1.6.0）。只存"基准色"，绘制时再按当前主题混底色 ——
+ * 同一个纯黄在米色纸面和夜里深色底上观感完全不同，深色底上直接用纯黄会刺眼。 */
+static COLORREF HlBase(int idx)
+{
+    static const COLORREF k[] = {
+        RGB(0xF3, 0xD0, 0x5C),   /* 0 黄 */
+        RGB(0x7C, 0xC5, 0x7A),   /* 1 绿 */
+        RGB(0x6F, 0xA8, 0xE8),   /* 2 蓝 */
+        RGB(0xE0, 0x8C, 0xB4),   /* 3 粉 */
+    };
+    if (idx < 0) idx = 0;
+    if (idx > 3) idx = 3;
+    return k[idx];
+}
+
+/* 高亮实际用的底色：基准色往背景色里混 62%，纸上是一层淡彩，
+ * 文字压上去依然对比充分；夜间模式自然变成深一点的高亮块。 */
+static COLORREF HlTint(int idx)
+{
+    const Theme& th = CurTheme();
+    return Mix(HlBase(idx), th.bg, 62);
+}
+
 static void DrawRun(int x, int y, int start, int end)
 {
     const Theme& th = CurTheme();
@@ -1005,6 +1233,31 @@ static void DrawRun(int x, int y, int start, int end)
     clip.top = y - 2;
     clip.right = x + s_textW + S(3);
     clip.bottom = y + s_lineH;
+    /* 先铺高亮底色（1.6.0）：色块在下、文字在上，和选区同一套做法。
+     * g_hls 按 off 有序，所以碰到"起点已经在行尾之后"的条目就能提前 break。 */
+    if (!g_hls.empty()) {
+        for (size_t i = 0; i < g_hls.size(); i++) {
+            const Highlight& h = g_hls[i];
+            int hEnd = h.off + h.len;
+            if (hEnd <= start) continue;
+            if (h.off >= end) break;
+            int os = h.off > start ? h.off : start;
+            int oe = hEnd < end ? hEnd : end;
+            if (os >= oe) continue;
+            SIZE pre, sel;
+            pre.cx = pre.cy = sel.cx = sel.cy = 0;
+            if (os > start) GetTextExtentPoint32W(s_dc, s, os - start, &pre);
+            GetTextExtentPoint32W(s_dc, s + (os - start), oe - os, &sel);
+            RECT hr;
+            hr.left = x + pre.cx;
+            hr.top = y + S(1);
+            hr.right = hr.left + sel.cx + S(2);
+            hr.bottom = y + s_lineH - S(1);
+            HBRUSH hb = CreateSolidBrush(HlTint(h.color));
+            FillRect(s_dc, &hr, hb);
+            DeleteObject(hb);
+        }
+    }
     /* 有选区才走分段绘制；没有选区时整行一次 ExtTextOutW 最快。 */
     if (s_selB > s_selA) {
         /* 本行与选区求交集：起点取两者较大者，终点取两者较小者。os < oe
@@ -1526,56 +1779,50 @@ static void PaintAll()
     }
 
     ClampAnchor();
-    int x = s_padL;
-    int y = s_padT;
-    int p = s_aPara, line = s_aLine;
-    std::vector<int> st;
-    int guard = 0;
-    /* 从锚点开始逐段逐行画。guard 6000：正常情况下画满一屏最多几十段就 break
-       了，这个上限只是防数据异常时死循环。 */
-    while (p < g_book.ParaCount() && y < H && guard++ < 6000) {
-        bool title = BookIsChapterPara(g_book, p);
-        SelectObject(s_dc, title ? s_fontB : s_fontN);
-        SetTextColor(s_dc, title ? th.title : th.fg);
-        LayoutPara(p, st);
-        int nl = (int)st.size() - 1;
-        /* 空段落：不画内容，但要占一点垂直空间，否则连续空行会被压成 0 高度，和 LinesInView
-           里算出来的行数对不上（翻页会重复/漏行）。 */
-        if (nl <= 0) {
-            /* 只有"不是视口顶行"时才加这半行高：否则一打开书，顶行如果正好是空段，就会凭空多出半行空白，看起来像顶
-               部边距变大了。 */
-            if (p > s_aPara || line > 0) y += s_lineH / 2;
-            p++; line = 0;
-            continue;
-        }
-        /* 兜底：重排后行数变少时 line 可能越界（ClampAnchor 已经夹过一次，这里防
-           的是绘制过程中数据被改动的情况）。 */
-        if (line >= nl) line = nl - 1;
-        /* 章标题上方额外留白，只在标题的第 0 行可见时加一次。 */
-        if (title && line == 0) y += s_titleGap;
-        /* 书签标记：这一段上有书签，就在正文左边缘画一道短竖条（用标题色），
-           用户在正文里一眼就能看到"我在这儿标过"。用二分查 g_bmParas —— 一屏最多几十段，
-           代价可忽略；g_bmParas 由 ui.cpp 在打开书、增删书签时重建。 */
-        if (!g_bmParas.empty() && std::binary_search(g_bmParas.begin(), g_bmParas.end(), p)) {
+    /* 一次性把这一屏的每一行摊平（含双栏换列、首行缩进、标题间隙），
+     * 然后照着这个数组逐行画。规则只写在 BuildFlow 里一份。 */
+    std::vector<FlowLine> flow;
+    BuildFlow(s_aPara, s_aLine, H, flow);
+    for (size_t i = 0; i < flow.size(); i++) {
+        const FlowLine& fl = flow[i];
+        /* 字体和颜色要按"当前这行属于哪种段落"重新选：BuildFlow 里为了量宽度
+         * 已经选过一次，但中间可能被别的段落改掉。 */
+        SelectObject(s_dc, fl.title ? s_fontB : s_fontN);
+        SetTextColor(s_dc, fl.title ? th.title : th.fg);
+        /* 书签标记：段落的第一行可见时，在正文左边缘画一道短竖条。
+         * g_bmParas 由 ui.cpp 维护（打开书、增删书签时重建），有序所以能二分。 */
+        if (fl.firstLine && !g_bmParas.empty() &&
+            std::binary_search(g_bmParas.begin(), g_bmParas.end(), fl.para)) {
             RECT rb;
-            rb.left   = x - S(15);
+            rb.left   = fl.x - S(15);
             rb.right  = rb.left + S(4);
-            rb.top    = y + S(3);
+            rb.top    = fl.y + S(3);
             rb.bottom = rb.top + s_lineH - S(6);
             if (rb.bottom < rb.top + S(4)) rb.bottom = rb.top + S(4);
             HBRUSH br = CreateSolidBrush(th.title);
             FillRect(s_dc, &rb, br);
             DeleteObject(br);
         }
-        for (int l = line; l < nl; l++) {
-            /* 一屏画满就停：后面几十万字一概不碰，这是自绘排版能扛大文件的关键。 */
-            if (y >= H) break;
-            DrawRun(x, y, st[(size_t)l], st[(size_t)l + 1]);
-            y += s_lineH;
+        DrawRun(fl.x, fl.y, fl.start, fl.end);
+    }
+    /* 页码：分页模式下右下角显示"本章第 n/m 页"。
+     *
+     * 为什么是"本章"而不是全书：全书总页数得把每一段都排一遍版才数得出来，
+     * 一本 8800 章的书要几百毫秒——放进绘制就是每滚一下卡一下。按章算的话，
+     * 一章通常只有几十段，排一次不到 1 毫秒，而且"本章还剩几页"本来就是分页
+     * 阅读时最想知道的信息。 */
+    if (PagedMode()) {
+        int cur = 0, tot = 0;
+        if (ChapterPageInfo(&cur, &tot)) {
+            wchar_t info[64];
+            wsprintfW(info, L"第 %d / %d 页", cur, tot);
+            RECT rr;
+            SetRect(&rr, W - S(160), H - s_lineH - S(6), W - S(12), H - S(6));
+            HFONT oldF = (HFONT)SelectObject(s_dc, s_fontN);
+            SetTextColor(s_dc, th.dim);
+            DrawTextW(s_dc, info, -1, &rr, DT_RIGHT | DT_BOTTOM | DT_SINGLELINE | DT_NOPREFIX);
+            SelectObject(s_dc, oldF);
         }
-        if (y >= H) break;
-        y += s_paraGap;
-        p++; line = 0;
     }
     BitBlt(hdc, 0, 0, W, H, s_dc, 0, 0, SRCCOPY);
     EndPaint(s_wnd, &ps);
@@ -1586,48 +1833,34 @@ static void PaintAll()
 /* 屏幕坐标 -> 字符偏移（鼠标选择、双击选段的基础）。
    参数：mx / my 是客户区坐标；返回：命中的字符偏移。点在正文之外（下方空白、右侧
    空白）时返回全文长度，这样拖选能一路拖到末尾；点在行首左侧时返回该行首字符。
-   实现注意：必须和 PaintAll 用完全相同的"逐段逐行 + y 累加"规则，包括 s_titleGap、
-   s_paraGap、空段半行高，甚至连那个 `if (p > s_aPara || line > 0)` 的顶行特判都要
-   一致。两处一旦不同，点到的字就会整体偏移 —— 这也是这段代码看起来那么像 PaintAll
-   的原因，改动时务必两处一起改。guard 6000 与 PaintAll 保持同样的上限。 */
+   1.6.0 起不再自己重走一遍排版规则，而是直接用 BuildFlow 摊出这一屏的行：
+   双栏、首行缩进、标题间隙全都由那一份逻辑决定，命中位置不可能和画出来的位置错开。 */
 static int HitTestChar(int mx, int my)
 {
     if (!g_book.Ok()) return 0;
     EnsureFonts();
-    int x = s_padL;
-    int y = s_padT;
-    int p = s_aPara, line = s_aLine;
-    std::vector<int> st;
-    int guard = 0;
-    while (p < g_book.ParaCount() && guard++ < 6000) {
-        bool title = BookIsChapterPara(g_book, p);
-        SelectObject(s_dc, title ? s_fontB : s_fontN);
-        LayoutPara(p, st);
-        int nl = (int)st.size() - 1;
-        if (nl <= 0) { y += s_lineH / 2; p++; line = 0; continue; }
-        if (line >= nl) line = nl - 1;
-        if (title && line == 0) y += s_titleGap;
-        for (int l = line; l < nl; l++) {
-            /* 鼠标落在这一行的垂直范围内：行顶是 y，行高 s_lineH。注意这里不再判 y < H ——
-               鼠标在窗口下方空白处时，最后一次循环会自然把"全文长度"返回出去。 */
-            if (my < y + s_lineH) {
-                int ls = st[(size_t)l], le = st[(size_t)l + 1];
-                int maxW = mx - x;
-                /* 点在行首左边（含负坐标）：算作行首。 */
-                if (maxW <= 0) return ls;
-                int nFit = 0;
-                SIZE sz; sz.cx = sz.cy = 0;
-                /* 借用和排版同一个 API，问"这一行里、x 像素之内能放下几个字"。比按字数乘平均宽度准确得多（中英混排时字
-                   宽差别很大）。 */
-                GetTextExtentExPointW(s_dc, g_book.text.c_str() + ls, le - ls, maxW, &nFit, nullptr, &sz);
-                /* 夹住 nFit：GetTextExtentExPointW 在宽度足够时会把 nFit 设成整段长度，理论上不会超过
-                   le-ls，但夹一下更安全。 */
-                return ls + (nFit > le - ls ? le - ls : nFit);
-            }
-            y += s_lineH;
+    RECT rc;
+    GetClientRect(s_wnd, &rc);
+    /* 命中范围按"屏幕高度 + 一行"给，多出来的一行是给"点在最后一行下方但还没到
+       行外"的情况留的余量。 */
+    std::vector<FlowLine> flow;
+    BuildFlow(s_aPara, s_aLine, rc.bottom + s_lineH, flow);
+    for (size_t i = 0; i < flow.size(); i++) {
+        const FlowLine& fl = flow[i];
+        if (my < fl.y + s_lineH) {
+            SelectObject(s_dc, fl.title ? s_fontB : s_fontN);
+            int maxW = mx - fl.x;
+            /* 点在行首左边（含负坐标）：算作行首 */
+            if (maxW <= 0) return fl.start;
+            int nFit = 0;
+            SIZE sz; sz.cx = sz.cy = 0;
+            /* 借用和排版同一个 API，问"这一行里、x 像素之内能放下几个字"。
+               比按字数乘平均宽度准确得多（中英混排时字宽差别很大）。 */
+            GetTextExtentExPointW(s_dc, g_book.text.c_str() + fl.start, fl.end - fl.start,
+                                  maxW, &nFit, nullptr, &sz);
+            int len = fl.end - fl.start;
+            return fl.start + (nFit > len ? len : nFit);
         }
-        y += s_paraGap;
-        p++; line = 0;
     }
     /* 一路扫到书尾都没命中：返回全文长度，拖选时能选到最后一个字。 */
     return (int)g_book.text.size();

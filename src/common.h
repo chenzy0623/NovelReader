@@ -104,6 +104,58 @@ struct Settings {
     COLORREF cTitle = RGB(0x8A, 0x5A, 0x2B);  /* 章节标题文字 */
     COLORREF cSel   = RGB(0xBF, 0xDC, 0xF4);  /* 选中文字的背景（正文色会按对比度自动反转） */
     COLORREF cHov   = RGB(0xEC, 0xE6, 0xD8);  /* 悬停/次级底色：首页书架悬停行、折叠条 */
+
+    /* ---- 1.6.0 新增 ---- */
+    /* 隐私模式：打开后标题栏、顶栏、状态栏都不显示书名（只显示"小说阅读器"），
+     * 适合在公共场合/录屏时用。书架卡片仍然照常显示（那是自己的机器上才看的东西）。 */
+    int privacy = 0;
+    /* 老板键：任意时刻按下就立刻把窗口藏起来，再按一下恢复。
+     * 存成 "Ctrl+Alt+H" 这种字符串，空串表示不启用。 */
+    std::wstring bossKey = L"Ctrl+Alt+H";
+};
+
+/* 一本书的排版设置（1.6.0 新增：每本书可以有不同的排版）。
+ *
+ * 为什么要"每本书独立"：读网文习惯大字号、宽行距、分页双栏；读 PDF 抽出的文字
+ * 或者古典小说时又希望紧凑一点。一个全局字号必然来回改，所以把排版存到**这本书
+ * 自己的 ini 段**里（见 PosSectionFor），换书自动换排版，新书继承 [settings]
+ * 里的默认值。
+ *
+ * 字段全是"档位"而不是像素：档位由 view.cpp 换算成实际尺寸，这样换 DPI、
+ * 换字号时不用迁移旧记录。 */
+struct BookLayout {
+    int fontPt    = 17;      /* 正文字号（磅），12~40 */
+    int spacing   = 1;       /* 行距：0 紧凑 1 标准 2 宽松（对应 view.cpp 的 kSpacing[]） */
+    int margin    = 1;       /* 页边距：0 窄 1 标准 2 宽 */
+    int indent    = 1;       /* 首行缩进：0 关 1 缩进两个字 */
+    int paged     = 0;       /* 阅读方式：0 连续滚动 1 分页（一屏一页） */
+    int cols      = 1;       /* 栏数：1 单栏 2 双栏（双栏自动转成分页模式） */
+    int forceFont = 0;       /* 强制字体：1 时连目录/状态栏/工具栏也用 fontFace */
+    std::wstring fontFace = L"Microsoft YaHei";  /* 正文（及强制字体时的界面）字体名 */
+};
+
+/* 一条高亮 / 笔记。
+ *
+ * 存的是"偏移 + 长度"，不复制原文：书改了位置就对不上，但这是所有阅读器的共同
+ * 取舍 —— 复制一份原文进 ini，几万条标注能把 ini 撑到几十 MB。
+ * note 为空表示只是高亮；color 是 0~3 的调色板下标（见 view.cpp 的 kHlColors）。 */
+struct Highlight {
+    int off = 0;             /* 起止字符偏移（UTF-16 下标） */
+    int len = 0;             /* 长度，至少 1 */
+    int color = 0;           /* 颜色下标 0 黄 1 绿 2 蓝 3 粉 */
+    std::wstring note;       /* 附注文字；空 = 只有高亮 */
+};
+
+/* 一条可自定义的快捷键。
+ *
+ * id 是命令 ID（ids.h 里的 IDM_*），action 是给人看的中文名，def 是出厂默认值，
+ * cur 是当前生效值，格式 "Ctrl+Alt+H" / "F6" / "Alt+Left"。
+ * 表本身是只读的（内置顺序），只有 cur 会被 ini 覆盖。 */
+struct KeyBind {
+    int id;                  /* 命令 ID */
+    const wchar_t* action;   /* 功能名（对话框里显示） */
+    const wchar_t* def;      /* 出厂默认键 */
+    std::wstring cur;        /* 当前键；空串 = 用户主动取消了这个快捷键 */
 };
 
 /* 一套配色。日间/夜间各一份，见 view.cpp 的 kDay / kNight。
@@ -272,6 +324,44 @@ void ShelfRefresh();
 const std::vector<ShelfItem>& ShelfItems();
 
 /* =====================================================================
+ * 每本书的排版 / 高亮笔记 / 快捷键 (layout.cpp)
+ * ===================================================================== */
+
+/* 当前生效的排版（打开书时从该书 ini 段读，改字号行距等直接改它并回存）。
+ * 全局 g_set 里的 fontPt/spacing/fontFace 只是"新书的默认值"。 */
+extern BookLayout g_lay;
+
+/* 当前书的高亮/笔记，按 off 升序；绘制时二分定位。 */
+extern std::vector<Highlight> g_hls;
+
+/* 用 [settings] 里的全局默认值填满 g_lay（没打开书时调，也用于"恢复默认排版"）。 */
+void LayoutFromSettings();
+
+/* 读 / 写某本书的排版。键前缀 lay_（lay_fontPt / lay_spacing / lay_margin /
+ * lay_indent / lay_paged / lay_cols / lay_force / lay_face），存在这本书的进度段里。 */
+void LayoutLoad(const std::wstring& path);
+void LayoutSave(const std::wstring& path);
+
+/* 读 / 写某本书的高亮笔记（段名 "hl" + PosSectionFor 的哈希部分）。
+ * 存储格式：n0=偏移,长度,颜色   t0=笔记正文  —— 分开存是因为笔记里可能有逗号。 */
+void HighlightLoad(const std::wstring& path);
+void HighlightSave(const std::wstring& path);
+
+/* 快捷键表（内置顺序，cur 从 ini 的 [keys] 段覆盖） */
+std::vector<KeyBind>& KeyBinds();
+void KeysLoad();
+void KeysSave();
+
+/* "Ctrl+Alt+H" ⇄ (虚拟键码, 修饰键位)。
+ * Parse 返回 false 表示字符串解析不出来（多半是用户手改 ini 写错）。
+ * mods 用 WIN32 的 MOD_* 位：MOD_CONTROL / MOD_ALT / MOD_SHIFT。 */
+bool KeysParse(const std::wstring& text, BYTE* vk, BYTE* mods);
+std::wstring KeysFormat(BYTE vk, BYTE mods);
+
+/* 按 KeyBinds() 里当前的键重新生成加速键表（换键之后必须调，见 ui.cpp 的 UiRebuildAccel）。 */
+void UiRebuildAccel();
+
+/* =====================================================================
  * 阅读视图 (view.cpp)
  * ===================================================================== */
 
@@ -353,6 +443,46 @@ void ViewPdfScroll(int dy);
 /* ============ 主界面里与 PDF 版式相关的入口 ============ */
 /* 菜单 / F9：在「PDF 原始版式」与「文字重排」之间切换，附带提示与状态栏刷新 */
 void UiTogglePdfMode();
+
+/* ============ 1.6.0：排版 / 高亮笔记 / 快捷键 / 老板键 / 隐私 ============ */
+
+/* 分页模式下一页能装几行（连续滚动模式下也返回这个值，翻页步长用它） */
+int ViewLinesPerPage();
+
+/* 当前选区的起止偏移；没选中时 *a == *b（都等于光标处）。没有光标时返回 false。 */
+bool ViewSelection(int* a, int* b);
+
+/* 选中一段并滚动到可见（高亮列表里点条目时用）。 */
+void ViewSelectRange(int a, int b);
+
+/* 高亮 / 笔记（ui.cpp） */
+void UiAddHighlight(int color);   /* 给当前选区加高亮；同位置已有则改成这个颜色 */
+void UiRemoveHighlight();         /* 删掉与选区相交的高亮 */
+void UiEditNote();                /* 给选区加/改笔记（弹输入框） */
+void UiShowHighlights();          /* 侧栏切到"高亮与笔记"列表 */
+void UiExportNotes();             /* 导出成 Markdown 文件 */
+
+/* 快捷键设置对话框（列出所有可改的功能，点一行然后按新键） */
+void UiKeysDialog();
+
+/* 当前的加速键表句柄（消息循环每轮问一次，换表后立刻生效）。
+ * 改完快捷键必须调 UiRebuildAccel() 重建，旧表会被销毁。 */
+HACCEL UiAccelHandle();
+void UiRebuildAccel();
+
+/* 老板键：按 g_set.bossKey 重新注册全局热键；切换显示/隐藏 */
+void UiApplyBossKey();
+void UiToggleBoss();
+
+/* 隐私模式开关（隐藏书名） */
+void UiTogglePrivacy();
+
+/* 标题栏 / 顶栏 / 状态栏要显示的"书名"：隐私模式开着时返回占位词（"文档"），
+ * 让别人从任务栏、截图或 Alt+Tab 预览里都看不出你在读什么书。 */
+std::wstring UiDisplayTitle();
+
+/* 排版改完之后的统一收尾：存盘 + 重排 + 刷新状态栏/菜单勾选 + 重绘 */
+void UiLayoutChanged(bool relayout);
 
 /* =====================================================================
  * 主界面 (ui.cpp)

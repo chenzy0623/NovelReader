@@ -1,9 +1,9 @@
-﻿﻿NovelReader 1.5.0 —— 源码说明与编译方法
+﻿﻿NovelReader 1.6.0 —— 源码说明与编译方法
 ==========================================
 
 这个文件夹里是阅读器的全部源码：纯 C++17 + Win32 API，没有任何第三方库
 （zip 解压、DEFLATE、PDF 解析、HTTP 服务全是自己写的），编译出来就是一个
-约 893 KB 的独立 exe（静态链接，不带 DLL）。
+约 947 KB 的独立 exe（静态链接，不带 DLL）。
 
 源码里每个文件的开头都有一段中文说明，讲这个文件负责什么、关键决定为什么这么做；
 重要函数和容易踩坑的地方都有逐段注释。
@@ -37,6 +37,8 @@
   源码\src\source.h      书源数据结构的声明（BookSource + 存取接口）
   源码\src\source.cpp    书源的读写与增删：六项规则存进 ini 的 [sources] 段、
                         内置示例源、最多 16 个、删源时清掉旧键
+  源码\src\layout.h    每本书排版的声明（BookLayout）+ 高亮/笔记（Highlight）+ 快捷键表
+  源码\src\layout.cpp  每本书排版 / 高亮 / 笔记 / 快捷键的 ini 存取与键名解析（约 520 行）
   源码\src\server.h     手机阅读服务的声明
   源码\src\server.cpp   局域网 HTTP 服务：书架页 / 目录页 / 分页阅读页，
                         手机端进度写回同一份 ini
@@ -73,8 +75,9 @@ build.bat 会做两件事：
   g++ -std=gnu++17 -O2 -DUNICODE -D_UNICODE -D_WIN32_WINNT=0x0601 ^
       -municode -mwindows -ffunction-sections -fdata-sections -Wall -Wextra ^
       -Wl,--gc-sections -Wl,-s -static -static-libgcc -static-libstdc++ ^
-      src\book.cpp src\ini.cpp src\view.cpp src\ui.cpp src\zip.cpp ^
-      src\format.cpp src\web.cpp src\source.cpp src\pdf.cpp src\pdfrender.cpp src\server.cpp ^
+      src\book.cpp src\ini.cpp src\layout.cpp src\view.cpp src\ui.cpp ^
+      src\zip.cpp src\format.cpp src\pdf.cpp src\pdfrender.cpp ^
+      src\server.cpp src\web.cpp src\source.cpp ^
       build\app.res -o build\NovelReader.exe ^
       -lcomctl32 -lcomdlg32 -lshell32 -lole32 -lgdi32 -luser32 -ladvapi32 ^
       -lgdiplus -lshcore -lruntimeobject -lwininet -lws2_32 -liphlpapi
@@ -149,7 +152,7 @@ build.bat 会做两件事：
    把文件参数转发给第一个就退出。
 
 
-11. 界面为什么全部自绘（1.5.0）
+11. 界面为什么全部自绘（1.6.0）
     系统控件的灰底、3D 边框、菜单栏在米色纸面和夜间深底上都很扎眼，所以顶栏
     （NRToolbar）、状态栏（NRStatus）、目录/搜索结果列表（LBS_OWNERDRAWFIXED）、
     搜索条三个按钮（BS_OWNERDRAW）全部自己画。要点有三个：
@@ -174,6 +177,50 @@ build.bat 会做两件事：
     ShelfRefresh 则先按 [recent] 加入，再扫所有 f* 段按 path 把漏掉的书补回，
     最后按 ts（最后阅读时间）排序并回写 [recent]。
 
+  11. 排版为什么按「每本书」存，而不是全局一份
+
+      读网文和读古籍/PDF 抽文的习惯完全不同：网文要大字宽行距，古籍要小字
+      单栏不缩进。全局一份的结果就是每次切书都要重调一遍。
+
+      所以排版存在每本书自己的 ini 段里（就是记录阅读进度的那个 f 段），
+      键名统一加 lay_ 前缀。新书第一次打开时继承 [settings] 里的字号/行距/
+      字体作为默认，之后各记各的。这样也不用做"回滚默认值"的逻辑 ——
+      新书天然从那套默认开始。
+
+  12. 排版规则只写一份（BuildFlow）
+
+      1.5.0 之前"每段怎么断行、每行多宽"这套规则在绘制和命中测试里各写了
+      一遍，双栏一加就会开始漂移：点在这一行，选中的却是上一行。
+
+      1.6.0 抽出 struct FlowLine 与 BuildFlow()：给它起始段/行和可视高度，
+      它返回一串「这行画在哪、是第几段、是不是标题、是不是段首行」。
+      绘制、鼠标命中、行数统计都吃这同一份结果，所以双栏、分页、缩进
+      怎么变都不会对不上。
+
+  13. 高亮为什么用混色画
+
+      高亮色如果直接用不透明色，夜间模式（近黑底）上会变成一块刺眼的亮斑。
+      HlTint() 用「主色 38% + 当前纸色 62%」混一份出来，换配色时自动跟着走。
+
+      存盘用 off,len,color 三个整数（笔记正文另存一个键，因为笔记里有逗号），
+      读的时候坏数据跳过而不是整本丢弃 —— 用户手改 ini 改坏了不至于把
+      2000 条高亮全清空。
+
+  14. 快捷键怎么做到"改了立刻生效"
+
+      原来的加速键表是编译期写死的静态数组，运行时改不了。现在 BuildAccel()
+      从 KeyBinds() 现算：解析 "Ctrl+Shift+1" 这类字符串 → 翻译成 MOD_*/FVIRTKEY
+      → CreateAcceleratorTableW。改了键就 UiRebuildAccel() 重建一张表。
+
+      注意消息循环里不能缓存 HACCEL：重建之后旧句柄会被销毁，所以每轮都
+      取一次 UiAccelHandle()。另外 MOD_CONTROL(0x0002) 和 FCONTROL(0x0008)
+      是两套不同的位值，不能直接或运算，必须逐位翻译。
+
+  15. 老板键为什么用 RegisterHotKey
+
+      窗口隐藏后没有焦点，键盘消息根本不进消息循环，所以"窗口内快捷键"这条
+      路走不通。RegisterHotKey 是系统级注册，隐藏、失焦都能收到 WM_HOTKEY。
+      注册失败（被别的程序占用）要明确告诉用户，否则他会以为功能坏了。
 四、调试
 ------------------------------------------
   build_dbg.bat          编出带 NrTrace 的调试版
@@ -184,16 +231,17 @@ trace 覆盖：菜单命令分发、搜索链路、自动下滑的定时器、�
 
 五、代码规模（约）
 ------------------------------------------
-  ui.cpp      3100 行      主窗口、自绘顶栏/状态栏/列表、全部交互
-  view.cpp    1500 行      排版与绘制、书架卡片
+  ui.cpp      4900 行      主窗口、自绘顶栏/状态栏/列表、全部交互
+  view.cpp    1700 行      排版（BuildFlow）与绘制、书架卡片
   pdf.cpp      900 行      PDF 解析
   pdfrender.cpp 590 行     PDF 原始版式渲染（WinRT + GDI+）
   server.cpp   650 行      局域网阅读服务
   web.cpp      1120 行     网页抓书 + 书源搜索（规则驱动）
+  layout.cpp    520 行     每本书排版、高亮/笔记、快捷键表
   source.cpp    250 行     书源模型与 ini 存取
   format.cpp   640 行      EPUB/DOCX/HTML/MD 抽正文
   zip.cpp      645 行      zip + DEFLATE
   book.cpp     560 行      解码、分章、搜索
   ini.cpp      300 行      配置、进度、书架、书签
   common.h     320 行      数据结构与接口
-  合计约 8900 行，注释约占 28%
+  合计约 9600 行，注释约占 30%

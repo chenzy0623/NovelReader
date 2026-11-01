@@ -92,6 +92,9 @@ static HFONT s_uiFont = nullptr;
  */
 static bool s_searchShown = false;
 static int  s_panel = 0;                 /* 0 目录, 1 搜索结果 */
+/* 上一次用过的高亮颜色（0~3）。Ctrl+H 快速标记时沿用它，
+ * 免得每标一句都要重新挑颜色。 */
+static int  s_lastHlColor = 0;
 /* 防递归用的「正在程序化同步」标志：我们调 LB_SETCURSEL 时列表会回发
  * LBN_SELCHANGE，若不挡住就会变成「同步目录 → 触发跳章 → 再同步」的死循环。
  * 用法固定为：置位 → 发消息 → 立刻复位，中间不调任何会抛消息的函数。
@@ -139,6 +142,11 @@ static void AutoSyncMenu();
 /* 侧栏切页：书签面板（UiShowBookmarks）的代码放在 ShowPanel 定义之前，
  * 所以这里先声明一下；s_panel 的取值 0 目录 / 1 搜索命中 / 2 书签。 */
 static void ShowPanel(int which);
+/* 1.6.0：下面三个都在文件后半段定义，但导出笔记、快捷键对话框在前面就要用，
+ * 所以原型提前（C++ 不允许调用未声明的函数）。 */
+static std::wstring ClipToWidth(HDC dc, const std::wstring& s, int maxW);
+static bool WriteTextFileUtf8Bom(const std::wstring& path, const std::wstring& text);
+static HACCEL BuildAccel();
 
 /* ---------------- 字体 ---------------- */
 
@@ -638,7 +646,8 @@ static void DrawToolbar(HDC dc, const RECT& rcClient)
     HFONT oldF = (HFONT)SelectObject(dc, titleFont ? titleFont : s_uiFont);
     int oldM = SetBkMode(dc, TRANSPARENT);
 
-    std::wstring title = g_book.Ok() ? g_book.title : L"书架";
+    /* 1.6.0：书名走 UiDisplayTitle()，隐私模式开着时这里显示"文档"而不是真书名。 */
+    std::wstring title = g_book.Ok() ? UiDisplayTitle() : L"书架";
     SIZE tsz; tsz.cx = tsz.cy = 0;
     GetTextExtentPoint32W(dc, title.c_str(), (int)title.size(), &tsz);
 
@@ -1104,7 +1113,8 @@ void UiUpdateStatus()
         p1 = ShelfItems().empty() ? L"Ctrl+O 打开小说文件" : L"单击书名继续阅读";
         p2 = L"";
     } else {
-        p0 = g_book.title;
+        /* 隐私模式：状态栏第一格也不显示真书名 */
+        p0 = UiDisplayTitle();
         if (!s_statusExtra.empty()) p0 += L"  ·  " + s_statusExtra;
         /* 章节号按「屏幕顶行」算，而不是按选中位置或鼠标位置：
          * 用户感知的「我在哪一章」永远是眼睛看到的第一行。
@@ -1496,6 +1506,679 @@ void UiShowBookmarks()
     ShowPanel(2);
 }
 
+/* ---------------- 高亮与笔记 ---------------- */
+
+/* 高亮条目在侧栏列表里的编码，跟书签一样是 "偏移|显示文字"：
+ * 列表只存字符串，偏移藏在文字前面的数字里，点击时反解出来即可，
+ * 不必再维护一份与列表索引一一对应的数组（那种做法在插入/删除后会错位）。
+ * 注意：高亮自己有 off/len 两份数据在 g_hls 里，这里只是"哪个高亮"的定位。 */
+
+/* 取一条高亮的显示文字：章名 + 该处前后的原文摘要。
+ * 摘要起点要往前退一点（S(0) 不够，读者需要上下文才认得出是哪一段），
+ * 但退太多会把上一段的内容也带进来，所以定在 8 个字。 */
+static std::wstring HlLabel(const Highlight& h)
+{
+    if (!g_book.Ok() || h.off < 0 || h.off >= (int)g_book.text.size()) return std::wstring();
+    int ch = BookChapterAtPara(g_book, BookCharToPara(g_book, h.off));
+    std::wstring name = BookChapterTitle(g_book, ch);
+    int from = h.off - 8;
+    if (from < 0) from = 0;
+    /* 不跨段：从段首起，否则摘要会带着上一段的尾巴，看起来很怪 */
+    int paraStart = (int)g_book.paraOff[(size_t)BookCharToPara(g_book, h.off)];
+    if (from < paraStart) from = paraStart;
+    int to = h.off + h.len + 24;
+    if (to > (int)g_book.text.size()) to = (int)g_book.text.size();
+    std::wstring mid = g_book.text.substr((size_t)from, (size_t)(to - from));
+    /* 换行会让列表框里的一行断成两行，摘要里不能有换行 */
+    for (size_t i = 0; i < mid.size(); i++) if (mid[i] == L'\n' || mid[i] == L'\r') mid[i] = L' ';
+    if (!name.empty()) return name + L" · " + mid;
+    return mid;
+}
+
+/* 把 g_hls 填进侧栏列表（s_panel == 3 时 s_hHits 就是高亮列表）。
+ * 有笔记的高亮在末尾加一个 ✎ 记号，让读者一眼看出"这条我写过东西"。 */
+static void FillHighlights()
+{
+    if (!s_hHits) return;
+    int panelW = g_set.sidebar ? S(320) : S(232);
+    int maxW = panelW - S(30);
+    SendMessageW(s_hHits, LB_RESETCONTENT, 0, 0);
+    if (g_hls.empty()) {
+        SendMessageW(s_hHits, LB_ADDSTRING, 0, (LPARAM)L"（还没有高亮：选中正文后按 Ctrl+H）");
+        return;
+    }
+    HDC dc = GetDC(s_hHits);
+    for (size_t i = 0; i < g_hls.size(); i++) {
+        std::wstring label = HlLabel(g_hls[i]);
+        if (!g_hls[i].note.empty()) label += L"  ✎";
+        /* 列表里只放"给人看"的文字，偏移不进字符串 —— g_hls 是按 off 排好序的，
+         * 列表下标和它对得上（FillHighlights 每次都整表重建），不需要像书签那样
+         * 把偏移编进条目里。之前带上 "偏移|" 前缀，结果列表里真的显示了 "0|"。 */
+        SendMessageW(s_hHits, LB_ADDSTRING, 0, (LPARAM)ClipToWidth(dc, label, maxW).c_str());
+    }
+    ReleaseDC(s_hHits, dc);
+}
+
+/* 高亮按起点排序的比较器。
+ * 用非捕获的普通函数而不是 lambda：std::sort 每次都传同一份，避免每调用一次就生成
+ * 一个新的 lambda 类型（虽然模板会合并，但写成函数更直观，也方便别处复用）。
+ * 起点相同就按长度短的在前 —— 这样套叠在一起的高亮画出来时，短的在上面，看不漏。 */
+static bool HlLess(const Highlight& a, const Highlight& b)
+{
+    if (a.off != b.off) return a.off < b.off;
+    return a.len < b.len;
+}
+
+/* 加高亮：优先用当前选中的范围，没有选中就取"当前阅读位置那一段"。
+ * 参数 color 是 0..3 的配色序号（黄/绿/蓝/粉），越界夹住。
+ * 为什么允许"没选中就高亮整段"：读网文时想标记的是"这一段写得好"，
+ * 让用户先精确拖选一遍反而烦；要改精确范围可以删掉重来。 */
+void UiAddHighlight(int color)
+{
+    if (!g_book.Ok()) {
+        MessageBoxW(g_hMain, L"请先打开一本书。", L"提示", MB_ICONINFORMATION);
+        return;
+    }
+    if (color < 0) color = 0;
+    if (color > 3) color = 3;
+    int a = 0, b = 0;
+    Highlight h;
+    if (ViewSelection(&a, &b) && b > a) {
+        h.off = a;
+        h.len = b - a;
+    } else {
+        int off = ViewAnchorOffset();
+        if (off < 0) off = 0;
+        if (off > (int)g_book.text.size()) off = (int)g_book.text.size();
+        int para = BookCharToPara(g_book, off);
+        int s = (int)g_book.paraOff[(size_t)para];
+        int e = (int)g_book.paraOff[(size_t)para + 1];
+        while (e > s && (g_book.text[(size_t)e - 1] == L'\n' || g_book.text[(size_t)e - 1] == L'\r')) e--;
+        if (e <= s) {
+            MessageBoxW(g_hMain, L"这一行没有正文可标记。", L"提示", MB_ICONINFORMATION);
+            return;
+        }
+        h.off = s;
+        h.len = e - s;
+    }
+    h.color = color;
+    if (g_hls.size() >= 2000) {
+        MessageBoxW(g_hMain, L"这本书的高亮已经到 2000 条上限了，先删一些再标。", L"提示", MB_ICONINFORMATION);
+        return;
+    }
+    g_hls.push_back(h);
+    std::sort(g_hls.begin(), g_hls.end(), HlLess);
+    HighlightSave(g_book.path);
+    if (s_panel == 3) FillHighlights();
+    ViewInvalidate();
+    wchar_t msg[64];
+    wsprintfW(msg, L"已高亮 %d 个字", h.len);
+    s_statusExtra = msg;
+    UiUpdateStatus();
+}
+
+/* 删掉"当前阅读位置"覆盖到的那条高亮。
+ * 为什么按位置而不是按列表选中项：正文里点到哪就删哪，比"先切到列表、再找到条目、
+ * 再删"顺手得多；列表里要删也行 —— 点条目会先跳过去，再按 Ctrl+Shift+H 就是删它。 */
+void UiRemoveHighlight()
+{
+    if (!g_book.Ok()) return;
+    if (g_hls.empty()) {
+        MessageBoxW(g_hMain, L"这本书还没有高亮。", L"提示", MB_ICONINFORMATION);
+        return;
+    }
+    int off = ViewAnchorOffset();
+    int len = (int)g_book.text.size();
+    bool removed = false;
+    /* 从后往前扫：删掉最后一条，前面的下标不受影响 */
+    for (int i = (int)g_hls.size() - 1; i >= 0; i--) {
+        const Highlight& h = g_hls[(size_t)i];
+        if (off >= h.off && off < h.off + h.len) {
+            g_hls.erase(g_hls.begin() + i);
+            removed = true;
+            break;
+        }
+        /* 光标正好落在末尾（读者习惯把光标停在刚读过的地方）也算命中 */
+        if (off >= len - 1 && h.off + h.len >= len - 1 && h.off <= off) {
+            g_hls.erase(g_hls.begin() + i);
+            removed = true;
+            break;
+        }
+    }
+    if (!removed) {
+        MessageBoxW(g_hMain, L"当前位置没有高亮。把光标放到高亮的文字上再试。", L"提示", MB_ICONINFORMATION);
+        return;
+    }
+    HighlightSave(g_book.path);
+    if (s_panel == 3) FillHighlights();
+    ViewInvalidate();
+    s_statusExtra = L"高亮已删除";
+    UiUpdateStatus();
+}
+
+/* 一个极简的文本输入框（写笔记用）。
+ * 为什么不用现成的 DialogBox + 资源：本程序没有 .rc 里的对话框模板（资源里只有图标
+ * 和 manifest），自己建一个窗口比维护模板文件更省事，而且能和主题配色保持一致。
+ * 返回值：true = 用户点了确定（out 里是文本，可能是空串 —— 表示清空笔记）；
+ * false = 取消或直接关窗，调用方不要改数据。 */
+static HWND s_txtEdit = nullptr;
+static bool s_txtDone = false;
+static std::wstring s_txtText;
+
+static LRESULT CALLBACK TxtBoxProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    switch (m) {
+    case WM_CREATE: {
+        /* 提示行 + 多行编辑框 + 两个按钮。坐标写死成 S() 缩放后的像素，
+         * 因为这个窗口尺寸固定（不符合 DPI 会在这里崩），不做自由布局。 */
+        CreateWindowExW(0, L"STATIC", L"笔记内容（可以直接留空表示清空这条笔记）",
+                        WS_CHILD | WS_VISIBLE, S(14), S(12), S(420), S(20),
+                        h, nullptr, nullptr, nullptr);
+        s_txtEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT",
+                                    L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP |
+                                    ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL,
+                                    S(14), S(38), S(432), S(170), h, (HMENU)1, nullptr, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"确定",
+                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                        S(268), S(220), S(84), S(28), h, (HMENU)2, nullptr, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"取消",
+                        WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                        S(362), S(220), S(84), S(28), h, (HMENU)3, nullptr, nullptr);
+        return 0;
+    }
+    case WM_COMMAND:
+        if (LOWORD(w) == 2) {
+            /* 先把文本取出来再销毁：窗口没了就读不到了 */
+            int n = GetWindowTextLengthW(s_txtEdit);
+            std::wstring t;
+            if (n > 0) {
+                t.resize((size_t)n + 1);
+                int got = GetWindowTextW(s_txtEdit, &t[0], n + 1);
+                t.resize((size_t)(got > 0 ? got : 0));
+            }
+            s_txtText = t;
+            s_txtDone = true;
+            DestroyWindow(h);
+            return 0;
+        }
+        if (LOWORD(w) == 3) { DestroyWindow(h); return 0; }
+        break;
+    case WM_CLOSE:
+        DestroyWindow(h);
+        return 0;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+static bool AskText(const wchar_t* caption, const std::wstring& init, std::wstring& out)
+{
+    HINSTANCE inst = (HINSTANCE)GetWindowLongPtrW(g_hMain, GWLP_HINSTANCE);
+    const wchar_t* kCls = L"NRTxtBox";
+    static bool s_reg = false;
+    if (!s_reg) {
+        WNDCLASSEXW wc;
+        ZeroMemory(&wc, sizeof(wc));
+        wc.cbSize = sizeof(wc);
+        wc.style = CS_DBLCLKS;
+        wc.lpfnWndProc = TxtBoxProc;
+        wc.hInstance = inst;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.lpszClassName = kCls;
+        if (!RegisterClassExW(&wc)) return false;
+        s_reg = true;
+    }
+    RECT pr;
+    GetWindowRect(g_hMain, &pr);
+    int w = S(470), h = S(300);
+    int x = pr.left + ((pr.right - pr.left) - w) / 2;
+    int y = pr.top + ((pr.bottom - pr.top) - h) / 2;
+    s_txtEdit = nullptr;
+    s_txtDone = false;
+    s_txtText.clear();
+    HWND box = CreateWindowExW(WS_EX_DLGMODALFRAME, kCls, caption,
+                               WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+                               x, y, w, h, g_hMain, nullptr, inst, nullptr);
+    if (!box) return false;
+    if (s_txtEdit && !init.empty()) SetWindowTextW(s_txtEdit, init.c_str());
+    if (s_txtEdit) SetFocus(s_txtEdit);
+    EnableWindow(g_hMain, FALSE);
+    MSG msg;
+    while (IsWindow(box) && GetMessageW(&msg, nullptr, 0, 0)) {
+        if (!IsDialogMessageW(box, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    EnableWindow(g_hMain, TRUE);
+    SetForegroundWindow(g_hMain);
+    if (!s_txtDone) return false;
+    out = s_txtText;
+    return true;
+}
+
+/* 导出笔记：写成 Markdown，方便贴到别处或存进网盘。
+ * 只导有笔记的高亮（纯高亮没有文字内容，导出去是一堆原文片段，没意义）。
+ * 文件编码用 UTF-8 带 BOM，记事本打开才不会乱码（和 web 抓书的落盘一致）。 */
+void UiExportNotes()
+{
+    if (!g_book.Ok()) {
+        MessageBoxW(g_hMain, L"请先打开一本书。", L"提示", MB_ICONINFORMATION);
+        return;
+    }
+    int n = 0;
+    for (size_t i = 0; i < g_hls.size(); i++) if (!g_hls[i].note.empty()) n++;
+    if (n == 0) {
+        MessageBoxW(g_hMain, L"这本书还没有写过笔记。先用 Ctrl+Shift+N 给高亮写一条。",
+                    L"提示", MB_ICONINFORMATION);
+        return;
+    }
+    wchar_t path[MAX_PATH];
+    wsprintfW(path, L"%s-笔记.md", g_book.title.c_str());
+    /* 文件名里的 \ / : * ? " < > | 会让保存失败，统一换成下划线 */
+    for (wchar_t* p = path; *p; p++) {
+        if (*p == L'\\' || *p == L'/' || *p == L':' || *p == L'*' || *p == L'?' ||
+            *p == L'"' || *p == L'<' || *p == L'>' || *p == L'|') *p = L'_';
+    }
+    std::wstring text;
+    text += L"# " + g_book.title + L" 的笔记\n\n";
+    for (size_t i = 0; i < g_hls.size(); i++) {
+        const Highlight& h = g_hls[(size_t)i];
+        if (h.note.empty()) continue;
+        wchar_t head[64];
+        int ch = BookChapterAtPara(g_book, BookCharToPara(g_book, h.off));
+        std::wstring name = BookChapterTitle(g_book, ch);
+        if (name.empty()) name = L"（开篇）";
+        wsprintfW(head, L"## %s\n\n", name.c_str());
+        text += head;
+        /* 原文摘录：把换行压成空格，方便在 Markdown 里当成引用块 */
+        int to = h.off + h.len;
+        if (to > (int)g_book.text.size()) to = (int)g_book.text.size();
+        std::wstring quote = g_book.text.substr((size_t)h.off, (size_t)(to - h.off));
+        for (size_t k = 0; k < quote.size(); k++) if (quote[k] == L'\n' || quote[k] == L'\r') quote[k] = L' ';
+        text += L"> " + quote + L"\n\n";
+        text += h.note + L"\n\n";
+    }
+    if (!WriteTextFileUtf8Bom(path, text)) {
+        MessageBoxW(g_hMain, L"写文件失败（目录不可写？）", L"导出笔记", MB_ICONWARNING);
+        return;
+    }
+    std::wstring msg = L"已导出到：\n" + std::wstring(path) + L"\n\n现在打开看看吗？";
+    if (MessageBoxW(g_hMain, msg.c_str(), L"导出笔记", MB_ICONINFORMATION | MB_YESNO) == IDYES) {
+        ShellExecuteW(g_hMain, L"open", path, nullptr, nullptr, SW_SHOWNORMAL);
+    }
+}
+
+/* 给一条高亮写/改笔记。
+ * 目标高亮的找法：先看"当前阅读位置是否落在某条高亮里"（读者刚标记完、刚跳过来，
+ * 光标就在那儿）；没有的话，如果高亮列表正开着，就用列表里选中的那条。
+ * 两者都没有就提示用户先标一条 —— 笔记必须挂在某条高亮上，否则它没有位置可回顾。 */
+void UiEditNote()
+{
+    if (!g_book.Ok()) {
+        MessageBoxW(g_hMain, L"请先打开一本书。", L"提示", MB_ICONINFORMATION);
+        return;
+    }
+    if (g_hls.empty()) {
+        MessageBoxW(g_hMain, L"这本书还没有高亮。先选中文字按 Ctrl+H 标一条，再写笔记。",
+                    L"提示", MB_ICONINFORMATION);
+        return;
+    }
+    int idx = -1;
+    int off = ViewAnchorOffset();
+    for (size_t i = 0; i < g_hls.size(); i++) {
+        const Highlight& h = g_hls[i];
+        if (off >= h.off && off < h.off + h.len) { idx = (int)i; break; }
+    }
+    if (idx < 0 && s_panel == 3 && s_hHits) {
+        /* 列表里选中的那条：条目字符串是 "偏移|文字"，偏移能直接反解 */
+        int sel = (int)SendMessageW(s_hHits, LB_GETCURSEL, 0, 0);
+        if (sel >= 0 && sel < (int)g_hls.size()) idx = sel;
+    }
+    if (idx < 0) {
+        MessageBoxW(g_hMain, L"把光标放到高亮的文字上（或在高亮列表里点一条）再写笔记。",
+                    L"提示", MB_ICONINFORMATION);
+        return;
+    }
+    std::wstring note = g_hls[(size_t)idx].note;
+    std::wstring input;
+    if (!AskText(L"写笔记", note, input)) return;
+    g_hls[(size_t)idx].note = input;
+    HighlightSave(g_book.path);
+    if (s_panel == 3) FillHighlights();
+    s_statusExtra = input.empty() ? L"笔记已清空" : L"笔记已保存";
+    UiUpdateStatus();
+}
+
+/* 打开高亮列表（没高亮也打开，里面有一行提示）。 */
+void UiShowHighlights()
+{
+    if (!g_book.Ok()) {
+        MessageBoxW(g_hMain, L"请先打开一本书。", L"提示", MB_ICONINFORMATION);
+        return;
+    }
+    FillHighlights();
+    ShowPanel(3);
+}
+
+/* ---------------- 快捷键设置 ---------------- */
+
+/* 当前的加速键表。1.6.0 起用户可以改键，改完必须换一张新表：
+ * 加速键表是 CreateAcceleratorTableW 建的内核对象，内容不可变，只能销毁重建。
+ * 消息循环每轮都问 UiAccelHandle()，所以换表后立刻生效，不必重启程序。 */
+static HACCEL s_accel = nullptr;
+
+HACCEL UiAccelHandle()
+{
+    return s_accel;
+}
+
+void UiRebuildAccel()
+{
+    if (s_accel) {
+        DestroyAcceleratorTable(s_accel);
+        s_accel = nullptr;
+    }
+    s_accel = BuildAccel();
+}
+
+/* 快捷键列表里的一行文字："功能名  ——  当前键（或"未设置"）" */
+static std::wstring KeyRowText(const KeyBind& b)
+{
+    std::wstring s = b.action;
+    s += L"    ";
+    /* 用全角空格而不是制表符：LISTBOX 里制表符会被显示成一个空格，对不齐 */
+    s += b.cur.empty() ? L"（未设置）" : b.cur;
+    return s;
+}
+
+static HWND s_keysList = nullptr;
+static HWND s_keysHint = nullptr;
+
+static void KeysFillList()
+{
+    if (!s_keysList) return;
+    int sel = (int)SendMessageW(s_keysList, LB_GETCURSEL, 0, 0);
+    SendMessageW(s_keysList, LB_RESETCONTENT, 0, 0);
+    std::vector<KeyBind>& binds = KeyBinds();
+    for (size_t i = 0; i < binds.size(); i++) {
+        std::wstring t = KeyRowText(binds[i]);
+        SendMessageW(s_keysList, LB_ADDSTRING, 0, (LPARAM)t.c_str());
+    }
+    if (sel >= 0 && sel < (int)binds.size()) SendMessageW(s_keysList, LB_SETCURSEL, sel, 0);
+}
+
+/* 列表子类化：把"在列表上按键"解释成"给这一行设快捷键"。
+ * 为什么在列表上按键而不是弹一个"请按键"的小窗：用户刚点了某一行，手就在键盘上，
+ * 直接按最省事；而且不需要额外窗口来抢焦点。
+ * 规则：
+ *   - 只按修饰键（Ctrl/Shift/Alt/Win）不算，等真的按到主键；
+ *   - Esc = 取消这条绑定（相当于"这个功能不要快捷键"）；
+ *   - Delete/Backspace = 清空绑定；
+ *   - 其余组合键写回 KeyBinds()[sel].cur，只改内存，点「确定」才落盘。 */
+static LRESULT CALLBACK KeysListSub(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR id, DWORD_PTR ref)
+{
+    (void)id;
+    (void)ref;
+    if (m == WM_KEYDOWN || m == WM_SYSKEYDOWN) {
+        int sel = (int)SendMessageW(h, LB_GETCURSEL, 0, 0);
+        std::vector<KeyBind>& binds = KeyBinds();
+        if (sel < 0 || sel >= (int)binds.size()) return 0;
+        int vk = (int)w;
+        /* 单独按修饰键：不当作绑定，等主键 */
+        if (vk == VK_CONTROL || vk == VK_SHIFT || vk == VK_MENU ||
+            vk == VK_LWIN || vk == VK_RWIN) {
+            return 0;
+        }
+        if (vk == VK_ESCAPE || vk == VK_DELETE || vk == VK_BACK) {
+            binds[(size_t)sel].cur.clear();
+            KeysFillList();
+            SetWindowTextW(s_keysHint, L"已清空这个功能的快捷键。");
+            return 0;
+        }
+        BYTE mods = 0;
+        if (GetKeyState(VK_CONTROL) & 0x8000) mods |= MOD_CONTROL;
+        if (GetKeyState(VK_MENU) & 0x8000)    mods |= MOD_ALT;
+        if (GetKeyState(VK_SHIFT) & 0x8000)   mods |= MOD_SHIFT;
+        /* 没按修饰键时，F1~F24 与功能键（PrintScreen 等）可以单独用；
+         * 普通字母数字不加修饰会抢走正文里的输入，强制要求带 Ctrl/Alt。 */
+        bool isFn = (vk >= VK_F1 && vk <= VK_F24);
+        if (mods == 0 && !isFn) {
+            SetWindowTextW(s_keysHint, L"普通按键请加上 Ctrl 或 Alt（否则打字时会误触发）。");
+            return 0;
+        }
+        binds[(size_t)sel].cur = KeysFormat((BYTE)vk, mods);
+        KeysFillList();
+        SetWindowTextW(s_keysHint, L"按「确定」保存，按「恢复默认」全部还原。");
+        return 0;
+    }
+    return DefSubclassProc(h, m, w, l);
+}
+
+static LRESULT CALLBACK KeysBoxProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    switch (m) {
+    case WM_CREATE: {
+        CreateWindowExW(0, L"STATIC",
+                        L"点一行，然后直接按下想要的新组合键。Esc 或 Delete = 清空这条。",
+                        WS_CHILD | WS_VISIBLE, S(14), S(10), S(520), S(20), h, nullptr, nullptr, nullptr);
+        s_keysList = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX",
+                                     L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL |
+                                     LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
+                                     S(14), S(34), S(520), S(360), h, (HMENU)1, nullptr, nullptr);
+        SetWindowSubclass(s_keysList, KeysListSub, 1, 0);
+        s_keysHint = CreateWindowExW(0, L"STATIC", L"",
+                                     WS_CHILD | WS_VISIBLE, S(14), S(400), S(520), S(20),
+                                     h, (HMENU)5, nullptr, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"确定", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                        S(268), S(426), S(84), S(28), h, (HMENU)2, nullptr, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"恢复默认", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                        S(360), S(426), S(100), S(28), h, (HMENU)3, nullptr, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                        S(468), S(426), S(66), S(28), h, (HMENU)4, nullptr, nullptr);
+        KeysFillList();
+        return 0;
+    }
+    case WM_COMMAND:
+        if (LOWORD(w) == 2) {
+            KeysSave();
+            UiRebuildAccel();
+            DestroyWindow(h);
+            return 0;
+        }
+        if (LOWORD(w) == 3) {
+            /* 恢复默认：把每条 cur 填回 def，不清空表 */
+            std::vector<KeyBind>& binds = KeyBinds();
+            for (size_t i = 0; i < binds.size(); i++) binds[i].cur = binds[i].def;
+            KeysFillList();
+            SetWindowTextW(s_keysHint, L"已恢复默认，点「确定」保存。");
+            return 0;
+        }
+        if (LOWORD(w) == 4) { DestroyWindow(h); return 0; }
+        break;
+    case WM_CLOSE:
+        DestroyWindow(h);
+        return 0;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+/* 快捷键设置对话框（菜单 阅读 → 快捷键设置 / Ctrl+F12）。
+ * 改完立刻存 ini 并换加速键表 —— 不做"确定/取消"两套状态备份，
+ * 因为一旦用户看到"确定"，就会以为不点确定也能用；干脆就一个「确定」。 */
+void UiKeysDialog()
+{
+    HINSTANCE inst = (HINSTANCE)GetWindowLongPtrW(g_hMain, GWLP_HINSTANCE);
+    const wchar_t* kCls = L"NRKeysBox";
+    static bool s_reg = false;
+    if (!s_reg) {
+        WNDCLASSEXW wc;
+        ZeroMemory(&wc, sizeof(wc));
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = KeysBoxProc;
+        wc.hInstance = inst;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.lpszClassName = kCls;
+        if (!RegisterClassExW(&wc)) return;
+        s_reg = true;
+    }
+    RECT pr;
+    GetWindowRect(g_hMain, &pr);
+    int w = S(560), hgt = S(500);
+    int x = pr.left + ((pr.right - pr.left) - w) / 2;
+    int y = pr.top + ((pr.bottom - pr.top) - hgt) / 2;
+    HWND box = CreateWindowExW(WS_EX_DLGMODALFRAME, kCls, L"快捷键设置",
+                               WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+                               x, y, w, hgt, g_hMain, nullptr, inst, nullptr);
+    if (!box) return;
+    EnableWindow(g_hMain, FALSE);
+    MSG msg;
+    while (IsWindow(box) && GetMessageW(&msg, nullptr, 0, 0)) {
+        if (!IsDialogMessageW(box, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    EnableWindow(g_hMain, TRUE);
+    SetForegroundWindow(g_hMain);
+}
+
+/* ---------------- 排版（每本书独立） ---------------- */
+
+/* 排版设置改完的统一出口：存盘 → 让 view 重算度量 → 重画 → 状态栏提示。
+ * 参数 relayout 表示"段落换行结果会变"（字号、字体、栏宽、首行缩进、页边距都算），
+ * 这时必须让 view 把每段的行数缓存全部作废；只改页面模式（分页开关）时行数不变，
+ * 传 false 可以省掉一次全书重排 —— 8000 章的书重排要几百毫秒，能省就省。 */
+void UiLayoutChanged(bool relayout)
+{
+    if (!g_book.Ok()) return;
+    LayoutSave(g_book.path);
+    ViewMetricsChanged(relayout);
+    ViewInvalidate();
+    UiUpdateStatus();
+}
+
+
+
+/* 首行缩进开关（中文小说习惯缩两格，英文/技术书不缩） */
+static void LayoutToggleIndent()
+{
+    g_lay.indent = g_lay.indent ? 0 : 1;
+    s_statusExtra = g_lay.indent ? L"首行缩进：开" : L"首行缩进：关";
+    UiLayoutChanged(true);
+}
+
+/* 分页模式开关。
+ * 关掉分页时必须顺带把双栏收成单栏：双栏靠"一屏两栏"来排，连续滚动时两栏的
+ * 位置没法同步（左栏滚到一半，右栏该显示哪一段？），所以双栏本来就强制分页。 */
+static void LayoutTogglePaged()
+{
+    g_lay.paged = g_lay.paged ? 0 : 1;
+    if (!g_lay.paged && g_lay.cols >= 2) g_lay.cols = 1;
+    s_statusExtra = g_lay.paged ? L"分页模式：开" : L"分页模式：关";
+    UiLayoutChanged(true);
+}
+
+/* 双栏开关：开双栏自动打开分页（理由同上） */
+static void LayoutToggleCols()
+{
+    if (g_lay.cols >= 2) {
+        g_lay.cols = 1;
+        s_statusExtra = L"单栏";
+    } else {
+        g_lay.cols = 2;
+        g_lay.paged = 1;
+        s_statusExtra = L"双栏（自动开启分页）";
+    }
+    UiLayoutChanged(true);
+}
+
+/* "强制字体"：忽略每本书自己的字体，统一用全局字体。
+ * 用途：有些人给某本书设了仿宋，后来机器上卸了这个字体，每次打开都退回雅黑；
+ * 打开强制字体就不用逐本去改。 */
+static void LayoutToggleForceFont()
+{
+    g_lay.forceFont = g_lay.forceFont ? 0 : 1;
+    s_statusExtra = g_lay.forceFont ? L"强制使用全局字体" : L"使用本书字体";
+    UiLayoutChanged(true);
+}
+
+/* 恢复本书排版默认值：字号/行距/字体回到全局默认，其余回出厂值 */
+static void LayoutReset()
+{
+    LayoutFromSettings();
+    s_statusExtra = L"本书排版已恢复默认";
+    UiLayoutChanged(true);
+}
+
+/* ---------------- 隐私与老板键 ---------------- */
+
+/* 标题栏 / 顶栏 / 状态栏显示的"书名"要不要真的显示。
+ * 隐私模式下统一显示这个占位词：别人从任务栏、截图、甚至 Alt+Tab 预览里
+ * 都看不出你在读什么书。 */
+std::wstring UiDisplayTitle()
+{
+    if (!g_book.Ok()) return L"小说阅读器";
+    if (g_set.privacy) return L"文档";
+    return g_book.title;
+}
+
+/* 按当前状态刷标题栏。开书、关书、切隐私模式都调它，避免三处各写一份拼串逻辑。 */
+static void ApplyWindowTitle()
+{
+    std::wstring cap;
+    if (!g_book.Ok()) cap = L"小说阅读器";
+    else cap = L"小说阅读器 - " + UiDisplayTitle();
+    SetWindowTextW(g_hMain, cap.c_str());
+}
+
+/* 隐私模式开关：只影响"显示"，不影响任何读写 —— 书还是那本书，进度照存。 */
+void UiTogglePrivacy()
+{
+    g_set.privacy = g_set.privacy ? 0 : 1;
+    SettingsSave();
+    ApplyWindowTitle();
+    UiLayout();          /* 顶栏要重画（书名变了） */
+    UiUpdateStatus();
+    s_statusExtra = g_set.privacy ? L"隐私模式：开（标题已隐藏）" : L"隐私模式：关";
+    UiUpdateStatus();
+}
+
+/* 注册/重新注册老板键。
+ * 老板键只能用 RegisterHotKey 实现：程序被隐藏、没有焦点时也要能把窗口叫回来，
+ * 而普通键盘消息只在有焦点时到窗口。
+ * 注册失败（被别的程序占了同一个组合）不算错误流程，只记下来在对话框里提示。 */
+static bool s_bossOk = false;
+void UiApplyBossKey()
+{
+    UnregisterHotKey(g_hMain, 1);
+    s_bossOk = false;
+    BYTE vk = 0, mods = 0;
+    if (!KeysParse(g_set.bossKey, &vk, &mods)) return;
+    /* RegisterHotKey 用的是 MOD_* 那一套，和 KeysParse 输出的正好一致 */
+    s_bossOk = RegisterHotKey(g_hMain, 1, (UINT)mods, (UINT)vk) != FALSE;
+    /* 注册失败不弹框（启动阶段用户只想看书），只在状态栏挂一句后缀；
+     * 真正要看这个结果的时机是用户刚改完老板键，那时状态栏正好就在眼前。 */
+    if (!s_bossOk && g_hMain && g_book.Ok()) {
+        s_statusExtra = L"老板键注册失败（可能被别的程序占用）";
+        UiUpdateStatus();
+    }
+}
+
+/* 老板键：把窗口藏起来 / 叫回来。
+ * 只 ShowWindow 不 DestroyWindow：藏起来时程序还在后台跑，阅读位置照常记忆，
+ * 再按一次（或点任务栏图标）就回来。 */
+void UiToggleBoss()
+{
+    if (!g_hMain) return;
+    if (IsWindowVisible(g_hMain)) {
+        ShowWindow(g_hMain, SW_HIDE);
+    } else {
+        ShowWindow(g_hMain, SW_SHOW);
+        if (IsIconic(g_hMain)) ShowWindow(g_hMain, SW_RESTORE);
+        SetForegroundWindow(g_hMain);
+    }
+}
+
 /* ---------------- 外观：字体 / 配色 ---------------- */
 
 /* 选择正文字体：直接借系统字体对话框（ChooseFontW）。
@@ -1507,10 +2190,10 @@ void UiPickFont()
 {
     LOGFONTW lf;
     ZeroMemory(&lf, sizeof(lf));
-    lf.lfHeight = -MulDiv(g_set.fontPt, g_dpi, 72);
+    lf.lfHeight = -MulDiv(g_lay.fontPt, g_dpi, 72);
     lf.lfWeight = FW_NORMAL;
     lf.lfCharSet = DEFAULT_CHARSET;
-    lstrcpynW(lf.lfFaceName, g_set.fontFace.empty() ? L"Microsoft YaHei" : g_set.fontFace.c_str(), LF_FACESIZE);
+    lstrcpynW(lf.lfFaceName, g_lay.fontFace.empty() ? L"Microsoft YaHei" : g_lay.fontFace.c_str(), LF_FACESIZE);
 
     CHOOSEFONTW cf;
     ZeroMemory(&cf, sizeof(cf));
@@ -1524,11 +2207,17 @@ void UiPickFont()
     cf.Flags = CF_SCREENFONTS | CF_INITTOLOGFONTSTRUCT | CF_NOSTYLESEL | CF_NOSCRIPTSEL;
     if (!ChooseFontW(&cf)) return;
 
+    g_lay.fontFace = lf.lfFaceName;
+    /* 1.6.0：字体是"每本书"的设置。同时更新会话默认值，下一本新书能用上；
+     * 若这本书开了"强制字体"，那么改字体同时把强制关掉 —— 否则用户选了字体却
+     * 看不出变化，会以为功能坏了。 */
+    g_lay.forceFont = 0;
     g_set.fontFace = lf.lfFaceName;
     SettingsSave();          /* 立刻落盘：换字体是"设置"，不该等到关窗口才存 */
+    if (g_book.Ok()) LayoutSave(g_book.path);
     ViewMetricsChanged(true);   /* 字体变了：行高、换行位置全部重算（传 true 让段落行数缓存作废） */
     ViewInvalidate();
-    s_statusExtra = std::wstring(L"字体：") + g_set.fontFace;
+    s_statusExtra = std::wstring(L"字体：") + g_lay.fontFace;
     UiUpdateStatus();
 }
 
@@ -1828,6 +2517,12 @@ void UiOpenFile(const std::wstring& path)
     g_book.paraOff.swap(nb.paraOff);
     g_book.chapters.swap(nb.chapters);
 
+    /* 1.6.0：先把这本书自己的排版和高亮读进来，再让视图建书。
+     * 顺序不能反 —— ViewSetBook 之后会算度量、排首屏，那时 g_lay 必须已经是
+     * "这本书的设置"，否则第一屏会用上一本书的字号/栏数画出来再跳一次。 */
+    LayoutLoad(path);
+    HighlightLoad(path);
+
     ClearSearchState();
     ViewSetBook();
     FillToc();
@@ -1839,7 +2534,7 @@ void UiOpenFile(const std::wstring& path)
     else ViewGotoOffset(0, 0);
 
     std::wstring cap = L"小说阅读器 - ";
-    cap += g_book.title;
+    cap += UiDisplayTitle();
     SetWindowTextW(g_hMain, cap.c_str());
 
     RecentAdd(path);
@@ -1875,6 +2570,10 @@ void UiCloseFile()
     if (!g_book.Ok()) return;
     UiAutoStop();
     UiSaveProgress();
+    /* 1.6.0：把这本书的排版与高亮落盘（进度已经在上面 UiSaveProgress 存过）。
+     * 必须在清空 g_book.path 之前 —— 段名是用路径算出来的。 */
+    LayoutSave(g_book.path);
+    HighlightSave(g_book.path);
 
     /* swap 空对象 = 真正释放内存（clear 不保证还容量） */
     std::wstring().swap(g_book.text);
@@ -1886,6 +2585,10 @@ void UiCloseFile()
      * （ini 里的书签本身不动，下次打开这本书会重新读回来） */
     std::vector<std::wstring>().swap(s_bms);
     g_bmParas.clear();
+    /* 高亮同理：偏移是那本书的坐标，留着会在下一本书里画到毫不相干的位置 */
+    std::vector<Highlight>().swap(g_hls);
+    /* 排版回默认值：回书架后顶栏/标题不该还挂着上一本书的字号设置 */
+    LayoutFromSettings();
 
     ClearSearchState();
     ViewSetBook();
@@ -3018,6 +3721,37 @@ static HMENU BuildMenu()
     AppendMenuW(bm, MF_STRING, IDM_BM_DEL,  L"删除此段书签");
     AppendMenuW(r, MF_POPUP, (UINT_PTR)bm, L"书签(&M)");
 
+    /* 高亮与笔记子菜单（1.6.0）：标 4 种颜色、写笔记、看列表、导出。
+     * 颜色不做成"先选颜色再标"的两步，而是一键一色 —— 读到好句子时手边动作越少越好。 */
+    HMENU hl = CreatePopupMenu();
+    AppendMenuW(hl, MF_STRING, IDM_HL_COLOR_BASE + 0, L"黄色高亮\tCtrl+H");
+    AppendMenuW(hl, MF_STRING, IDM_HL_COLOR_BASE + 1, L"绿色高亮");
+    AppendMenuW(hl, MF_STRING, IDM_HL_COLOR_BASE + 2, L"蓝色高亮");
+    AppendMenuW(hl, MF_STRING, IDM_HL_COLOR_BASE + 3, L"粉色高亮");
+    AppendMenuW(hl, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(hl, MF_STRING, IDM_HL_NOTE, L"写笔记...\tCtrl+Shift+N");
+    AppendMenuW(hl, MF_STRING, IDM_HL_LIST, L"高亮与笔记列表\tCtrl+L");
+    AppendMenuW(hl, MF_STRING, IDM_HL_DEL,  L"删除此处高亮\tCtrl+Shift+X");
+    AppendMenuW(hl, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(hl, MF_STRING, IDM_HL_EXPORT, L"导出笔记为 Markdown...");
+    AppendMenuW(r, MF_POPUP, (UINT_PTR)hl, L"高亮与笔记(&H)");
+
+    /* 排版子菜单（1.6.0）：每本书一份，所以菜单里不写"全局"字样 */
+    HMENU lay = CreatePopupMenu();
+    HMENU mg = CreatePopupMenu();
+    AppendMenuW(mg, MF_STRING, IDM_LAY_MARGIN_BASE + 0, L"窄");
+    AppendMenuW(mg, MF_STRING, IDM_LAY_MARGIN_BASE + 1, L"标准");
+    AppendMenuW(mg, MF_STRING, IDM_LAY_MARGIN_BASE + 2, L"宽");
+    AppendMenuW(lay, MF_POPUP, (UINT_PTR)mg, L"页边距");
+    AppendMenuW(lay, MF_STRING, IDM_LAY_INDENT, L"首行缩进两字\tCtrl+Shift+I");
+    AppendMenuW(lay, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(lay, MF_STRING, IDM_LAY_PAGED, L"分页模式\tCtrl+Shift+P");
+    AppendMenuW(lay, MF_STRING, IDM_LAY_COLS,  L"双栏显示\tCtrl+Shift+C");
+    AppendMenuW(lay, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(lay, MF_STRING, IDM_LAY_FORCE_FONT, L"强制使用全局字体");
+    AppendMenuW(lay, MF_STRING, IDM_LAY_RESET, L"恢复本书排版默认值");
+    AppendMenuW(r, MF_POPUP, (UINT_PTR)lay, L"排版(&L)");
+
     /* 外观子菜单：字体 / 导入字体 / 自定义配色 / 预设方案。
      * 预设放在二级子菜单里，是因为一共五套，平铺会把「阅读」菜单撑得太长。 */
     HMENU look = CreatePopupMenu();
@@ -3048,6 +3782,12 @@ static HMENU BuildMenu()
     AppendMenuW(hp, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(hp, MF_STRING, IDM_PHONE, L"手机阅读（局域网）(&P)...\tCtrl+G");
     AppendMenuW(hp, MF_STRING, IDM_PHONE_JUMP, L"跳到手机读到的位置\tCtrl+Shift+G");
+    AppendMenuW(hp, MF_SEPARATOR, 0, nullptr);
+    /* 1.6.0：隐私与老板键。放在帮助菜单里是因为它们属于"环境设置"，
+     * 和阅读/排版不是一类；但都是随时要能按到的东西，所以放最显眼的位置。 */
+    AppendMenuW(hp, MF_STRING, IDM_KEYS_EDIT, L"快捷键设置(&K)...\tCtrl+F12");
+    AppendMenuW(hp, MF_STRING, IDM_PRIVACY, L"隐私模式（隐藏书名）\tCtrl+Shift+H");
+    AppendMenuW(hp, MF_STRING, IDM_BOSS, L"立即隐藏 / 唤回窗口\tCtrl+Alt+H");
     AppendMenuW(hp, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(hp, MF_STRING, IDM_KEYS, L"快捷键说明");
     AppendMenuW(hp, MF_STRING, IDM_ABOUT, L"关于");
@@ -3187,29 +3927,44 @@ static void SaveAll()
  * 夹取到 9~42 磅：再小没法读，再大一行放不下几个字，排版会退化。
  * 夹取后若与原值相同就直接返回 —— 避免到顶了还每次重排一遍全书，大书重排
  * 是毫秒到几十毫秒级的开销，按键连击时很浪费。
- * ViewMetricsChanged(true)：true 表示「换行会变」，必须作废所有段落的行数缓存；
- * 这和只换主题（传 false）是两回事，别传错。
+ *
+ * 1.6.0：字号是"每本书"的（g_lay.fontPt），改完落进这本书的 ini 段，同时更新
+ * 会话默认值（g_set.fontPt），这样下一本新书继承的是你最近用过的字号，而不是
+ * 出厂值。没有打开书时就直接改默认值 —— 在书架上按 Ctrl+= 也要有反应。
  */
 void UiSetFontDelta(int d)
 {
-    int f = g_set.fontPt + d;
+    int f = g_lay.fontPt + d;
     if (f < 9) f = 9;
     if (f > 42) f = 42;
-    if (f == g_set.fontPt) return;
+    if (f == g_lay.fontPt) return;
+    g_lay.fontPt = f;
     g_set.fontPt = f;
+    IniSetInt(L"settings", L"fontPt", f);
+    if (g_book.Ok()) {
+        LayoutSave(g_book.path);
+    }
+    wchar_t msg[48];
+    wsprintfW(msg, L"字号 %d 磅", f);
+    s_statusExtra = msg;
     ViewMetricsChanged(true);
-    IniSetInt(L"settings", L"fontPt", g_set.fontPt);
+    UiUpdateStatus();
 }
 
 /* 行距在 紧凑 → 标准 → 宽松 之间循环（0/1/2，对应 view.cpp 的 kSpacing[]）。
  * 取模 3 保证永远落在 0..2，不用写 if 分支；行距一变换行位置也变，
- * 所以 ViewMetricsChanged(true)。
- */
+ * 所以 ViewMetricsChanged(true)。1.6.0 起同样是"每本书"的设置。 */
 void UiCycleSpacing()
 {
-    g_set.spacing = (g_set.spacing + 1) % 3;
+    g_lay.spacing = (g_lay.spacing + 1) % 3;
+    g_set.spacing = g_lay.spacing;
+    IniSetInt(L"settings", L"spacing", g_lay.spacing);
+    if (g_book.Ok()) LayoutSave(g_book.path);
+    /* 状态栏顺带告诉用户现在是哪一档，省得靠肉眼比行距 */
+    static const wchar_t* kName[] = { L"行距：紧凑", L"行距：标准", L"行距：宽松" };
+    s_statusExtra = kName[g_lay.spacing];
     ViewMetricsChanged(true);
-    IniSetInt(L"settings", L"spacing", g_set.spacing);
+    UiUpdateStatus();
 }
 
 /* 日间 / 夜间配色切换（F2）。
@@ -3417,6 +4172,22 @@ static void OnCommand(int id, int code, HWND ctl)
         UiApplyPreset(id - IDM_PRESET_BASE);
         return;
     }
+    /* 高亮四色：IDM_HL_COLOR_BASE..+3 连号，颜色序号 = id 偏移。
+     * 单独成区间而不是四个 case，是为了以后加第 5、第 6 种颜色时只改 ids.h 和
+     * view.cpp 的调色板，这里一个字都不用动。 */
+    if (id >= IDM_HL_COLOR_BASE && id < IDM_HL_COLOR_BASE + IDM_HL_COLOR_MAX) {
+        s_lastHlColor = id - IDM_HL_COLOR_BASE;
+        UiAddHighlight(s_lastHlColor);
+        return;
+    }
+    /* 页边距三档：同样连号 */
+    if (id >= IDM_LAY_MARGIN_BASE && id < IDM_LAY_MARGIN_BASE + IDM_LAY_MARGIN_MAX) {
+        g_lay.margin = id - IDM_LAY_MARGIN_BASE;
+        static const wchar_t* kM[] = { L"页边距：窄", L"页边距：标准", L"页边距：宽" };
+        s_statusExtra = kM[g_lay.margin];
+        UiLayoutChanged(true);
+        return;
+    }
     switch (id) {
     case IDM_OPEN: {
         std::wstring p = OpenDlg();
@@ -3475,6 +4246,27 @@ static void OnCommand(int id, int code, HWND ctl)
     case IDM_IMPORT_FONT: UiImportFont(); break;
     case IDM_PICK_COLORS: UiPickColors(); break;
 
+    /* ---- 1.6.0 新增：高亮与笔记 ---- */
+    /* IDM_HL_ADD 是"用上次用过的颜色快速标一条"（快捷键 Ctrl+H），
+     * 连着标十句时不该每句都重新挑颜色。 */
+    case IDM_HL_ADD:      UiAddHighlight(s_lastHlColor); break;
+    case IDM_HL_NOTE:     UiEditNote(); break;
+    case IDM_HL_LIST:     UiShowHighlights(); break;
+    case IDM_HL_DEL:      UiRemoveHighlight(); break;
+    case IDM_HL_EXPORT:   UiExportNotes(); break;
+
+    /* ---- 1.6.0 新增：排版（每本书） ---- */
+    case IDM_LAY_INDENT:     LayoutToggleIndent(); break;
+    case IDM_LAY_PAGED:      LayoutTogglePaged(); break;
+    case IDM_LAY_COLS:       LayoutToggleCols(); break;
+    case IDM_LAY_FORCE_FONT: LayoutToggleForceFont(); break;
+    case IDM_LAY_RESET:      LayoutReset(); break;
+
+    /* ---- 1.6.0 新增：快捷键 / 隐私 / 老板键 ---- */
+    case IDM_KEYS_EDIT:  UiKeysDialog(); break;
+    case IDM_PRIVACY:    UiTogglePrivacy(); break;
+    case IDM_BOSS:       UiToggleBoss(); break;
+
     case IDC_TOC:
         if (code == LBN_SELCHANGE && !s_tocSync && g_book.Ok()) {            int sel = (int)SendMessageW(s_hToc, LB_GETCURSEL, 0, 0);
             if (sel >= 0 && sel < (int)g_book.chapters.size()) {
@@ -3486,7 +4278,7 @@ static void OnCommand(int id, int code, HWND ctl)
     case IDC_HITS:
         if (code == LBN_SELCHANGE && !s_hitSync) {
             int sel = (int)SendMessageW(s_hHits, LB_GETCURSEL, 0, 0);
-            /* 这个 LISTBOX 是两个面板共用的：s_panel==2 时它显示书签，其余显示搜索结果。
+            /* 这个 LISTBOX 是三个面板共用的：s_panel==1 搜索结果、2 书签、3 高亮与笔记。
              * 所以点击后的动作要按当前面板分开处理，否则点书签会去查搜索结果数组。 */
             if (s_panel == 2) {
                 if (sel >= 0 && sel < (int)s_bms.size()) {
@@ -3495,6 +4287,14 @@ static void OnCommand(int id, int code, HWND ctl)
                         ViewGotoOffset(off, 0);
                         UiUpdateStatus();
                     }
+                }
+            } else if (s_panel == 3) {
+                /* 高亮条目同样是 "偏移|文字"，直接反解偏移跳过去；
+                 * 顺便把这一条高亮选中（ViewSelectRange），读者一眼看到是哪一段。 */
+                if (sel >= 0 && sel < (int)g_hls.size()) {
+                    const Highlight& h = g_hls[(size_t)sel];
+                    ViewSelectRange(h.off, h.off + h.len);
+                    UiUpdateStatus();
                 }
             } else if (sel >= 0 && sel < (int)s_hits.size()) {
                 UiJumpHit(sel);
@@ -3632,9 +4432,11 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l)
 
             if (dis->itemID != (UINT)-1) {
                 std::wstring text = ListText(dis->hwndItem, (int)dis->itemID);
+                /* 搜索结果条目较长、属于"辅助信息"，用次要色；
+                 * 书签与高亮是用户自己存下来的东西，用正文色更清楚。 */
                 DrawListRow(dis->hDC, dis->rcItem, text,
                             (dis->itemState & ODS_SELECTED) != 0,
-                            dis->CtlID == IDC_HITS);   /* 命中/书签条目用次要色，章节名用正文色 */
+                            dis->CtlID == IDC_HITS && s_panel == 1);
             }
             return TRUE;
         }
@@ -3752,6 +4554,15 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l)
         return TRUE;
     }
 
+    case WM_HOTKEY:
+        /* 老板键（默认 Ctrl+Alt+H）：这是唯一能在程序没有焦点时收到消息的途径，
+         * 所以窗口藏起来之后只有它能叫回来。wParam 是注册时给的 id（我们只用 1）。 */
+        if (w == 1) {
+            UiToggleBoss();
+            return 0;
+        }
+        break;
+
     case WM_SETFOCUS:
         ViewFocus();
         return 0;
@@ -3779,35 +4590,57 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l)
  * 操作输入框文本。同理 Ctrl+滚轮调字号做在 view 的 WM_MOUSEWHEEL 里，也不进这张表。
  * 返回值：加速键表句柄，失败为 nullptr（调用方需判空）；本程序退出时由系统回收。
  */
+/* 从快捷键表（layout.cpp 的 KeyBinds）生成加速键表。
+ *
+ * 1.6.0 起快捷键可自定义：表内容来自 ini 的 [keys] 段，用户在「快捷键设置」里
+ * 改完就调 UiRebuildAccel() 重新生成 —— 所以不能再像以前那样写一个静态数组。
+ * 另外补几条**不允许自定义**的固定键（重载、上一个搜索命中），它们要么是系统
+ * 惯例，要么改了会跟别的功能打架，干脆不进设置界面。
+ *
+ * 设计说明（沿用旧注释，仍然成立）：
+ *  - Ctrl+C / Ctrl+A 故意不在这张表里。加速键是在消息派发之前拦截按键的，一旦登记，
+ *    EDIT（搜索框）自己的 Ctrl+C 复制、Ctrl+A 全选就永远收不到，会变成「在搜索框里
+ *    按 Ctrl+A 结果把整本书选中了」。这两个键交给当前有焦点的窗口自己处理。
+ *  - 解析失败的条目直接跳过：ini 是文本文件，用户手改成 "Ctrl+随便" 时不至于
+ *    整张表都建不出来，只是那一条失效。
+ * 返回值：加速键表句柄，失败为 nullptr（调用方需判空）。 */
 static HACCEL BuildAccel()
 {
-    ACCEL a[] = {
-        { FVIRTKEY | FCONTROL,             'O',         IDM_OPEN },
-        { FVIRTKEY | FCONTROL,             'W',         IDM_CLOSEFILE },
-        { FVIRTKEY | FCONTROL,             'F',         IDM_FIND },
-        { FVIRTKEY | FCONTROL,             'T',         IDM_TOC },
-        { FVIRTKEY | FCONTROL,             'D',         IDM_BM_ADD },
-        { FVIRTKEY | FCONTROL,             'B',         IDM_BM_LIST },
-        { FVIRTKEY | FCONTROL,             'U',         IDM_OPEN_URL },
-        { FVIRTKEY | FCONTROL,             'S',         IDM_SOURCE },
-        { FVIRTKEY | FCONTROL,             'G',         IDM_PHONE },
-        { FVIRTKEY | FCONTROL | FSHIFT,    'G',         IDM_PHONE_JUMP },
-        /* 界面上没有菜单栏了，键盘用户要有办法把整个菜单召唤出来：
-         * Ctrl+F10 是 Windows 上的惯例（很多应用里它就是"打开右键菜单"）。 */
-        { FVIRTKEY | FCONTROL,             VK_F10,      IDM_MENU },
-        { FVIRTKEY,                        VK_F2,       IDM_THEME },
-        { FVIRTKEY,                        VK_F3,       IDM_FIND_NEXT },
-        { FVIRTKEY,                        VK_F5,       IDM_RELOAD },
-        { FVIRTKEY,                        VK_F6,       IDM_AUTO_TOGGLE },
-        { FVIRTKEY,                        VK_F7,       IDM_AUTO_SLOW },
-        { FVIRTKEY,                        VK_F8,       IDM_AUTO_FAST },
-        { FVIRTKEY,                        VK_F9,       IDM_PDF_MODE },
-        { FVIRTKEY | FCONTROL,             VK_OEM_PLUS, IDM_FONT_UP },
-        { FVIRTKEY | FCONTROL,             VK_ADD,      IDM_FONT_UP },
-        { FVIRTKEY | FCONTROL,             VK_OEM_MINUS, IDM_FONT_DOWN },
-        { FVIRTKEY | FCONTROL,             VK_SUBTRACT, IDM_FONT_DOWN },
-    };
-    return CreateAcceleratorTableW(a, (int)(sizeof(a) / sizeof(a[0])));
+    std::vector<ACCEL> a;
+    std::vector<KeyBind>& binds = KeyBinds();
+    for (size_t i = 0; i < binds.size(); i++) {
+        if (binds[i].cur.empty()) continue;      /* 用户取消了这个快捷键 */
+        BYTE vk = 0, mods = 0;
+        if (!KeysParse(binds[i].cur, &vk, &mods)) continue;
+        ACCEL ac;
+        ZeroMemory(&ac, sizeof(ac));
+        /* 加速键表用的是 FCONTROL/FALT/FSHIFT 这套位，和 MOD_* 不是同一套值，
+         * 必须逐位翻译一遍（直接或运算会因为数值撞上而出错）。 */
+        ac.fVirt = FVIRTKEY;
+        if (mods & MOD_CONTROL) ac.fVirt |= FCONTROL;
+        if (mods & MOD_ALT)     ac.fVirt |= FALT;
+        if (mods & MOD_SHIFT)   ac.fVirt |= FSHIFT;
+        ac.key = vk;
+        ac.cmd = (WORD)binds[i].id;
+        a.push_back(ac);
+    }
+    /* 固定键：重载（F5）和"上一个命中"（Shift+F3），不进设置界面 */
+    {
+        ACCEL ac; ZeroMemory(&ac, sizeof(ac));
+        ac.fVirt = FVIRTKEY; ac.key = VK_F5; ac.cmd = IDM_RELOAD;
+        bool dup = false;
+        for (size_t i = 0; i < a.size(); i++) if (a[i].cmd == IDM_RELOAD) dup = true;
+        if (!dup) a.push_back(ac);
+    }
+    {
+        ACCEL ac; ZeroMemory(&ac, sizeof(ac));
+        ac.fVirt = FVIRTKEY | FSHIFT; ac.key = VK_F3; ac.cmd = IDM_FIND_PREV;
+        bool dup = false;
+        for (size_t i = 0; i < a.size(); i++) if (a[i].cmd == IDM_FIND_PREV) dup = true;
+        if (!dup) a.push_back(ac);
+    }
+    if (a.empty()) return nullptr;
+    return CreateAcceleratorTableW(&a[0], (int)a.size());
 }
 
 /* 返回值给 wWinMain 决定「启动时打开哪本书」：非空串就是命令行给出的文件，
@@ -3911,6 +4744,15 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdLine, int)
      * 也有东西可改），书源管理打开时列表也立刻是齐的。 */
     SourceLoad();
 
+    /* 1.6.0：排版、快捷键、老板键也都在这里初始化。
+     * LayoutFromSettings() 先把 g_lay 铺成"新书默认值"（还没开书时书架/欢迎页也用这套）；
+     * 打开书之后 UiOpenFile 里的 LayoutLoad 会用这本书自己的设置覆盖它。
+     * KeysLoad 必须早于 UiRebuildAccel —— 表里要用的就是 ini 里的键位。 */
+    LayoutFromSettings();
+    KeysLoad();
+    UiRebuildAccel();
+    UiApplyBossKey();     /* 老板键是全局热键，注册失败也不影响主流程 */
+
     /* 状态栏属于通用控件，必须先 InitCommonControlsEx 才能 CreateWindowExW 成功 */
     INITCOMMONCONTROLSEX icc;
     icc.dwSize = sizeof(icc);
@@ -3978,8 +4820,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdLine, int)
     AutoSyncMenu();
     UiLayout();
 
-    HACCEL acc = BuildAccel();
-
     ShowWindow(g_hMain, SW_SHOW);
     UpdateWindow(g_hMain);
     UiUpdateStatus();
@@ -4002,7 +4842,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdLine, int)
      */
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
-        if (acc && TranslateAcceleratorW(g_hMain, acc, &msg)) continue;
+        /* 每轮都问一次当前加速键表：用户改了快捷键会重建表（UiRebuildAccel），
+         * 本地变量 acc 会变成旧表的悬空句柄，所以不能缓存。 */
+        HACCEL cur = UiAccelHandle();
+        if (cur && TranslateAcceleratorW(g_hMain, cur, &msg)) continue;
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
