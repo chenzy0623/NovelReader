@@ -127,14 +127,18 @@ final class PeerServer implements Runnable {
         }
 
         if (path.startsWith("/peer/progress") && "POST".equals(method)) {
-            byte[] body = new byte[contentLength];
+            /* 必须从 in 里读：BufferedReader 为了找换行已经把 body 一起读进它自己的
+             * 缓冲区了，再从 s.getInputStream() 读原始流只会读到 0 字节 ——
+             * 原来这里就是这样：电脑推过来的进度全丢、永远回 400。 */
+            StringBuilder sb = new StringBuilder();
             int got = 0;
             while (got < contentLength) {
-                int n = s.getInputStream().read(body, got, contentLength - got);
-                if (n <= 0) break;
-                got += n;
+                int ch = in.read();
+                if (ch < 0) break;
+                sb.append((char) ch);
+                got += String.valueOf((char) ch).getBytes("UTF-8").length;
             }
-            String text = new String(body, 0, got, "UTF-8").trim();
+            String text = sb.toString().trim();
             Store.Record r = Store.Record.decode(text);
             if (r == null) {
                 reply(s, 400, "text/plain; charset=utf-8", "bad record\n");

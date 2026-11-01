@@ -286,7 +286,11 @@ static void EnsureFonts()
     std::wstring face = g_lay.forceFont ? g_set.fontFace
                                        : (g_lay.fontFace.empty() ? g_set.fontFace : g_lay.fontFace);
     if (face.empty()) face = L"Microsoft YaHei";
-    if (s_fontN && px == s_fontPx && face == s_fontFace) return;
+    /* 行高也是"度量"的一部分：只比字号/字体名的话，Ctrl+1 切行距会在这里
+     * 提前返回，下面的 s_lineH 永远不重算，行距功能看起来完全失效。 */
+    int sp = g_lay.spacing; if (sp < 0) sp = 0; if (sp > 2) sp = 2;
+    int wantLineH = (int)((-px) * kSpacing[sp] + 0.5f);
+    if (s_fontN && px == s_fontPx && face == s_fontFace && wantLineH == s_lineH) return;
     if (s_fontN) DeleteObject(s_fontN);
     if (s_fontB) DeleteObject(s_fontB);
     LOGFONTW lf;
@@ -308,9 +312,9 @@ static void EnsureFonts()
     s_fontB = CreateFontIndirectW(&lf);
     s_fontPx = px;
     s_fontFace = face;
-    /* 行距档位来自 ini，属于用户可改数据，用前先夹到合法区间，否则 kSpacing[] 会越界读到一个随机系数。 */
-    int sp = g_lay.spacing; if (sp < 0) sp = 0; if (sp > 2) sp = 2;
-    s_lineH = (int)((-px) * kSpacing[sp] + 0.5f);
+    /* 行距档位来自 ini，属于用户可改数据；上面已经夹到合法区间并算好 wantLineH
+     * （否则 kSpacing[] 会越界读到一个随机系数）。 */
+    s_lineH = wantLineH;
     s_paraGap = (int)((-px) * 0.42f + 0.5f);
     s_titleGap = (int)((-px) * 0.85f + 0.5f);
     InvalidCounts();
@@ -773,7 +777,8 @@ static bool ChapterPageInfo(int* cur, int* total)
     if (pEnd > pStart + 4000) pEnd = pStart + 4000;   /* 一章几千段的怪书就别数了 */
 
     int perPage = ViewLinesPerPage();
-    if (TwoColumns()) perPage *= 2;
+    /* 同 ViewScrollPages：ViewLinesPerPage() 已经包含双栏两栏的行数，
+     * 再乘 2 会让"共 m 页"只有实际的一半。 */
     if (perPage < 1) perPage = 1;
 
     int before = 0, lines = 0;
@@ -903,8 +908,9 @@ void ViewScrollPages(int n)
 {
     int cnt = LinesInView(nullptr);
     int step = cnt > 1 ? cnt - 1 : 1;
-    /* 双栏模式下"一页"是两栏，按这个步长才不会只翻半页。 */
-    if (TwoColumns()) step *= 2;
+    /* 这里不能再乘 2：BuildFlow 在双栏时是先填满左栏、接着填右栏，
+     * LinesInView() 返回的已经是"一整页（两栏）"的行数。再乘 2 就是一次翻两页，
+     * 中间整页正文被静默跳过。 */
     ViewScrollLines(n * step);
 }
 
@@ -1848,6 +1854,13 @@ static int HitTestChar(int mx, int my)
     for (size_t i = 0; i < flow.size(); i++) {
         const FlowLine& fl = flow[i];
         if (my < fl.y + s_lineH) {
+            /* 双栏时左右两栏的行 y 相同、x 不同：只按 y 匹配会让右栏的
+             * 点击/拖选/双击全部命中左栏同高度那一行（选错字、复制错内容），
+             * 所以还要校验 x 落在该行所在的栏内。 */
+            if (TwoColumns()) {
+                int leftEdge = fl.x - (fl.firstLine ? IndentW() : 0);
+                if (mx < leftEdge || mx > leftEdge + s_textW) continue;
+            }
             SelectObject(s_dc, fl.title ? s_fontB : s_fontN);
             int maxW = mx - fl.x;
             /* 点在行首左边（含负坐标）：算作行首 */

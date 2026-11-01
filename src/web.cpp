@@ -96,6 +96,33 @@ static std::wstring LinkTextToPlain(const std::wstring& raw)
                 if (ent == L"gt")   { out += L'>'; i = semi; continue; }
                 if (ent == L"quot") { out += L'"'; i = semi; continue; }
                 if (ent == L"#12288") { out += L' '; i = semi; continue; }
+                /* 数字实体：目录页里 &#31532; 这种写法很常见（"第"），
+                 * 原来只认写死的 #12288，其余数字实体原样留着，章节名对不上
+                 * 就被当成非章节整条丢掉 —— 遇到整站这么写的，目录会全空。 */
+                if (!ent.empty() && ent[0] == L'#') {
+                    unsigned long v = 0;
+                    bool ok2 = true;
+                    if (ent.size() > 2 && (ent[1] == L'x' || ent[1] == L'X')) {
+                        for (size_t k = 2; k < ent.size(); k++) {
+                            wchar_t c2 = ent[k];
+                            int d2;
+                            if (c2 >= L'0' && c2 <= L'9') d2 = c2 - L'0';
+                            else if (c2 >= L'a' && c2 <= L'f') d2 = c2 - L'a' + 10;
+                            else if (c2 >= L'A' && c2 <= L'F') d2 = c2 - L'A' + 10;
+                            else { ok2 = false; break; }
+                            v = v * 16 + (unsigned long)d2;
+                        }
+                    } else if (ent.size() > 1) {
+                        for (size_t k = 1; k < ent.size(); k++) {
+                            wchar_t c2 = ent[k];
+                            if (c2 < L'0' || c2 > L'9') { ok2 = false; break; }
+                            v = v * 10 + (unsigned long)(c2 - L'0');
+                        }
+                    } else {
+                        ok2 = false;
+                    }
+                    if (ok2 && v > 0 && v <= 0xFFFF) { out += (wchar_t)v; i = semi; continue; }
+                }
             }
         }
         out += c;
@@ -352,6 +379,17 @@ static bool FetchOnceCurl(const std::wstring& url, std::string& body, std::wstri
     /* -s 静默、-L 跟跳转、--compressed 让 curl 自己解 gzip、-o 落文件。
      * UA 与请求头都照 Chrome 抄：有的站点（例如走 Cloudflare 的）会拿
      * 请求头缺项 + TLS 指纹做机器人判定，头越像浏览器，被拦的概率越低。 */
+    /* 安全：URL 来自网页/剪贴板，是不可信数据。直接拼进命令行时，URL 里一个 `"`
+     * 就能截断参数，把后半段变成新的 curl 参数（例如 -o 写进启动目录 → 任意文件
+     * 写入 / 开机自启）。curl 的 URL 参数没法安全转义引号，所以这里直接拒绝。 */
+    if (url.find_first_of(L"\"\r\n") != std::wstring::npos) {
+        err = L"网址里含有引号或换行，出于安全考虑拒绝抓取。";
+        return false;
+    }
+    if (url.compare(0, 7, L"http://") != 0 && url.compare(0, 8, L"https://") != 0) {
+        err = L"只支持 http:// 或 https:// 开头的网址。";
+        return false;
+    }
     std::wstring cmd = L"\"";
     cmd += curl;
     cmd += L"\" -s -L --compressed --max-time ";

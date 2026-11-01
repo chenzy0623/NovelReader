@@ -247,7 +247,17 @@ static KeyBind kDefBinds[] = {
     { IDM_PRIVACY,     L"隐私模式开关",    L"Ctrl+Shift+H", L"" },
     { IDM_PDF_MODE,    L"PDF 原始版式切换",L"F9",           L"" },
     { IDM_KEYS_EDIT,   L"快捷键设置",      L"Ctrl+F12",     L"" },
+    { IDM_KEYS,        L"快捷键说明",      L"F1",           L"" },
     { IDM_MENU,        L"打开主菜单",      L"Ctrl+F10",     L"" },
+    /* 1.7.0 修复：下面这些命令原来只在菜单文字里写了快捷键，从没登记进这张表，
+     * 于是 BuildAccel() 建不出对应的加速键，按了完全没反应；老板键连"改"都改不了。 */
+    { IDM_BOSS,        L"老板键（隐藏/唤回窗口）", L"Ctrl+Alt+H", L"" },
+    { IDM_OPEN_URL,    L"打开网页小说",    L"Ctrl+U",       L"" },
+    { IDM_SOURCE,      L"书源搜索",        L"Ctrl+S",       L"" },
+    { IDM_PHONE,       L"手机阅读（局域网）", L"Ctrl+G",   L"" },
+    { IDM_PHONE_JUMP,  L"跳到手机读到的位置", L"Ctrl+Shift+G", L"" },
+    { IDM_LAY_INDENT,  L"首行缩进开关",    L"Ctrl+Shift+I", L"" },
+    { IDM_HL_DEL,      L"删除此处高亮",    L"Ctrl+Shift+X", L"" },
 };
 
 /* 表 + 当前值。第一次调用时把 def 填进 cur，之后 KeysLoad 覆盖成 ini 里的值。

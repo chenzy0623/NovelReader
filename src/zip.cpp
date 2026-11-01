@@ -250,15 +250,35 @@ struct OutBuf {
 
     explicit OutBuf(std::string& str) : s(str) {}
 
+    size_t want = 0;   /* 中央目录声明的原始大小（不可信数据） */
+
     void Init(size_t n) {
-        s.assign(n, '\0');
-        cap = n;
+        /* 安全：n 来自 ZIP 中央目录，是不可信数据 —— 一个 108 字节的 ZIP 就能声明
+         * 4 GB，直接 assign 会瞬间吃光内存或抛 std::bad_alloc 把程序打崩。
+         * 这里只做保守预分配（上限 4 MB），真正需要更多时由 Put/CopyBack 按需增长。 */
+        const size_t kPrealloc = 4u * 1024u * 1024u;
+        size_t cap0 = n < kPrealloc ? n : kPrealloc;
+        s.assign(cap0, '\0');
+        cap = cap0;
+        want = n;
         pos = 0;
+    }
+
+    /* 预分配不够时按需增长，但绝不超过中央目录声明的原始大小。 */
+    bool Grow(size_t need) {
+        if (need > want || pos > want - need) return false;
+        size_t newCap = cap ? cap * 2 : 64u * 1024u;
+        if (newCap > want) newCap = want;
+        if (newCap < pos + need) newCap = pos + need;
+        if (newCap <= cap) return false;
+        s.resize(newCap, '\0');
+        cap = newCap;
+        return true;
     }
 
     // 写一个字节；超过预期长度说明压缩数据比声明的长，属于损坏，直接失败。
     bool Put(uint8_t b) {
-        if (pos >= cap) return false;
+        if (pos >= cap && !Grow(1)) return false;
         s[pos++] = (char)b;
         return true;
     }
@@ -268,7 +288,8 @@ struct OutBuf {
     // 那正是"重复重复重复..."这种长串能压到极小的原理。
     bool CopyBack(size_t dist, size_t len) {
         if (dist == 0 || dist > pos) return false;   // 距离越界：非法回溯
-        if (len > cap - pos) return false;           // 输出会超出声明的原始大小
+        if (len > want - pos) return false;          // 输出会超出声明的原始大小
+        if (cap < pos + len && !Grow(len)) return false;
         for (size_t k = 0; k < len; k++) {
             s[pos] = s[pos - dist];
             pos++;

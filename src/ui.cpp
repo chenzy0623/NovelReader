@@ -994,8 +994,10 @@ static void DrawToolbar(HDC dc, const RECT& rcClient)
         SetTextColor(dc, th.fg);
         ExtTextOutW(dc, leftLimit, (H - tsz.cy) / 2, 0, nullptr, title.c_str(), (int)title.size(), nullptr);
 
-        /* 章名：书名右边 S(14)，用次要色；空间不够就算了 */
-        if (g_book.Ok() && !s_stC.empty()) {
+        /* 章名：书名右边 S(14)，用次要色；空间不够就算了。
+         * 隐私模式下书名已经是「文档」，章名（"第3章 三年之约"）一样会暴露在读什么书，
+         * 所以这里一并不画。 */
+        if (g_book.Ok() && !s_stC.empty() && !g_set.privacy) {
             HFONT nf = MakeUiFont(9, false);
             HFONT of2 = nf ? (HFONT)SelectObject(dc, nf) : nullptr;
             int x2 = leftLimit + tsz.cx + S(14);
@@ -1456,8 +1458,15 @@ void UiUpdateStatus()
         int ch = BookChapterAtPara(g_book, ViewCurrentPara());
         if (!g_book.chapters.empty()) {
             if (ch >= 0) {
-                p1 = BookChapterTitle(g_book, ch);
-                if (p1.size() > 34) p1 = p1.substr(0, 34) + L"…";
+                if (g_set.privacy) {
+                    /* 隐私模式：只保留"第几章"这种不含书名的定位信息 */
+                    wchar_t tb[32];
+                    wsprintfW(tb, L"第 %d 章", ch + 1);
+                    p1 = tb;
+                } else {
+                    p1 = BookChapterTitle(g_book, ch);
+                    if (p1.size() > 34) p1 = p1.substr(0, 34) + L"…";
+                }
             } else {
                 p1 = L"（开篇）";
             }
@@ -2106,8 +2115,12 @@ void UiExportNotes()
                     L"提示", MB_ICONINFORMATION);
         return;
     }
+    /* 书名可以长到 255 字，拼上 "-笔记.md" 会超过 MAX_PATH 的 wchar_t 数组；
+     * 先把书名截到安全长度，并且用带长度参数 swprintf 而不是无边界 wsprintfW。 */
+    std::wstring noteTitle = g_book.title;
+    if (noteTitle.size() > 200) noteTitle.resize(200);
     wchar_t path[MAX_PATH];
-    wsprintfW(path, L"%s-笔记.md", g_book.title.c_str());
+    swprintf(path, MAX_PATH, L"%s-笔记.md", noteTitle.c_str());
     /* 文件名里的 \ / : * ? " < > | 会让保存失败，统一换成下划线 */
     for (wchar_t* p = path; *p; p++) {
         if (*p == L'\\' || *p == L'/' || *p == L':' || *p == L'*' || *p == L'?' ||
@@ -2118,12 +2131,12 @@ void UiExportNotes()
     for (size_t i = 0; i < g_hls.size(); i++) {
         const Highlight& h = g_hls[(size_t)i];
         if (h.note.empty()) continue;
-        wchar_t head[64];
         int ch = BookChapterAtPara(g_book, BookCharToPara(g_book, h.off));
         std::wstring name = BookChapterTitle(g_book, ch);
         if (name.empty()) name = L"（开篇）";
-        wsprintfW(head, L"## %s\n\n", name.c_str());
-        text += head;
+        /* 章名最长 60 字，"## "+60+"\n\n"+'\0' 需要 66 个 wchar，
+         * 原来的 wchar_t head[64] 会越界写栈。 */
+        text += L"## " + name + L"\n\n";
         /* 原文摘录：把换行压成空格，方便在 Markdown 里当成引用块 */
         int to = h.off + h.len;
         if (to > (int)g_book.text.size()) to = (int)g_book.text.size();
@@ -2744,10 +2757,12 @@ void UiRunSearch(const std::wstring& kw)
         NrTrace(L"  FillHits done");
         ShowPanel(1);
         NrTrace(L"  ShowPanel done");
-        wchar_t b[128];
-        if (s_hits.size() >= 4000) wsprintfW(b, L"“%s” 命中超过 4000 处（仅显示前 4000）", kw.c_str());
-        else wsprintfW(b, L"“%s” 共 %d 处", kw.c_str(), (int)s_hits.size());
-        s_statusExtra = b;
+        /* 关键词最长 511 个 wchar（搜索框上限），塞进 wchar b[128] 会写爆栈，
+         * 而 wsprintfW 不做边界检查。改成随长度自适应的 std::wstring。 */
+        std::wstring msg = L"“" + kw + L"” ";
+        if (s_hits.size() >= 4000) msg += L"命中超过 4000 处（仅显示前 4000）";
+        else msg += L"共 " + std::to_wstring((int)s_hits.size()) + L" 处";
+        s_statusExtra = msg;
         UiUpdateStatus();
     }
     if (s_hits.empty()) return;
@@ -5282,6 +5297,7 @@ static HACCEL BuildAccel()
     std::vector<KeyBind>& binds = KeyBinds();
     for (size_t i = 0; i < binds.size(); i++) {
         if (binds[i].cur.empty()) continue;      /* 用户取消了这个快捷键 */
+        if (binds[i].id == IDM_BOSS) continue;   /* 老板键走 RegisterHotKey，不能进加速键表 */
         BYTE vk = 0, mods = 0;
         if (!KeysParse(binds[i].cur, &vk, &mods)) continue;
         ACCEL ac;
@@ -5423,7 +5439,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdLine, int)
     LayoutFromSettings();
     KeysLoad();
     UiRebuildAccel();
-    UiApplyBossKey();     /* 老板键是全局热键，注册失败也不影响主流程 */
+    /* 老板键必须等主窗口创建之后再注册（见 CreateWindowExW 之后的 UiCreateChildren）：
+     * 现在 g_hMain 还是 nullptr，RegisterHotKey(NULL, ...) 注册的是"线程热键"，
+     * WM_HOTKEY 会以 hwnd == NULL 投递到线程队列，窗口过程根本收不到。 */
 
     /* 状态栏属于通用控件，必须先 InitCommonControlsEx 才能 CreateWindowExW 成功 */
     INITCOMMONCONTROLSEX icc;
@@ -5484,6 +5502,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdLine, int)
 
     /* 控件 → 菜单 → 最近打开（依赖菜单）→ 菜单勾选状态 → 布局（依赖全部控件） */
     UiCreateChildren(inst);
+    /* 老板键是全局热键，必须用真实主窗口句柄注册，否则 WM_HOTKEY 没人处理。 */
+    UiApplyBossKey();
     /* 菜单**不挂到窗口上**：SetMenu 那条系统灰菜单栏和这套纸感界面太不搭，
      * 而且在夜间模式下它是全窗口唯一一块亮色。改成"点左上角三条横线 / 右键"弹出同一个菜单，
      * 快捷键（BuildAccel 那些）照旧有效，功能一个不少。 */

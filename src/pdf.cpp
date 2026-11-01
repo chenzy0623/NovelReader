@@ -390,12 +390,17 @@ void PdfDoc::ParseCMap(const std::string& cm, PdfFont& f) const {
             std::string hs, he;
             if (!readHex(hs) || !readHex(he)) { i++; continue; }
             uint32_t lo = 0, hi = 0;
-            if (!hexToCode(hs, lo) || !hexToCode(he, hi) || hi < lo || hi - lo > 65535) continue;
+            if (!hexToCode(hs, lo) || !hexToCode(he, hi)) continue;
+            /* hi < lo 是非法区间；区间长度用 64 位算 —— 原来 `hi - lo` 在
+             * uint32_t 里做，hi 接近 0xFFFFFFFF 时不会拦下，循环变量回绕成死循环，
+             * 还能顺手把 f.map 撑到 OOM。 */
+            if (hi < lo || (unsigned long long)hi - (unsigned long long)lo > 65535ULL) continue;
             f.codeBytes = (int)(hs.size() / 2);
             PdfSkipWs(cm, i);
             if (i < cm.size() && cm[i] == '[') {         // 逐个映射
                 i++;
-                for (uint32_t c = lo; c <= hi; c++) {
+                for (unsigned long long cc = lo; cc <= (unsigned long long)hi; cc++) {
+                    uint32_t c = (uint32_t)cc;
                     std::string hd;
                     if (!readHex(hd)) break;
                     std::string bytes;
@@ -410,7 +415,8 @@ void PdfDoc::ParseCMap(const std::string& cm, PdfFont& f) const {
                 if (!readHex(hd)) continue;
                 uint32_t base = 0;
                 if (!hexToCode(hd, base)) continue;
-                for (uint32_t c = lo; c <= hi; c++) {
+                for (unsigned long long cc = lo; cc <= (unsigned long long)hi; cc++) {
+                    uint32_t c = (uint32_t)cc;
                     uint32_t v = base + (c - lo);
                     wchar_t wc = (wchar_t)(v & 0xFFFF);
                     f.map[c] = std::wstring(1, wc);

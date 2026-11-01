@@ -603,9 +603,12 @@ void HandleOne(SOCKET c)
 {
     std::string req;
     char buf[2048];
-    // 读请求头，直到 \r\n\r\n
+    // 读请求头，直到 \r\n\r\n。除了前面设的单次 recv 超时，这里再加一个总时长上限：
+    // 否则攻击者每 4.9 秒滴一个字节，就能无限占住这个单线程 accept 循环，服务整体卡死。
+    const DWORD reqStart = GetTickCount();
     while (req.size() < (size_t)kMaxReq)
     {
+        if (GetTickCount() - reqStart > 5000) return;
         int k = recv(c, buf, sizeof(buf), 0);
         if (k <= 0) break;
         req.append(buf, (size_t)k);

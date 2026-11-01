@@ -317,13 +317,18 @@ void Respond(SOCKET c, int code, const char* reason, const std::string& body, co
  * 甚至没开书；等下次打开那本书时再用指纹去查。 */
 void StorePeerRec(const SyncRec& r)
 {
+    /* 对端数据是不可信输入（8233 无鉴权，局域网内都能打）：key[64] / val[512]
+     * 用 wsprintfW 拼对端可控字符串且无边界检查，超长 key/chapter 直接写爆栈。
+     * 指纹固定 16 个十六进制字符，章名截到 400 字足够显示。 */
+    std::wstring k = r.key.substr(0, 32);
+    std::wstring ch = r.chapter.substr(0, 400);
     wchar_t key[64];
-    wsprintfW(key, L"k%s", r.key.c_str());
+    wsprintfW(key, L"k%s", k.c_str());
     wchar_t val[512];
-    wsprintfW(val, L"%d|%d|%d|%s", r.off, r.pct, r.ts, r.chapter.c_str());
+    wsprintfW(val, L"%d|%d|%d|%s", r.off, r.pct, r.ts, ch.c_str());
     IniSetStr(L"sync", key, val);
     /* 书名单独存一份：万一这台机器上没有这本书，也能在提示里说出是哪本 */
-    wsprintfW(key, L"t%s", r.key.c_str());
+    wsprintfW(key, L"t%s", k.c_str());
     IniSetStr(L"sync", key, r.title);
 }
 
@@ -392,7 +397,19 @@ void HandleOne(SOCKET c)
             return;
         }
         std::string body;
-        body += RecToLine(SyncRec{ key, title, L"", 0, 0, 0 }) + "\n";
+        /* 首行要带真实进度：原来 off/pct/ts 写死 0，手机把这条当"电脑的进度"存下来，
+         * 于是手机永远从第 1 页开始读（ReaderActivity 里 intent 的 off 成了死代码）。 */
+        SyncRec headRec;
+        headRec.key = key;
+        headRec.title = title;
+        {
+            std::vector<SyncRec> localAll;
+            SyncLocalRecords(localAll);
+            for (size_t i = 0; i < localAll.size(); i++) {
+                if (localAll[i].key == key) { headRec = localAll[i]; break; }
+            }
+        }
+        body += RecToLine(headRec) + "\n";
         /* 正文单独放在第二行之后，保持第一行仍是记录格式 */
         int n = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), (int)text.size(), nullptr, 0, nullptr, nullptr);
         if (n > 0)
