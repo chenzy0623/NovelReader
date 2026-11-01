@@ -371,8 +371,13 @@ HBITMAP RenderPageToBitmap(int index, int targetW, int* outW, int* outH)
     if (destW < 200) destW = 200;
     if (destW > 4000) destW = 4000;
 
-    /* 2 倍超采样，缩小显示时中文笔画才不会糊 */
-    const int renderW = destW * 2;
+    /* 渲染尺寸：**按屏幕上的实际像素 1:1 渲染**。
+     * 早期版本做过 2 倍超采样（`destW * 2`），为的是缩小显示时笔画不糊；代价是
+     * 位图内存直接 4 倍——一页 A4 在 700 宽显示时，1:1 是 700x906x4B ≈ 2.5 MB，
+     * 2 倍就是 1400x1812x4B ≈ 10 MB/页，三页缓存轻松吃掉 30 MB。
+     * 既然调用方传进来的 targetW 就是最终显示宽度，1:1 渲染 + HALFTONE 贴图
+     * 基本是等尺寸搬运、不会二次重采样，中文小字照样清楚。 */
+    const int renderW = destW;
     int renderH = (int)(pageHpt * renderW / pageWpt + 0.5);
     if (renderH < 1) renderH = 1;
 
@@ -580,11 +585,12 @@ HBITMAP PdfRenderPageBitmap(int index, int targetW)
     fresh.hbm = RenderPageToBitmap(index, targetW, &fresh.width, &fresh.height);
     if (!fresh.hbm) return nullptr;
 
-    if (m.cache.size() >= 3) {
-        ReleaseEntry(m.cache.back());
-        m.cache.pop_back();
-    }
-    m.cache.insert(m.cache.begin(), fresh);
+    /* 缓存只留 1 张（当前页）：PDF 原始版式一次只看一页，留着历史页纯粹是浪费内存
+     * （一页 2.5 MB 看着不多，但 4K 屏 2000 宽渲染时就是 2000x2600x4B ≈ 20 MB）。
+     * 翻页时先把旧图删掉再插新图，峰值也只有一个位图。 */
+    for (size_t i = 0; i < m.cache.size(); i++) ReleaseEntry(m.cache[i]);
+    m.cache.clear();
+    m.cache.push_back(fresh);
     return m.cache[0].hbm;
 }
 

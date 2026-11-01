@@ -48,6 +48,7 @@
 #include <commctrl.h>
 #include <commdlg.h>
 #include <shellapi.h>
+#include <windowsx.h>
 #include <cwchar>
 #include <algorithm>
 
@@ -70,8 +71,20 @@ static HWND s_hFind = nullptr, s_bFind = nullptr, s_bNext = nullptr, s_bClose = 
 /* 侧栏折叠条：自绘的细长按钮（BS_OWNERDRAW），贴在侧栏底部；收起后变成左边缘的细竖条。
  * 它和菜单里的「显示/隐藏目录」是同一个功能的两个入口，都调 UiToggleSidebar。 */
 static HWND s_hFold = nullptr;
+/* 顶部工具栏（自绘窗口 NRToolbar）与它的悬停状态。放在这里而不是工具栏代码块里，
+ * 是因为 UiCreateChildren 要用它，而 UiCreateChildren 定义在前面。
+ * s_barHover = -1 表示鼠标不在任何按钮上；s_barTrack 表示是否已经 TrackMouseEvent。 */
+static HWND s_hBar = nullptr;
+static int  s_barHover = -1;
+static bool s_barTrack = false;
+/* 标题区最后一次绘制时的宽度：BarHitTest 要按同一宽度算按钮位置（鼠标消息里没有客户区宽度），
+ * 用最近一次 WM_PAINT 的量代替再取一次 GetClientRect，省一次系统调用也避免两处不一致。 */
+static int  s_lastBarW = 0;
 /* 「最近打开」子菜单句柄：BuildMenu 建好后存下来，UiRebuildRecentMenu 只动它，不动整个菜单栏 */
 static HMENU s_hRecentMenu = nullptr;
+/* 整个应用菜单：**不挂在窗口上**（SetMenu 会带出一条系统灰菜单栏，和纸感界面不搭），
+ * 靠左上角三条横线按钮 / 右键 / Ctrl+F10 弹出，命令分发仍然走 WM_COMMAND。 */
+static HMENU s_hAppMenu = nullptr;
 static HFONT s_uiFont = nullptr;
 /* ---- 界面瞬时状态（都不进 ini，退出即丢）----
  * s_searchShown：顶部搜索条是否展开，影响 UiLayout 里正文顶部要让出多少高度。
@@ -97,6 +110,10 @@ static int  s_curHit = -1;
 static int  s_sbH = 24;
 /* 状态栏第一格后缀（如搜索后的「共 N 处」）；单独存一份，避免污染属于书本身的 g_book.title */
 static std::wstring s_statusExtra;
+/* 最近一次算出的阅读百分比（千分数）。状态栏右侧数字与底部进度条都用它；
+ * 单独存一份是因为 UiSetStatus 也可能被别处（网页抓取进度）调用，
+ * 那时不该把"书读到哪儿"的进度条冲掉。 */
+static int  s_lastPct = 0;
 
 /* ---- 定时器 id（SetTimer 的第二个参数，同一窗口内必须唯一）----
  * TIMER_POS ：阅读进度防抖保存（见 WM_APP_STATUS 与 WM_TIMER）。
@@ -193,6 +210,37 @@ static LRESULT CALLBACK EditSub(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DW
     return DefSubclassProc(h, m, w, l);
 }
 
+/* 前置声明：这两个窗口过程定义在"顶部工具栏 / 自绘状态栏"那两段里（位于
+ * UiCreateChildren 之后），而注册窗口类的函数在 UiCreateChildren 之前就要用到它们的地址。 */
+static LRESULT CALLBACK ToolbarProc(HWND h, UINT m, WPARAM w, LPARAM l);
+static LRESULT CALLBACK StatusProc(HWND h, UINT m, WPARAM w, LPARAM l);
+
+/* 注册"自绘框架"窗口类：工具栏（NRToolbar）与状态栏（NRStatus）。
+ *
+ * 之所以要自己注册窗口类，是因为这两个区域需要完全自绘（配色跟着主题走、
+ * 圆角、进度条），而系统 STATUSCLASSNAME 之类的控件只能吃系统配色。
+ * 两个类共用同一个窗口过程 ToolbarProc / StatusProc，样式都是 CS_HREDRAW|CS_VREDRAW
+ * （改尺寸时整块重画，避免右/下边留残影），光标用箭头（不注册 IDC_ARROW 时
+ * 系统会给一个很丑的默认光标）。
+ * 注册失败（比如类已存在）不当成错误：主窗口还没建，影响不到别的逻辑。 */
+static void UiRegisterChromeClasses(HINSTANCE inst)
+{
+    WNDCLASSEXW wc;
+    ZeroMemory(&wc, sizeof(wc));
+    wc.cbSize = sizeof(wc);
+    wc.style = CS_HREDRAW | CS_VREDRAW;
+    wc.hInstance = inst;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hbrBackground = nullptr;          /* 全部自绘，不要系统刷底 */
+    wc.lpfnWndProc = ToolbarProc;
+    wc.lpszClassName = L"NRToolbar";
+    RegisterClassExW(&wc);
+
+    wc.lpfnWndProc = StatusProc;
+    wc.lpszClassName = L"NRStatus";
+    RegisterClassExW(&wc);
+}
+
 /* 一次性创建所有子窗口（在 CreateWindowEx 建好主窗口之后、UiLayout 之前调用）。
  * 参数 inst 其实用不上（MakeChild 自己从 g_hMain 取实例句柄），保留是为了
  * 与其他初始化函数签名一致，故用 (void)inst 消掉未使用警告。
@@ -206,28 +254,44 @@ static void UiCreateChildren(HINSTANCE inst)
 {
     (void)inst;
     s_uiFont = MakeUiFont(9, false);
+    UiRegisterChromeClasses((HINSTANCE)GetWindowLongPtrW(g_hMain, GWLP_HINSTANCE));
 
     /* 正文视图由 view.cpp 创建（它自己注册窗口类 NRView、自绘、处理滚轮键盘选中） */
     s_hView = ViewCreate(g_hMain);
 
-    /* 状态栏：SBARS_SIZEGRIP 给右下角加拖拽握把；高度由系统算，所以布局时要先 WM_SIZE 再量 */
-    s_hStatus = MakeChild(STATUSCLASSNAMEW, WS_VISIBLE | SBARS_SIZEGRIP, 0, IDC_STATUS, nullptr);
+    /* 顶部工具栏：自绘窗口（窗口类 NRToolbar，由 UiRegisterChromeClasses 注册）。
+     * 它不属于"系统控件"，所以没有边框、没有主题配色问题，画成什么样完全由 DrawToolbar 决定。 */
+    s_hBar = MakeChild(L"NRToolbar", WS_VISIBLE | WS_CLIPSIBLINGS, 0, IDC_BAR, nullptr);
+
+    /* 底部状态栏：同样是自绘（窗口类 NRStatus），三段文本 + 通条进度见 DrawStatusBar。
+     * 不用系统 STATUSCLASSNAMEW 的原因：它只接受系统配色，夜间模式下会露出一条亮灰，
+     * 而且没法在末尾画进度条。 */
+    s_hStatus = MakeChild(L"NRStatus", WS_VISIBLE | WS_CLIPSIBLINGS, 0, IDC_STATUS, nullptr);
+
     /* 目录列表：LBS_NOTIFY 让选中变化能通知父窗口（WM_COMMAND + LBN_SELCHANGE）；
      * LBS_NOINTEGRALHEIGHT 允许高度不是行高的整数倍，避免最后一行被裁掉；
-     * WS_EX_CLIENTEDGE 给个凹陷边框，和正文区域在视觉上分开。
+     * LBS_OWNERDRAWFIXED + LBS_HASSTRINGS 表示"条目文字还是由列表自己存，
+     * 但每行的样子由我们在 WM_DRAWITEM 里画"（见 DrawListRow），
+     * 这样才能做出圆角选中条、当前章左侧强调竖条这些效果。
+     * 去掉 WS_EX_CLIENTEDGE：自绘边框已经在 WM_DRAWITEM/主窗口背景里处理了，
+     * 再套一层系统凹陷边框会把圆角切开。
      */
-    s_hToc = MakeChild(L"LISTBOX", WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
-                       WS_EX_CLIENTEDGE, IDC_TOC, nullptr);
+    s_hToc = MakeChild(L"LISTBOX", WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT |
+                       LBS_OWNERDRAWFIXED | LBS_HASSTRINGS,
+                       0, IDC_TOC, nullptr);
     /* 搜索结果列表：与目录同一块区域、同样样式，初始不带 WS_VISIBLE，切换靠 ShowWindow */
-    s_hHits = MakeChild(L"LISTBOX", WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
-                        WS_EX_CLIENTEDGE, IDC_HITS, nullptr);
+    s_hHits = MakeChild(L"LISTBOX", WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT |
+                        LBS_OWNERDRAWFIXED | LBS_HASSTRINGS,
+                        0, IDC_HITS, nullptr);
     /* 搜索条：ES_AUTOHSCROLL 让超长关键词横向滚动，不加 ES_MULTILINE 是因为
      * 搜索词不会有换行；三个按钮都带 WS_TABSTOP，保证 Tab 键能在它们之间走。
      */
-    s_hFind = MakeChild(L"EDIT", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, IDC_FINDEDIT, L"");
-    s_bFind = MakeChild(L"BUTTON", BS_PUSHBUTTON | WS_TABSTOP, 0, IDC_BFIND, L"搜索");
-    s_bNext = MakeChild(L"BUTTON", BS_PUSHBUTTON | WS_TABSTOP, 0, IDC_BNEXT, L"下一个");
-    s_bClose = MakeChild(L"BUTTON", BS_PUSHBUTTON | WS_TABSTOP, 0, IDC_BCLOSE, L"关闭");
+    /* 搜索框不要 WS_EX_CLIENTEDGE（系统立体边框跟纸面不搭），改由 WM_CTLCOLOREDIT 给底色 */
+    s_hFind = MakeChild(L"EDIT", ES_AUTOHSCROLL | WS_TABSTOP, 0, IDC_FINDEDIT, L"");
+    /* 三个按钮都自绘（BS_OWNERDRAW），样子在 DrawMiniButton 里定义 */
+    s_bFind = MakeChild(L"BUTTON", BS_OWNERDRAW | WS_TABSTOP, 0, IDC_BFIND, L"搜索");
+    s_bNext = MakeChild(L"BUTTON", BS_OWNERDRAW | WS_TABSTOP, 0, IDC_BNEXT, L"下一个");
+    s_bClose = MakeChild(L"BUTTON", BS_OWNERDRAW | WS_TABSTOP, 0, IDC_BCLOSE, L"关闭");
 
     /* 侧栏折叠条：BS_OWNERDRAW 表示"长什么样由我们自己在 WM_DRAWITEM 里画"（见 DrawFoldBar）。
      * 不用普通按钮是因为它要贴成一条细手柄，普通按钮的 3D 边框在这里很笨重。
@@ -245,9 +309,8 @@ static void UiCreateChildren(HINSTANCE inst)
  * 两种形态，靠矩形形状区分而不是靠标志位 —— 宽度小于阈值就当竖条：
  *   展开态：侧栏底部的横条，文字「‹ 收起目录」，告诉用户点它会收起来；
  *   收起态：左边缘的细竖条，只画一个「›」，点它重新展开。
- * 配色特意用系统灰（COLOR_BTNFACE / COLOR_BTNTEXT）而不是日间/夜间的米色，
- * 因为侧栏本身是系统 LISTBOX（也是灰的），硬套主题色反而突兀；它属于"窗口框架"，
- * 和状态栏、菜单同族。
+ * 配色跟着主题走（卡片色底 + 分隔线 + 次要文字色）：新版界面里侧栏本身已经是
+ * 主题色的自绘列表，折叠条再刷系统灰就会露出一条突兀的浅色带。
  * 边界：r 宽或高 <= 0 时直接返回（缩到极小的窗口里会出现），否则 FillRect 无意义、
  * 文字也没有地方放。
  */
@@ -256,8 +319,11 @@ static void DrawFoldBar(HDC dc, const RECT& r, bool pressed)
     if (r.right - r.left <= 0 || r.bottom - r.top <= 0) return;
 
     /* 1) 底色 + 分隔线：横条在顶边画线，竖条在右边画线，与相邻的列表分开 */
-    FillRect(dc, &r, GetSysColorBrush(COLOR_BTNFACE));
-    HPEN pen = CreatePen(PS_SOLID, 1, GetSysColor(COLOR_3DSHADOW));
+    const Theme& th = CurTheme();
+    HBRUSH bg = CreateSolidBrush(th.card);
+    FillRect(dc, &r, bg);
+    DeleteObject(bg);
+    HPEN pen = CreatePen(PS_SOLID, 1, th.line);
     HGDIOBJ oldPen = SelectObject(dc, pen);
     MoveToEx(dc, r.left, r.top, nullptr);
     LineTo(dc, r.right, r.top);
@@ -268,30 +334,610 @@ static void DrawFoldBar(HDC dc, const RECT& r, bool pressed)
     SelectObject(dc, oldPen);
     DeleteObject(pen);
 
-    /* 2) 文字：横条居中显示整句，竖条只靠上画一个箭头 */
+    /* 2) 图标与文字：横条居中显示"<  收起目录"，竖条画一个矢量箭头 */
     HFONT oldFont = (HFONT)SelectObject(dc, s_uiFont);
     int oldMode = SetBkMode(dc, TRANSPARENT);
-    COLORREF oldColor = SetTextColor(dc, pressed ? GetSysColor(COLOR_GRAYTEXT) : GetSysColor(COLOR_BTNTEXT));
+    /* 文字色：正常用正文色偏淡一档的感觉没有现成字段，这里直接用 dim（次要信息色）；
+     * 按下时更暗一点 —— 和列表里"灰显一行"的观感一致，不引入新颜色。 */
+    COLORREF oldColor = SetTextColor(dc, pressed ? th.track : th.dim);
 
     if (r.right - r.left >= S(30)) {
         /* 横条：居中，文字左右各留 6，放不下就截断（用 DT_END_ELLIPSIS 让它自己加省略号） */
         RECT tr = r;
         tr.left += S(6);
         tr.right -= S(6);
-        /* 箭头用半角 "<" / ">" 而不是 U+2039 之类的印刷引号：按钮用的是系统界面字体
-         * （MS Shell Dlg / Tahoma），这类字体里没有 ‹ › 字形，会画成方框或怪字符。 */
+        /* 箭头用半角 "<" / ">" 而不是 U+2039 之类的印刷引号：字体里不一定有那个字形，
+         * 缺字形时会画成方框或怪字符（踩过）。 */
         DrawTextW(dc, L"<  收起目录", -1, &tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     } else {
-        /* 竖条：箭头放在顶端往下 S(4) 处，水平居中 */
-        RECT tr = r;
-        tr.top += S(4);
-        tr.bottom = tr.top + S(20);
-        DrawTextW(dc, L">", -1, &tr, DT_CENTER | DT_TOP | DT_SINGLELINE);
+        /* 竖条：用两根线画一个 ">" 箭头，不用文字。
+         * 系统界面字体在中英混排下的小字号箭头又细又飘（实测 S(18) 宽的竖条里
+         * 那个 '>' 几乎看不见），矢量画出来的粗细、位置都可控。 */
+        int cx = (r.left + r.right) / 2;
+        int cy = r.top + S(14) + S(7);
+        int arm = S(4);                 /* 箭头两臂的半径 */
+        int thick = S(2) > 1 ? S(2) : 1;
+        HPEN arrowPen = CreatePen(PS_SOLID, thick, pressed ? th.track : th.dim);
+        HGDIOBJ oldArrowPen = SelectObject(dc, arrowPen);
+        MoveToEx(dc, cx - arm / 2, cy - arm, nullptr);
+        LineTo(dc, cx + arm / 2, cy);
+        LineTo(dc, cx - arm / 2, cy + arm);
+        SelectObject(dc, oldArrowPen);
+        DeleteObject(arrowPen);
     }
 
     SetTextColor(dc, oldColor);
     SetBkMode(dc, oldMode);
     SelectObject(dc, oldFont);
+}
+
+/* ---------------- 顶部工具栏 ---------------- */
+
+/* 工具栏上的按钮表。顺序就是从左到右的顺序，宽是 96 DPI 设计值（用时过 S()）。
+ * 为什么不直接用 BS_PUSHBUTTON 子窗口：系统按钮的 3D 边框、灰底、按下动画
+ * 和这套"纸感"界面完全不合，而且换成自绘一个窗口就够，不必为每个按钮建子类。
+ * 每个按钮点下去都只发 WM_COMMAND，走的还是原来那套命令号，功能零改动。 */
+struct UiBarBtn {
+    int id;                 /* 命令号（WM_COMMAND 的 LOWORD） */
+    const wchar_t* label;   /* 按钮文字（静态默认值；自动/主题两枚会按当前状态换字，见 BarBtnText） */
+};
+
+static const UiBarBtn kBarBtns[] = {
+    { IDM_TOC,         L"目录" },
+    { IDM_OPEN,        L"打开" },
+    { IDM_FIND,        L"搜索" },
+    { IDM_AUTO_TOGGLE, L"自动" },
+    { IDM_SOURCE,      L"书源" },
+    { IDM_THEME,       L"主题" },
+};
+static const int kBarBtnCount = (int)(sizeof(kBarBtns) / sizeof(kBarBtns[0]));
+
+/* 按钮文字（少数按钮按当前状态换字，比"自动"开关在开着时显示"暂停"更好懂：
+ * 按钮上写的是"点下去会发生什么"。同样，主题在夜间模式显示"日间"。 */
+static const wchar_t* BarBtnText(int index)
+{
+    if (index < 0 || index >= kBarBtnCount) return L"";
+    if (kBarBtns[index].id == IDM_AUTO_TOGGLE) return UiAutoRunning() ? L"暂停" : L"自动";
+    if (kBarBtns[index].id == IDM_THEME)       return (g_set.theme == 1) ? L"日间" : L"夜间";
+    return kBarBtns[index].label;
+}
+
+/* 按钮是否处于"激活"状态（画成强调色）：目录＝侧栏开着、自动＝正在滚、
+ * 搜索＝搜索条正开着（这时正文被搜索条压住一截，按钮亮着能提示"面板从哪儿关"）。 */
+static bool BarBtnActive(int index)
+{
+    if (index < 0 || index >= kBarBtnCount) return false;
+    int id = kBarBtns[index].id;
+    if (id == IDM_TOC)         return g_set.sidebar && g_book.Ok();
+    if (id == IDM_AUTO_TOGGLE) return UiAutoRunning();
+    if (id == IDM_FIND)        return s_searchShown != 0;
+    return false;
+}
+
+/* 顶部标题区的高度（96 DPI 设计值）。54 是"放得下一行 15px 粗体书名 + 呼吸感"的高度，
+ * 再高就抢正文的地方了。 */
+static int BarH()      { return S(54); }
+static int BarBtnH()   { return S(30); }   /* 胶囊组里单个按钮的高度 */
+static int BarBtnW()   { return S(56); }   /* 每个按钮的宽度（都是两个汉字，统一宽度最整齐） */
+static int BarPadX()   { return S(16); }   /* 标题区左右留白 */
+static int BarGroupPad() { return S(4); }  /* 胶囊组内侧留白（让圆角不啃字） */
+
+/* 状态栏（自绘）：三段文本 + 一条通条进度。文本由 UiSetStatus 写，绘制时读。 */
+static std::wstring s_stL, s_stC, s_stR;
+static int s_stPct = -1;          /* 0~1000；-1 = 不画进度条（没开书） */
+
+/* 把空闲的工作集页还给系统（声明与理由见 common.h）。
+ * 只在"内存需要回收"的时机调用：打开/关闭一本书、换 PDF 页、网页抓完。
+ * 千万不能放进 PaintAll / 滚动里——那会让每一帧都触发一次缺页中断风暴。 */
+void MemTrim()
+{
+    SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
+}
+
+/* 颜色混合（本文件局部版本）。view.cpp 里也有一份，但那是 static 的，
+ * 而 ui.cpp 需要它来算"选中行的淡色底"，所以这里再来一份。
+ * 参数 pa 是颜色 a 占的百分比（0~100）。 */
+static COLORREF UiMix(COLORREF a, COLORREF b, int pa)
+{
+    if (pa < 0) pa = 0;
+    if (pa > 100) pa = 100;
+    return RGB((GetRValue(a) * pa + GetRValue(b) * (100 - pa)) / 100,
+               (GetGValue(a) * pa + GetGValue(b) * (100 - pa)) / 100,
+               (GetBValue(a) * pa + GetBValue(b) * (100 - pa)) / 100);
+}
+
+/* 画一个圆角填充矩形。用 GDI 的 RoundRect：它同时用当前画笔（描边）和画刷（填充），
+ * 所以这里先选空画笔/目标色画刷，画完恢复。
+ * 参数 r 是目标矩形，rad 是圆角半径（像素，已过 S()），fill 是填充色，border 是描边色
+ * （border 传 CLR_INVALID 表示不描边）。 */
+static void UiRoundRect(HDC dc, const RECT& r, int rad, COLORREF fill, COLORREF border)
+{
+    if (r.right <= r.left || r.bottom <= r.top) return;
+    HBRUSH br = CreateSolidBrush(fill);
+    HPEN   pen = (border == CLR_INVALID)
+                 ? CreatePen(PS_NULL, 0, RGB(0, 0, 0))
+                 : CreatePen(PS_SOLID, 1, border);
+    HGDIOBJ ob = SelectObject(dc, br);
+    HGDIOBJ op = SelectObject(dc, pen);
+    RoundRect(dc, r.left, r.top, r.right, r.bottom, rad * 2, rad * 2);
+    SelectObject(dc, op);
+    SelectObject(dc, ob);
+    DeleteObject(pen);
+    DeleteObject(br);
+}
+
+/* 「菜单」按钮（三条横线，像常见的汉堡按钮）的矩形：贴左上角、垂直居中。
+ * 为什么不把菜单项塞进右边那组胶囊：菜单是"整个应用"的入口，和"当前这本书"的操作
+ * （目录/搜索/自动…）不是一类东西，放一起会让胶囊组变得又长又乱。 */
+static RECT BarMenuRect()
+{
+    RECT r = { 0, 0, 0, 0 };
+    int s = S(30);
+    int y = (BarH() - s) / 2;
+    r.left = BarPadX() - S(2);
+    r.top = y;
+    r.right = r.left + s;
+    r.bottom = y + s;
+    return r;
+}
+
+/* 鼠标是否落在菜单按钮上 */
+static bool BarMenuHit(int x, int y)
+{
+    RECT r = BarMenuRect();
+    POINT p = { x, y };
+    return PtInRect(&r, p) != FALSE;
+}
+
+/* 弹出整个应用菜单（屏幕坐标）。菜单没有挂在窗口上，所以只能这样弹；
+ * 用 TPM_RETURNCMD 拿到命令号后 Post 成 WM_COMMAND，走和菜单栏时期完全一样的分发路径。
+ * 右键、工具栏的「菜单」按钮、以及 Ctrl+F10（见 accelerators）都走这里。 */
+void UiShowAppMenuAt(int sx, int sy)
+{
+    if (!s_hAppMenu) return;
+    /* 弹出前把"最近打开"重刷一遍：用户可能刚打开过新文件，菜单里的列表要是旧的会点错 */
+    UiRebuildRecentMenu();
+    int cmd = (int)TrackPopupMenu(s_hAppMenu,
+                                  TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RIGHTBUTTON,
+                                  sx, sy, 0, g_hMain, nullptr);
+    if (cmd) PostMessageW(g_hMain, WM_COMMAND, (WPARAM)cmd, 0);
+}
+
+/* 整组按钮（胶囊容器）的矩形：贴右边缘，垂直居中。绘制与命中共用。 */
+static RECT BarGroupRect(int W)
+{
+    RECT r = { 0, 0, 0, 0 };
+    int gw = kBarBtnCount * BarBtnW() + BarGroupPad() * 2;
+    int gh = BarBtnH() + BarGroupPad() * 2;
+    int right = W - BarPadX();
+    if (right - gw < BarPadX()) {          /* 窗口太窄：让出左边至少 BarPadX */
+        right = BarPadX() + gw;
+    }
+    int y = (BarH() - gh) / 2;
+    r.right = right;
+    r.left = right - gw;
+    r.top = y;
+    r.bottom = y + gh;
+    return r;
+}
+
+/* 第 index 个按钮的矩形（已经算进胶囊组的内侧留白）。 */
+static RECT BarBtnRect(int index, int W)
+{
+    RECT r = { 0, 0, 0, 0 };
+    if (index < 0 || index >= kBarBtnCount) return r;
+    RECT g = BarGroupRect(W);
+    int x = g.left + BarGroupPad() + index * BarBtnW();
+    r.left = x;
+    r.right = x + BarBtnW();
+    r.top = g.top + BarGroupPad();
+    r.bottom = r.top + BarBtnH();
+    return r;
+}
+
+/* 鼠标位置 → 按钮序号，不落在任何按钮上返回 -1 */
+static int BarHitTest(int x, int y)
+{
+    POINT p = { x, y };
+    for (int i = 0; i < kBarBtnCount; i++) {
+        RECT r = BarBtnRect(i, s_lastBarW);
+        if (PtInRect(&r, p)) return i;
+    }
+    return -1;
+}
+
+/* 顶部标题区绘制。设计要点（这版是重写过的，上一版"一条横杠 + 一排小字按钮"太像工具栏）：
+ *   - 底色用纸张色，和正文连成一片，只在最底下一条 1px 细线收边 —— 不再是一块突兀的色带；
+ *   - 左边是书名（粗体）+ 章名（次要色），像书的页眉，而不是"标题栏"；
+ *   - 右边是一整组胶囊按钮（segmented control）：圆角容器 + 内部分隔线，
+ *     悬停/激活只给单格上淡色底，视觉上是一个整体，不是六个散落的文字；
+ *   - 进度不再放这里（底部状态栏已经有一条通条进度 + 百分比），少一处重复信息。 */
+static void DrawToolbar(HDC dc, const RECT& rcClient)
+{
+    const Theme& th = CurTheme();
+    int W = rcClient.right, H = rcClient.bottom;
+    s_lastBarW = W;
+
+    /* 1) 底：纸张色 + 底部 1px 收边线 */
+    HBRUSH bb = CreateSolidBrush(th.bg);
+    FillRect(dc, &rcClient, bb);
+    DeleteObject(bb);
+    HBRUSH lb = CreateSolidBrush(th.line);
+    RECT line = { 0, H - 1, W, H };
+    FillRect(dc, &line, lb);
+    DeleteObject(lb);
+
+    /* 2) 左侧「菜单」按钮：悬停时给一块淡色底，三条横线用正文色；
+     * 三条线的粗细跟着 DPI 走（S(1) 在 125% 下是 1px、150% 下是 2px，别用硬编码 1）。 */
+    {
+        RECT mr = BarMenuRect();
+        if (s_barHover == -2) {          /* -2 是"悬停在菜单按钮上"的约定值 */
+            UiRoundRect(dc, mr, S(8), th.hov, CLR_INVALID);
+        }
+        int lh = S(2), lw = (mr.right - mr.left) / 2 + S(2);
+        int lx = mr.left + ((mr.right - mr.left) - lw) / 2;
+        int gap = S(4);
+        int total = lh * 3 + gap * 2;
+        int ly = mr.top + ((mr.bottom - mr.top) - total) / 2;
+        HBRUSH bb2 = CreateSolidBrush(th.fg);
+        for (int i = 0; i < 3; i++) {
+            RECT bar = { lx, ly + i * (lh + gap), lx + lw, ly + i * (lh + gap) + lh };
+            FillRect(dc, &bar, bb2);
+        }
+        DeleteObject(bb2);
+    }
+
+    /* 3) 右侧胶囊按钮组：先画容器（卡片色 + 细边 + 全圆角），再画分隔线与每格 */
+    RECT g = BarGroupRect(W);
+    if (g.right > g.left) {
+        int rad = (g.bottom - g.top) / 2;
+        UiRoundRect(dc, g, rad, th.card, th.line);
+
+        HFONT btnFont = MakeUiFont(9, false);
+        HFONT oldFont = (HFONT)SelectObject(dc, btnFont ? btnFont : s_uiFont);
+        int oldMode = SetBkMode(dc, TRANSPARENT);
+
+        for (int i = 0; i < kBarBtnCount; i++) {
+            RECT r = BarBtnRect(i, W);
+            bool hot = (i == s_barHover);
+            bool active = BarBtnActive(i);
+
+            /* 悬停/激活：单格淡色底（比容器圆角小一点，看起来像"胶囊里被按亮的一格"） */
+            if (hot || active) {
+                RECT hr = r;
+                InflateRect(&hr, -S(1), -S(1));
+                UiRoundRect(dc, hr, (hr.bottom - hr.top) / 2,
+                            active ? UiMix(th.accent, th.card, 14) : th.hov, CLR_INVALID);
+            }
+            /* 分隔线：画在相邻两格中间，最后一格不用 */
+            if (i > 0) {
+                HPEN p = CreatePen(PS_SOLID, 1, th.line);
+                HGDIOBJ op = SelectObject(dc, p);
+                MoveToEx(dc, r.left, r.top + S(8), nullptr);
+                LineTo(dc, r.left, r.bottom - S(8));
+                SelectObject(dc, op);
+                DeleteObject(p);
+            }
+
+            SetTextColor(dc, active ? th.accent : (hot ? th.fg : th.dim));
+            DrawTextW(dc, BarBtnText(i), -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        }
+
+        SetBkMode(dc, oldMode);
+        SelectObject(dc, oldFont);
+        if (btnFont) DeleteObject(btnFont);
+    }
+
+    /* 3) 左侧：书名（粗体）+ 章名（次要色）。宽度让出胶囊组，放不下就省略。
+     * 书名用 12 号粗体（比正文大一点，像页眉的书名），章名用 9 号次要色接在后面。 */
+    int leftLimit = BarMenuRect().right + S(14);
+    int rightLimit = (g.right > g.left) ? g.left - S(16) : W - BarPadX();
+    if (rightLimit <= leftLimit + S(60)) return;   /* 窄窗口：只留按钮，不硬挤书名 */
+
+    HFONT titleFont = MakeUiFont(12, true);
+    HFONT oldF = (HFONT)SelectObject(dc, titleFont ? titleFont : s_uiFont);
+    int oldM = SetBkMode(dc, TRANSPARENT);
+
+    std::wstring title = g_book.Ok() ? g_book.title : L"书架";
+    SIZE tsz; tsz.cx = tsz.cy = 0;
+    GetTextExtentPoint32W(dc, title.c_str(), (int)title.size(), &tsz);
+
+    RECT tr = { leftLimit, 0, rightLimit, H };
+    if (tsz.cx > rightLimit - leftLimit) {
+        /* 太长：整个书名区自己截断，章名就不画了 */
+        SetTextColor(dc, th.fg);
+        DrawTextW(dc, title.c_str(), -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+    } else {
+        SetTextColor(dc, th.fg);
+        ExtTextOutW(dc, leftLimit, (H - tsz.cy) / 2, 0, nullptr, title.c_str(), (int)title.size(), nullptr);
+
+        /* 章名：书名右边 S(14)，用次要色；空间不够就算了 */
+        if (g_book.Ok() && !s_stC.empty()) {
+            HFONT nf = MakeUiFont(9, false);
+            HFONT of2 = nf ? (HFONT)SelectObject(dc, nf) : nullptr;
+            int x2 = leftLimit + tsz.cx + S(14);
+            RECT cr = { x2, 0, rightLimit, H };
+            SetTextColor(dc, th.dim);
+            DrawTextW(dc, s_stC.c_str(), -1, &cr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+            if (of2) SelectObject(dc, of2);
+            if (nf) DeleteObject(nf);
+        }
+    }
+
+    SetBkMode(dc, oldM);
+    SelectObject(dc, oldF);
+    if (titleFont) DeleteObject(titleFont);
+}
+
+/* 工具栏窗口过程：只做三件事 —— 画自己、跟踪悬停、把点击翻译成 WM_COMMAND。
+ * 为什么用 PostMessage 而不是 SendMessage：按钮命令里可能开模态框（打开文件、
+ * 搜索、主题），在鼠标消息的调用栈里开模态框会被重入，Post 出去更安全。 */
+static LRESULT CALLBACK ToolbarProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    switch (m) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        RECT rc;
+        GetClientRect(h, &rc);
+        /* 双缓冲：先画到内存位图再一次性贴，避免按钮区闪烁 */
+        HDC mem = CreateCompatibleDC(dc);
+        HBITMAP bmp = CreateCompatibleBitmap(dc, rc.right > 0 ? rc.right : 1, rc.bottom > 0 ? rc.bottom : 1);
+        if (mem && bmp) {
+            HGDIOBJ old = SelectObject(mem, bmp);
+            DrawToolbar(mem, rc);
+            BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
+            SelectObject(mem, old);
+        }
+        if (bmp) DeleteObject(bmp);
+        if (mem) DeleteDC(mem);
+        EndPaint(h, &ps);
+        return 0;
+    }
+
+    case WM_MOUSEMOVE: {
+        int x = GET_X_LPARAM(l), y = GET_Y_LPARAM(l);
+        /* -2 表示"悬停在菜单按钮上"（胶囊里的按钮用 0..n-1，-1 表示都不在） */
+        int idx = BarMenuHit(x, y) ? -2 : BarHitTest(x, y);
+        if (idx != s_barHover) {
+            s_barHover = idx;
+            InvalidateRect(h, nullptr, FALSE);
+        }
+        if (!s_barTrack) {
+            TRACKMOUSEEVENT tme;
+            ZeroMemory(&tme, sizeof(tme));
+            tme.cbSize = sizeof(tme);
+            tme.dwFlags = TME_LEAVE;
+            tme.hwndTrack = h;
+            TrackMouseEvent(&tme);
+            s_barTrack = true;
+        }
+        return 0;
+    }
+
+    case WM_MOUSELEAVE:
+        s_barTrack = false;
+        if (s_barHover != -1) { s_barHover = -1; InvalidateRect(h, nullptr, FALSE); }
+        return 0;
+
+    case WM_LBUTTONDOWN: {
+        int x = GET_X_LPARAM(l), y = GET_Y_LPARAM(l);
+        if (BarMenuHit(x, y)) {
+            /* 菜单按钮：在选择条正下方弹出整个菜单 */
+            RECT mr = BarMenuRect();
+            POINT p = { mr.left, mr.bottom + S(2) };
+            ClientToScreen(h, &p);
+            UiShowAppMenuAt(p.x, p.y);
+            return 0;
+        }
+        int idx = BarHitTest(x, y);
+        if (idx >= 0) PostMessageW(g_hMain, WM_COMMAND, (WPARAM)kBarBtns[idx].id, 0);
+        return 0;
+    }
+
+    case WM_RBUTTONUP: {
+        /* 标题区右键也能出菜单，和正文区右键一致 */
+        POINT p;
+        GetCursorPos(&p);
+        UiShowAppMenuAt(p.x, p.y);
+        return 0;
+    }
+
+    case WM_SETCURSOR:
+        /* 鼠标移到按钮上给个手型，明确"这里能点" */
+        int mx = GET_X_LPARAM(GetMessagePos()), my = GET_Y_LPARAM(GetMessagePos());
+        if (LOWORD(l) == HTCLIENT && (BarMenuHit(mx, my) || BarHitTest(mx, my) >= 0)) {
+            SetCursor(LoadCursorW(nullptr, IDC_HAND));
+            return TRUE;
+        }
+        break;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+/* ---------------- 自绘状态栏 ---------------- */
+
+/* 状态栏绘制：一行三段 + 底部通条进度。
+ * 三段的分工与原来系统状态栏一致（书名 / 章名 / 进度），但排版上做了两处改进：
+ *   1) 章名居中、左侧书名与右侧进度分别贴边，视线扫过时更有层次；
+ *   2) 整个窗口底部压一条 S(3) 的进度条，读书时余光就能看到读了多远。
+ * 进度条只在有书且知道百分比时画（s_stPct >= 0），否则只留底槽。 */
+static void DrawStatusBar(HDC dc, const RECT& rcClient)
+{
+    const Theme& th = CurTheme();
+    int W = rcClient.right, H = rcClient.bottom;
+
+    HBRUSH bb = CreateSolidBrush(th.card);
+    FillRect(dc, &rcClient, bb);
+    DeleteObject(bb);
+    HBRUSH lb = CreateSolidBrush(th.line);
+    RECT line = { 0, 0, W, 1 };
+    FillRect(dc, &line, lb);
+    DeleteObject(lb);
+
+    HFONT oldFont = (HFONT)SelectObject(dc, s_uiFont);
+    int oldMode = SetBkMode(dc, TRANSPARENT);
+
+    int pad = S(12);
+    RECT rl = { pad, 0, W / 3, H };
+    RECT rc = { W / 3, 0, W * 2 / 3, H };
+    RECT rr = { W * 2 / 3, 0, W - pad, H };
+
+    SetTextColor(dc, th.fg);
+    DrawTextW(dc, s_stL.c_str(), -1, &rl, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    SetTextColor(dc, th.dim);
+    DrawTextW(dc, s_stC.c_str(), -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    DrawTextW(dc, s_stR.c_str(), -1, &rr, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+    SetBkMode(dc, oldMode);
+    SelectObject(dc, oldFont);
+
+    /* 底部通条进度：底槽 + accent 填充 */
+    int barH = S(3);
+    RECT tr = { 0, H - barH, W, H };
+    HBRUSH tb = CreateSolidBrush(th.track);
+    FillRect(dc, &tr, tb);
+    DeleteObject(tb);
+    if (s_stPct >= 0) {
+        int p = s_stPct;
+        if (p < 0) p = 0;
+        if (p > 1000) p = 1000;
+        RECT fr = { 0, H - barH, W * p / 1000, H };
+        HBRUSH fb = CreateSolidBrush(th.accent);
+        FillRect(dc, &fr, fb);
+        DeleteObject(fb);
+    }
+}
+
+static LRESULT CALLBACK StatusProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    switch (m) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        RECT rc;
+        GetClientRect(h, &rc);
+        HDC mem = CreateCompatibleDC(dc);
+        HBITMAP bmp = CreateCompatibleBitmap(dc, rc.right > 0 ? rc.right : 1, rc.bottom > 0 ? rc.bottom : 1);
+        if (mem && bmp) {
+            HGDIOBJ old = SelectObject(mem, bmp);
+            DrawStatusBar(mem, rc);
+            BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
+            SelectObject(mem, old);
+        }
+        if (bmp) DeleteObject(bmp);
+        if (mem) DeleteDC(mem);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;   /* 全部在 WM_PAINT 里双缓冲画完，禁止系统先刷一遍底色（会闪） */
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+/* 写状态栏三段文本 + 进度。所有想改状态栏的地方都走这里（原来那些 SB_SETTEXTW
+ * 的调用点已全部替换），这样自绘状态窗口不需要知道任何业务逻辑。
+ * 参数 pct 是千分数（0~1000），传 -1 表示不画进度（例如没开书）。 */
+static void UiSetStatus(const std::wstring& l, const std::wstring& c,
+                        const std::wstring& r, int pct)
+{
+    s_stL = l;
+    s_stC = c;
+    s_stR = r;
+    s_stPct = pct;
+    if (s_hStatus) InvalidateRect(s_hStatus, nullptr, FALSE);
+    /* 工具栏右侧也显示百分比，状态变了要一起刷新 */
+    if (s_hBar) InvalidateRect(s_hBar, nullptr, FALSE);
+}
+
+
+
+/* ---------------- 自绘列表行（目录 / 搜索结果 / 书签共用） ---------------- */
+
+/* 列表行高（96 DPI 设计值 S(30)）。目录每行只是一行章名，30 足够留出上下呼吸；
+ * 搜索命中行文字更长，但列表本身不会换行（超长已被 ClipToWidth 截断），同样用 30。 */
+static int ListRowH() { return S(30); }
+
+/* 画列表里的一行。
+ * 参数 dc / r：控件 DC 与行矩形（来自 DRAWITEMSTRUCT）；text：行文字；
+ * selected：是否被选中（ODS_SELECTED）；dim：是否要画成次要色（搜索结果用，标题与片段同色，
+ * 这里保留参数以区分书签里"章名"这类弱信息）。
+ *
+ * 视觉设计：选中不再是系统蓝，而是"在纸面上压一道淡淡的高亮 + 左侧一根强调竖条"，
+ * 这样即使换成夜间或自定义配色也不会突兀；竖条用 accent 色，和进度条、当前章形成呼应。
+ */
+static void DrawListRow(HDC dc, const RECT& r, const std::wstring& text,
+                        bool selected, bool dim)
+{
+    const Theme& th = CurTheme();
+    RECT row = r;
+
+    /* 1) 行底：选中先铺一层 accent 淡色；不选中就保持面板底色（由列表自己的背景画） */
+    if (selected) {
+        COLORREF fill = UiMix(th.accent, th.card, 18);   /* accent 占 18%，淡到不抢字 */
+        UiRoundRect(dc, row, S(6), fill, CLR_INVALID);
+    }
+
+    /* 2) 文字：左侧留出竖条的位置 */
+    RECT tr = row;
+    tr.left += S(14);
+    tr.right -= S(8);
+    HFONT oldFont = (HFONT)SelectObject(dc, s_uiFont);
+    int oldMode = SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, selected ? th.fg : (dim ? th.dim : th.fg));
+    DrawTextW(dc, text.c_str(), -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    SetBkMode(dc, oldMode);
+    SelectObject(dc, oldFont);
+
+    /* 3) 左侧强调竖条：只在选中时出现，高出行高的 60%，垂直居中 */
+    if (selected) {
+        int bh = (row.bottom - row.top) * 3 / 5;
+        int by = row.top + ((row.bottom - row.top) - bh) / 2;
+        RECT bar = { row.left + S(5), by, row.left + S(9), by + bh };
+        HBRUSH bb = CreateSolidBrush(th.accent);
+        FillRect(dc, &bar, bb);
+        DeleteObject(bb);
+    }
+}
+
+/* 搜索条上的三个小按钮（搜索 / 下一个 / 关闭）自绘。
+ * 用 BS_OWNERDRAW 而不是系统 BS_PUSHBUTTON：系统的灰色立体按钮在米色纸面上很扎眼，
+ * 夜间配色下更是亮得发光。这里画成和顶栏胶囊一致的样子：圆角、卡片底、细描边，
+ * 按下时底色压深一档、文字用强调色。文字直接取控件自己的标题（GetWindowTextW），
+ * 将来改文案不用动绘制代码。 */
+static void DrawMiniButton(HDC dc, const RECT& r, const std::wstring& label, UINT state)
+{
+    const Theme& th = CurTheme();
+    bool pressed = (state & ODS_SELECTED) != 0;
+    bool disabled = (state & ODS_DISABLED) != 0;
+
+    /* 常态用 hov（比纸面稍深一点）而不是 card，否则按钮和背景几乎同色、看不出可点 */
+    COLORREF fill = pressed ? UiMix(th.accent, th.card, 16) : th.hov;
+    UiRoundRect(dc, r, S(7), fill, th.line);
+
+    HFONT oldFont = (HFONT)SelectObject(dc, s_uiFont);
+    int oldMode = SetBkMode(dc, TRANSPARENT);
+    COLORREF oldColor = SetTextColor(dc, disabled ? th.dim : (pressed ? th.accent : th.fg));
+    RECT tr = r;
+    DrawTextW(dc, label.c_str(), (int)label.size(), &tr,
+              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    SetTextColor(dc, oldColor);
+    SetBkMode(dc, oldMode);
+    SelectObject(dc, oldFont);
+}
+
+/* 取列表第 i 条的文字。OWNERDRAWFIXED + HASSTRINGS 时文字仍由列表控件保存，
+ * 这里只是把它读回来给自绘用；越界或空条目返回空串。 */
+static std::wstring ListText(HWND list, int i)
+{
+    int n = (int)SendMessageW(list, LB_GETCOUNT, 0, 0);
+    if (i < 0 || i >= n) return L"";
+    int len = (int)SendMessageW(list, LB_GETTEXTLEN, (WPARAM)i, 0);
+    if (len <= 0) return L"";
+    std::vector<wchar_t> buf((size_t)len + 2, 0);
+    SendMessageW(list, LB_GETTEXT, (WPARAM)i, (LPARAM)&buf[0]);
+    return std::wstring(&buf[0]);
 }
 
 /* ---------------- 布局 ---------------- */
@@ -315,22 +961,14 @@ static void UiLayout()
     GetClientRect(g_hMain, &rc);
     int W = rc.right, H = rc.bottom;
 
-    /* 先让状态栏吃一次 WM_SIZE，系统才会算出「含边距和握把」的真实高度 */
-    if (s_hStatus) {
-        SendMessageW(s_hStatus, WM_SIZE, 0, 0);
-        RECT sr;
-        GetWindowRect(s_hStatus, &sr);
-        int h = sr.bottom - sr.top;
-        if (h > 4) s_sbH = h;
-        /* 三段宽度用比例而不是像素：窗口拉宽时三格一起变宽。第一格到 34%，
-         * 第二格 34%→66%，第三格 66%→右边界（-1 是「到右边界」的约定写法）。
-         */
-        int parts[3];
-        parts[0] = W * 34 / 100;
-        parts[1] = W * 66 / 100;
-        parts[2] = -1;
-        SendMessageW(s_hStatus, SB_SETPARTS, 3, (LPARAM)parts);
-    }
+    /* 顶部工具栏：一条通栏，高度固定（BarH()），里面的按钮位置全由 BarBtnRect 现算，
+     * 所以这里只摆工具栏本身。它不参与"谁让出多少高度"之外的任何计算。 */
+    if (s_hBar) MoveWindow(s_hBar, 0, 0, W, BarH(), TRUE);
+
+    /* 底部状态栏：自绘窗口，高度固定 S(26)。原来要靠系统 WM_SIZE 量高度，
+     * 现在自己说了算 —— 顺便让 s_sbH 这个缓存继续有效（正文高度要用）。 */
+    s_sbH = S(26);
+    if (s_hStatus) MoveWindow(s_hStatus, 0, H - s_sbH, W, s_sbH, TRUE);
 
     /* 两个侧栏页共用一份宽度策略：目录 232、搜索结果 320，都是 96 DPI 设计值，用时过 S()。
      * 232 是按「第 N 章 标题」十来个汉字估的；320 是按「章名 · 前文【关键词】后文」估的，
@@ -350,7 +988,9 @@ static void UiLayout()
      * 收起时给 0，正文自然上移到窗口顶端，不留空条。
      */
     int searchH = s_searchShown ? S(38) : 0;
-    int top = searchH;
+    /* 正文区域的顶边 = 工具栏 + （展开时的）搜索条。工具栏永远在场，所以这一项不能省，
+     * 否则正文会被压在工具栏底下，第一行看不见。 */
+    int top = BarH() + searchH;
     int viewH = H - s_sbH - top;
     /* 正文高度夹一个下限，否则 view 会算出 0 行可用 */
     if (viewH < S(40)) viewH = S(40);
@@ -389,8 +1029,16 @@ static void UiLayout()
          */
         int sh = viewH - foldH;
         if (sh < S(40)) sh = S(40);
-        if (s_hToc)  MoveWindow(s_hToc, 0, top, sideW, sh, TRUE);
-        if (s_hHits) MoveWindow(s_hHits, 0, top, sideW, sh, TRUE);
+        /* 侧栏做成"浮在纸上的一块面板"：四周留 S(8) 的内边距，面板本身用主题卡片色
+         * （列表底色来自 WM_CTLCOLORLISTBOX），和纸色背景拉开层次，看起来不是一堵字墙。
+         * 内嵌后宽度要重新夹一次下限，否则窗口窄时可能算出负数宽度。 */
+        int px = S(8), py = S(6);
+        int pw = sideW - px - S(4);
+        if (pw < S(60)) pw = S(60);
+        int ph = sh - py - S(4);
+        if (ph < S(40)) ph = S(40);
+        if (s_hToc)  MoveWindow(s_hToc, px, top + py, pw, ph, TRUE);
+        if (s_hHits) MoveWindow(s_hHits, px, top + py, pw, ph, TRUE);
     }
     if (s_hToc)  ShowWindow(s_hToc,  (sideW > 0 && s_panel == 0) ? SW_SHOW : SW_HIDE);
     /* s_panel==2（书签面板）也复用 s_hHits 这个列表，所以要一起显示，
@@ -401,7 +1049,7 @@ static void UiLayout()
      * 输入框拿走剩余宽度。这样无论窗口多宽，按钮组始终贴着右边、不会乱飘。
      */
     if (s_searchShown) {
-        int y = S(5), hh = S(26);
+        int y = BarH() + S(6), hh = S(26);
         int bw = S(58);
         int right = W - S(8);
         int x = textX + S(8);       /* 左边从"正文左边界"起算：侧栏收起时也不会压在折叠条上 */
@@ -478,6 +1126,7 @@ void UiUpdateStatus()
         int total = (int)g_book.text.size();
         int pos = ViewAnchorOffset();
         int pct = total > 0 ? (int)((LONGLONG)pos * 1000 / total) : 0;
+        s_lastPct = pct;
         wchar_t buf[128];
         /* PDF 原始版式模式：这里要报"第几页"，因为用户看的就是一页页的图，
          * 报"第几章"对不上他眼前的内容（章和页不是一一对应）。 */
@@ -509,9 +1158,9 @@ void UiUpdateStatus()
             p2 += ab;
         }
     }
-    SendMessageW(s_hStatus, SB_SETTEXTW, 0, (LPARAM)p0.c_str());
-    SendMessageW(s_hStatus, SB_SETTEXTW, 1, (LPARAM)p1.c_str());
-    SendMessageW(s_hStatus, SB_SETTEXTW, 2, (LPARAM)p2.c_str());
+    /* 状态栏：左侧书名 + 补充信息，中间章名，右侧进度。三段都是给 UiSetStatus 的纯文本，
+     * 排版（哪段靠哪边、字号、进度条）全部由 DrawStatusBar 负责。 */
+    UiSetStatus(p0, p1, p2, g_book.Ok() ? s_lastPct : -1);
 }
 
 /* 让目录列表的选中项跟随当前阅读位置（只移动高亮，不触发跳转）。
@@ -1204,6 +1853,10 @@ void UiOpenFile(const std::wstring& path)
     UiLayout();
     ViewFocus();
     SetCursor(old);
+    /* 加载过程中临时用过的大缓冲区（原始字节、解码中间结果）此刻都已经 free 了，
+     * 但它们占的页还挂在本进程的工作集里。这里顺手压一次，打开 15 MB 的书之后
+     * 任务管理器里的数字才不会一直停在峰值上。 */
+    MemTrim();
 }
 
 /* 关掉当前这本书，回到首页书架（Ctrl+W、菜单「关闭当前书」都走这里）。无参数。
@@ -1247,6 +1900,9 @@ void UiCloseFile()
     UiLayout();
     ViewFocus();
     InvalidateRect(g_hMain, nullptr, TRUE);
+    /* 十几 MB 的正文刚交还给堆，把空闲页也一并还给系统：关掉一本书之后
+     * 任务管理器里的内存应该立刻掉回空窗口的水平，而不是等下本书来挤掉。 */
+    MemTrim();
 }
 
 /* ============================================================================
@@ -1592,7 +2248,9 @@ static bool WebProgressCb(void* ctx, int done, int total, const std::wstring& ms
     } else {
         s = L"正在抓取…";
     }
-    if (s_hStatus) SendMessageW(s_hStatus, SB_SETTEXTW, 0, (LPARAM)s.c_str());
+    /* 进度消息放到状态栏中间那段（"当前章名"平时占的位置）：抓书时章名没有意义，
+     * 中间一格最显眼。抓完由 UiUpdateStatus 立刻恢复正常三段。 */
+    if (s_hStatus) UiSetStatus(g_book.Ok() ? g_book.title : L"抓取网页小说", s, L"", -1);
 
     MSG m;
     while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) {
@@ -2791,6 +3449,16 @@ static void OnCommand(int id, int code, HWND ctl)
     case IDM_SELALL:    ViewSelectAll(); break;
     case IDM_KEYS:      ShowKeys(); break;
     case IDM_ABOUT:     ShowAbout(); break;
+    case IDM_MENU: {
+        /* 键盘唤起主菜单（Ctrl+F10）：弹在左上角「菜单」按钮的正下方，
+         * 位置和用鼠标点那个按钮完全一致。BarMenuRect 是自绘顶栏里的坐标，
+         * 顶栏贴在主窗口客户区左上角，所以对它做 ClientToScreen 就够。 */
+        RECT mr = BarMenuRect();
+        POINT mp = { mr.left, mr.bottom + S(2) };
+        if (s_hBar) ClientToScreen(s_hBar, &mp);
+        UiShowAppMenuAt(mp.x, mp.y);
+        break;
+    }
     case IDM_PHONE:       UiShowPhone(); break;
     case IDM_PHONE_JUMP:  UiJumpPhoneProgress(); break;
     case IDM_AUTO_TOGGLE: UiAutoToggle(); break;
@@ -2883,6 +3551,20 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l)
         UiLayout();
         return 0;
 
+    case WM_ERASEBKGND: {
+        /* 主窗口自己露出来的地方（侧栏与工具栏、状态栏之间的缝，卡片四周的留白）
+         * 统一刷成主题纸色。窗口类里注册的是 COLOR_3DFACE 系统灰，如果不在
+         * 这里盖掉，日间米色主题下会看到一圈系统灰边框，像没画完。
+         * 用 th.bg 而不是 th.card：卡片是"浮在纸上的块"，底色要比卡片略深一点才有层次。 */
+        HDC dc = (HDC)w;
+        RECT rc;
+        GetClientRect(h, &rc);
+        HBRUSH br = CreateSolidBrush(CurTheme().bg);
+        FillRect(dc, &rc, br);
+        DeleteObject(br);
+        return 1;
+    }
+
     case WM_GETMINMAXINFO: {
         /* 最小尺寸 600×420 是「侧栏 232 + 正文 368、还能排十来行」的经验值，过 S() 适配 DPI */
         MINMAXINFO* mmi = (MINMAXINFO*)l;
@@ -2907,13 +3589,80 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l)
         OnCommand(LOWORD(w), HIWORD(w), (HWND)l);
         return 0;
 
+    case WM_MEASUREITEM: {
+        /* 自绘列表要求父窗口给出每行高度（LBS_OWNERDRAWFIXED 只会问一次）。
+         * 行高统一 ListRowH()，目录与搜索结果共用 —— 两栏切换时行距不会跳。 */
+        MEASUREITEMSTRUCT* mis = (MEASUREITEMSTRUCT*)l;
+        if (mis && (mis->CtlID == IDC_TOC || mis->CtlID == IDC_HITS)) {
+            mis->itemHeight = (UINT)ListRowH();
+            return TRUE;
+        }
+        break;
+    }
+
     case WM_DRAWITEM: {
-        /* 只有侧栏折叠条是自绘的（BS_OWNERDRAW）。其它控件不会发这个通知，
-         * 但仍然判一下 CtlID，将来加自绘控件时不会串味。 */
+        /* 自绘控件共四类：侧栏折叠条（按钮）、目录列表、搜索结果/书签列表、
+         * 以及搜索条上的三个小按钮。全部在这里分发，绘制细节各自成函数，
+         * MainProc 只做"谁画的"判断。 */
         const DRAWITEMSTRUCT* dis = (const DRAWITEMSTRUCT*)l;
-        if (!dis || dis->CtlID != IDC_FOLD) break;
-        DrawFoldBar(dis->hDC, dis->rcItem, (dis->itemState & ODS_SELECTED) != 0);
-        return TRUE;
+        if (!dis) break;
+
+        if (dis->CtlID == IDC_BFIND || dis->CtlID == IDC_BNEXT || dis->CtlID == IDC_BCLOSE) {
+            wchar_t label[32] = { 0 };
+            GetWindowTextW(dis->hwndItem, label, 32);
+            DrawMiniButton(dis->hDC, dis->rcItem, label, dis->itemState);
+            return TRUE;
+        }
+
+        if (dis->CtlID == IDC_FOLD) {
+            DrawFoldBar(dis->hDC, dis->rcItem, (dis->itemState & ODS_SELECTED) != 0);
+            return TRUE;
+        }
+
+        if (dis->CtlID == IDC_TOC || dis->CtlID == IDC_HITS) {
+            const Theme& th = CurTheme();
+            /* 只刷"这一行"的底，绝不能刷整个控件！
+             * WM_DRAWITEM 是逐行发过来的，如果每收到一行就把整个客户区涂一次底色，
+             * 会把前面已经画好的行全盖掉 —— 表现出来就是"侧栏只剩最后一行"
+             * （这个 bug 实际踩过：目录里只看得见最下面那条章名）。
+             * 控件整体的底色由 WM_CTLCOLORLISTBOX 给画刷，见 MainProc 里那段。 */
+            HBRUSH bg = CreateSolidBrush(th.card);
+            FillRect(dis->hDC, &dis->rcItem, bg);
+            DeleteObject(bg);
+
+            if (dis->itemID != (UINT)-1) {
+                std::wstring text = ListText(dis->hwndItem, (int)dis->itemID);
+                DrawListRow(dis->hDC, dis->rcItem, text,
+                            (dis->itemState & ODS_SELECTED) != 0,
+                            dis->CtlID == IDC_HITS);   /* 命中/书签条目用次要色，章节名用正文色 */
+            }
+            return TRUE;
+        }
+        break;
+    }
+
+    case WM_CTLCOLOREDIT: {
+        /* 搜索框的底色/字色：默认是白底黑字，在米色纸面和夜间深底上都很突兀。
+         * 这里跟列表一样按主题现建画刷并缓存（每次先删旧的，防止切主题时泄漏）。 */
+        static HBRUSH s_editBrush = nullptr;
+        const Theme& teh = CurTheme();
+        if (s_editBrush) { DeleteObject(s_editBrush); s_editBrush = nullptr; }
+        s_editBrush = CreateSolidBrush(teh.card);
+        SetTextColor((HDC)w, teh.fg);
+        SetBkColor((HDC)w, teh.card);
+        return (LRESULT)s_editBrush;
+    }
+
+    case WM_CTLCOLORLISTBOX: {
+        /* 列表控件的"空白处"底色与文字色。返回一个画刷系统拿去刷底，
+         * 这里按当前主题现建、并缓存上一只以便释放（主题切换时会重建）。 */
+        static HBRUSH s_listBrush = nullptr;
+        const Theme& th = CurTheme();
+        if (s_listBrush) { DeleteObject(s_listBrush); s_listBrush = nullptr; }
+        s_listBrush = CreateSolidBrush(th.card);
+        SetTextColor((HDC)w, th.fg);
+        SetBkColor((HDC)w, th.card);
+        return (LRESULT)s_listBrush;
     }
 
     case WM_APP_STATUS: {
@@ -3038,11 +3787,14 @@ static HACCEL BuildAccel()
         { FVIRTKEY | FCONTROL,             'F',         IDM_FIND },
         { FVIRTKEY | FCONTROL,             'T',         IDM_TOC },
         { FVIRTKEY | FCONTROL,             'D',         IDM_BM_ADD },
-            { FVIRTKEY | FCONTROL,             'U',         IDM_OPEN_URL },
-            { FVIRTKEY | FCONTROL,             'S',         IDM_SOURCE },
-            { FVIRTKEY | FCONTROL,             'G',         IDM_PHONE },
-            { FVIRTKEY | FCONTROL | FSHIFT,    'G',         IDM_PHONE_JUMP },
-{ FVIRTKEY | FCONTROL,             'B',         IDM_BM_LIST },
+        { FVIRTKEY | FCONTROL,             'B',         IDM_BM_LIST },
+        { FVIRTKEY | FCONTROL,             'U',         IDM_OPEN_URL },
+        { FVIRTKEY | FCONTROL,             'S',         IDM_SOURCE },
+        { FVIRTKEY | FCONTROL,             'G',         IDM_PHONE },
+        { FVIRTKEY | FCONTROL | FSHIFT,    'G',         IDM_PHONE_JUMP },
+        /* 界面上没有菜单栏了，键盘用户要有办法把整个菜单召唤出来：
+         * Ctrl+F10 是 Windows 上的惯例（很多应用里它就是"打开右键菜单"）。 */
+        { FVIRTKEY | FCONTROL,             VK_F10,      IDM_MENU },
         { FVIRTKEY,                        VK_F2,       IDM_THEME },
         { FVIRTKEY,                        VK_F3,       IDM_FIND_NEXT },
         { FVIRTKEY,                        VK_F5,       IDM_RELOAD },
@@ -3218,7 +3970,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdLine, int)
 
     /* 控件 → 菜单 → 最近打开（依赖菜单）→ 菜单勾选状态 → 布局（依赖全部控件） */
     UiCreateChildren(inst);
-    SetMenu(g_hMain, BuildMenu());
+    /* 菜单**不挂到窗口上**：SetMenu 那条系统灰菜单栏和这套纸感界面太不搭，
+     * 而且在夜间模式下它是全窗口唯一一块亮色。改成"点左上角三条横线 / 右键"弹出同一个菜单，
+     * 快捷键（BuildAccel 那些）照旧有效，功能一个不少。 */
+    s_hAppMenu = BuildMenu();
     UiRebuildRecentMenu();
     AutoSyncMenu();
     UiLayout();

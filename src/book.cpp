@@ -201,11 +201,54 @@ static inline bool IsSpaceW(wchar_t c)
  *   - 控制字符、BOM(0xFEFF)、零宽空格(0x200B)、方向标记(0x200E/0x200F) → 删掉
  *
  * 注意：这里**不**去掉每行行首的空格。中文小说常用"两个全角空格"表示缩进，
- * 这正是排版想要的，去掉反而难看。 */
-static void Normalize(std::wstring& s)
+ * 这正是排版想要的，去掉反而难看。
+ *
+ * 实现上刻意做**原地整理**（读写指针都在同一个 wstring 里），而不是"建一个新串再 swap"：
+ * 15 MB 的小说解码后约 500 万字符（10 MB），再复制一份就是 20 MB 的峰值内存。
+ * 原地整理只用一个写指针 w：因为除了 \t 之外，输出永远**不**比输入长，写指针追不上
+ * 还没读到的字符，所以安全。\t 会被换成两个空格（输出比输入长 1 个 wchar_t），
+ * 这时原地做会踩坏还没读的数据，因此含 \t 的文本退回"整串重建"的老路。
+ * 中文小说几乎不用制表符，所以绝大多数文件都走零拷贝的原地路径。 */
+static void NormalizeByCopy(std::wstring& s)
 {
     std::wstring o;
     o.reserve(s.size() + 16);
+    bool prevNl = true;
+    for (size_t i = 0; i < s.size(); i++) {
+        wchar_t c = s[i];
+        if (c == L'\r') {
+            if (i + 1 < s.size() && s[i + 1] == L'\n') i++;
+            c = L'\n';
+        }
+        if (c == L'\n') {
+            while (!o.empty() && (o.back() == L' ' || o.back() == L'\t' || o.back() == 0x3000)) o.pop_back();
+            if (prevNl) continue;
+            o.push_back(L'\n');
+            prevNl = true;
+            continue;
+        }
+        if (c == L'\t') { o.push_back(L' '); o.push_back(L' '); prevNl = false; continue; }
+        if (c == 0x00A0) c = L' ';
+        if (c < 0x20 || c == 0x7F || c == 0xFEFF || c == 0x200B || c == 0x200E || c == 0x200F) continue;
+        o.push_back(c);
+        prevNl = false;
+    }
+    while (!o.empty() && o.back() == L'\n') o.pop_back();
+    s.swap(o);
+}
+
+static void Normalize(std::wstring& s)
+{
+    if (s.empty()) return;
+
+    /* 含制表符的文本走"重建"路径，保证 \t 仍然被换成两个空格 */
+    bool hasTab = false;
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] == L'\t') { hasTab = true; break; }
+    }
+    if (hasTab) { NormalizeByCopy(s); return; }
+
+    size_t w = 0;             /* 写指针：处理过的内容都塞回 s 的前面 */
     bool prevNl = true;   /* 起始视作换行，去掉开头空行 */
     for (size_t i = 0; i < s.size(); i++) {
         wchar_t c = s[i];
@@ -216,23 +259,22 @@ static void Normalize(std::wstring& s)
         }
         if (c == L'\n') {
             /* 先削掉这一行末尾的空格/全角空格 */
-            while (!o.empty() && (o.back() == L' ' || o.back() == L'\t' || o.back() == 0x3000)) o.pop_back();
+            while (w > 0 && (s[w - 1] == L' ' || s[w - 1] == L'\t' || s[w - 1] == 0x3000)) w--;
             if (prevNl) continue;              /* 多个空行合并成一个 */
-            o.push_back(L'\n');
+            s[w++] = L'\n';
             prevNl = true;
             continue;
         }
-        if (c == L'\t') { o.push_back(L' '); o.push_back(L' '); prevNl = false; continue; }
         if (c == 0x00A0) c = L' ';             /* 不间断空格统一成普通空格 */
         /* 控制字符 + 各种不可见字符一律丢弃 */
         if (c < 0x20 || c == 0x7F || c == 0xFEFF || c == 0x200B || c == 0x200E || c == 0x200F) continue;
-        o.push_back(c);
+        s[w++] = c;
         prevNl = false;
     }
     /* 去掉结尾的换行，避免最后多出一个空段落 */
-    while (!o.empty() && o.back() == L'\n') o.pop_back();
+    while (w > 0 && s[w - 1] == L'\n') w--;
     /* 去掉每行行首多余空格对阅读无碍，保留原样 */
-    s.swap(o);
+    s.resize(w);
 }
 
 /* ================= 分章 ================= */

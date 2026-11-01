@@ -21,6 +21,8 @@
 #include "common.h"
 #include <shlobj.h>
 #include <cwchar>
+#include <ctime>
+#include <algorithm>
 
 /* 全局唯一的设置对象，界面各处直接读写 g_set，改动后由 SettingsSave 落盘 */
 Settings g_set;
@@ -66,23 +68,156 @@ static bool EnsureUnicodeIni(const std::wstring& path)
     return true;
 }
 
-/* 程序启动时调用一次：定下 ini 路径。必须在任何 IniXxx / SettingsXxx 调用之前执行。 */
+/* 程序启动时调用一次：定下 ini 路径。必须在任何 IniXxx / SettingsXxx 调用之前执行。
+ *
+ * 这里除了"选一个可写的位置"，还多做了一件重要的事：**找回上一次的阅读记录**。
+ * 起因是真实的用户反馈——"更新之后书架里的书没了"：
+ * 绿色版把 NovelReader.ini 放在 exe 同目录，用户下新版往往解压到一个新文件夹，
+ * 于是程序看到的是一份全新的空 ini，书架当然空空如也（书本身没丢，只是记录不在这儿）。
+ *
+ * 处理原则（宁可不完美，也不能让用户以为书丢了）：
+ *   1) exe 同目录可写 → 以它为首选（保持绿色软件"拷走文件夹就带走进度"的特性）；
+ *   2) 这个 ini 里没有阅读记录时，去几个已知位置找"有阅读记录的那份"：
+ *      exe 上级目录、再上一级、这两层的子目录、%APPDATA%、%LOCALAPPDATA%、
+ *      桌面的 NovelReader\程序、下载目录的 NovelReader\程序；
+ *   3) 找到就直接**改用那一份**（不复制、不合并：任何合并都可能把用户手改过的
+ *      规则弄乱，而且原来的目录还在，继续往那儿写最不容易出错）；
+ *   4) 一个都找不到才用 exe 目录的新 ini。
+ * 找不到也还有第二道保险：ShelfRefresh 会扫 ini 里所有 f* 段把书补回书架。
+ */
+
+/* 取 exe 所在目录的上 n 级（n=1 是父目录） */
+static std::wstring DirUp(const std::wstring& dir, int n)
+{
+    std::wstring s = dir;
+    for (int i = 0; i < n; i++) {
+        size_t k = s.find_last_of(L"\\/");
+        if (k == std::wstring::npos) return s;
+        s = s.substr(0, k);
+        while (s.size() > 3 && (s.back() == L'\\' || s.back() == L'/')) s.pop_back();
+    }
+    return s;
+}
+
+/* 往候选表里追加一个 ini 路径（去重，且忽略空目录） */
+static void AddCandidate(std::vector<std::wstring>& v, const std::wstring& dir)
+{
+    if (dir.size() < 4) return;                 /* "", "C:", "C:\" 之类都跳过 */
+    std::wstring p = dir + L"\\NovelReader.ini";
+    for (size_t i = 0; i < v.size(); i++) {
+        if (_wcsicmp(v[i].c_str(), p.c_str()) == 0) return;
+    }
+    v.push_back(p);
+}
+
+/* 把 dir 下面一层子目录（最多 24 个）也当成候选目录，
+ * 覆盖"用户把新版解压到 NovelReader-1.5.0\ 而旧版在 NovelReader\ "这种常见布局。 */
+static void AddSubdirCandidates(std::vector<std::wstring>& v, const std::wstring& dir)
+{
+    if (dir.size() < 4) return;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((dir + L"\\*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    int n = 0;
+    do {
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) continue;
+        if (fd.cFileName[0] == L'.') continue;
+        AddCandidate(v, dir + L"\\" + fd.cFileName);
+        AddCandidate(v, dir + L"\\" + fd.cFileName + L"\\程序");
+        if (++n >= 24) break;                   /* 目录很多的盘也不至于卡住 */
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
+/* 这份 ini 里到底有没有"读过书"的痕迹。
+ *
+ * 判据比"文件存不存在"严格得多：新解压出来的 ini 也会存在（程序写设置时创建），
+ * 所以必须看 [recent] 有没有书、或者有没有任何一个 f* 段落里存了 path。 */
+static bool IniHasReadingData(const std::wstring& path)
+{
+    wchar_t r0[2048] = { 0 };
+    GetPrivateProfileStringW(L"recent", L"r0", L"", r0, 2048, path.c_str());
+    if (r0[0]) return true;
+
+    static std::vector<wchar_t> buf(64 * 1024);
+    DWORD n = GetPrivateProfileSectionNamesW(&buf[0], (DWORD)buf.size(), path.c_str());
+    if (n == 0) return false;
+    const wchar_t* p = &buf[0];
+    while (*p) {
+        if (p[0] == L'f') {                     /* 只可能是书的位置段 [fXXXXXXXX] */
+            wchar_t sec[64];
+            lstrcpynW(sec, p, 64);
+            wchar_t real[MAX_PATH * 2] = { 0 };
+            GetPrivateProfileStringW(sec, L"path", L"", real, MAX_PATH * 2, path.c_str());
+            if (real[0]) return true;
+        }
+        p += lstrlenW(p) + 1;
+    }
+    return false;
+}
+
 void IniInit()
 {
     std::wstring dir = ExeDir();
     std::wstring p = dir + L"\\NovelReader.ini";
-    if (EnsureUnicodeIni(p)) { s_iniPath = p; return; }   /* 首选：exe 同目录 */
 
-    /* 备选：%APPDATA%\NovelReader\NovelReader.ini（普通用户一定有写权限） */
+    /* 备选位置：%APPDATA%（普通用户一定有写权限） */
     wchar_t appdata[MAX_PATH * 2] = { 0 };
+    std::wstring appDir;
     if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, appdata))) {
-        std::wstring d = std::wstring(appdata) + L"\\NovelReader";
-        CreateDirectoryW(d.c_str(), nullptr);   /* 已存在会返回 FALSE，无所谓 */
-        s_iniPath = d + L"\\NovelReader.ini";
-        EnsureUnicodeIni(s_iniPath);
-    } else {
-        s_iniPath = p;   /* 实在不行就用原路径，至少程序不会崩 */
+        appDir = std::wstring(appdata) + L"\\NovelReader";
+        CreateDirectoryW(appDir.c_str(), nullptr);   /* 已存在会返回 FALSE，无所谓 */
     }
+    wchar_t localdata[MAX_PATH * 2] = { 0 };
+    std::wstring localDir;
+    if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, localdata))) {
+        localDir = std::wstring(localdata) + L"\\NovelReader";
+    }
+    wchar_t desktop[MAX_PATH * 2] = { 0 };
+    std::wstring deskDir;
+    if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_DESKTOPDIRECTORY, nullptr, 0, desktop))) {
+        deskDir = desktop;
+    }
+
+    /* 首选：exe 同目录。不可写就退回 %APPDATA%。 */
+    bool exeWritable = EnsureUnicodeIni(p);
+    std::wstring primary = exeWritable ? p : (appDir.empty() ? p : appDir + L"\\NovelReader.ini");
+    if (!exeWritable && !appDir.empty()) EnsureUnicodeIni(primary);
+
+    /* 首选这份里没有阅读记录 → 去找旧版本留下的那份 */
+    if (!IniHasReadingData(primary)) {
+        std::vector<std::wstring> cands;
+        /* exe 目录自己先排除（它就是 primary） */
+        std::wstring up1 = DirUp(dir, 1);
+        std::wstring up2 = DirUp(dir, 2);
+        AddCandidate(cands, up1);                       /* 老版在上一级目录 */
+        AddCandidate(cands, up1 + L"\\程序");
+        AddCandidate(cands, up1 + L"\\NovelReader");
+        AddCandidate(cands, up1 + L"\\NovelReader\\程序");
+        AddCandidate(cands, up2);
+        AddCandidate(cands, up2 + L"\\NovelReader");
+        AddCandidate(cands, up2 + L"\\NovelReader\\程序");
+        AddSubdirCandidates(cands, up1);                /* 解压成 NovelReader-1.4.0\ 这类情况 */
+        AddSubdirCandidates(cands, dir);
+        AddCandidate(cands, appDir);
+        AddCandidate(cands, localDir);
+        if (!deskDir.empty()) {
+            AddCandidate(cands, deskDir + L"\\NovelReader\\程序");
+            AddCandidate(cands, deskDir + L"\\NovelReader");
+            AddCandidate(cands, deskDir + L"\\小说阅读器\\程序");
+        }
+
+        for (size_t i = 0; i < cands.size(); i++) {
+            if (_wcsicmp(cands[i].c_str(), primary.c_str()) == 0) continue;
+            if (GetFileAttributesW(cands[i].c_str()) == INVALID_FILE_ATTRIBUTES) continue;
+            if (IniHasReadingData(cands[i])) {
+                s_iniPath = cands[i];    /* 直接改用那一份，之后继续往那儿写 */
+                return;
+            }
+        }
+    }
+
+    s_iniPath = primary;
 }
 
 /* 当前 ini 路径，"关于"对话框里展示给用户 */
@@ -253,6 +388,11 @@ void PosSaveMeta(const std::wstring& path, int off, const std::wstring& chname,
     IniSetInt(sec.c_str(), L"chn", chn);
     IniSetInt(sec.c_str(), L"pct", pct);                /* 千分数：1000 = 100.0% */
 
+    /* 最后阅读时间（Unix 秒）。只用来给首页书架排序：
+     * 书架同时从 [recent] 和 f* 段收集，没有时间戳就只能按"谁先被发现"排，
+     * 补回来的老书会莫名其妙跑到最前面。 */
+    IniSetInt(sec.c_str(), L"ts", (int)time(nullptr));
+
     /* 书名单独存一份：首页显示时不必再去解析路径（也避免路径里有各种怪字符）。
      * 只有 .txt 才把扩展名去掉：纯文本是默认格式，去掉更清爽；
      * .epub/.docx/.html/.md 则保留扩展名，因为"张三.epub"和"张三.txt"
@@ -277,8 +417,17 @@ static std::vector<ShelfItem> s_shelf;
 
 /* 重新扫一遍 ini 重建书架列表。
  *
- * 数据来源：最近打开列表（[recent] 的 r0..r9）给出"读过哪些书、什么顺序"，
- * 每本书自己的段给出进度。所以书架天然是"按最近阅读时间倒序"的。
+ * 数据来源有两个，缺一不可：
+ *   1) [recent] 的 r0..r9 —— 最近打开的顺序（用户主动打开过哪些书）；
+ *   2) ini 里所有 f* 段落 —— 只要这本书存过进度，就说明读过它。
+ * 为什么两处都要：老版本只写 [recent]，一旦这个段被写坏/被清空/被新版 ini
+ * 覆盖，书架就空了（"更新之后书没了"的报告就是这么来的）。而 f* 段落里有
+ * path 键，能独立把书补回来，等于给书架加了一道自愈能力。
+ *
+ * 排序：每本书的段里有 ts（最后阅读时间，Unix 秒），按 ts 从新到旧排；
+ * 没有 ts 的老记录排在有 ts 的后面，保持它们原来的相对顺序。
+ * 排完把顺序写回 [recent]，这样下次就算只读 [recent] 也是对的。
+ *
  * 两处细节：
  *   1) 文件已经被删/改名时标 missing，首页上灰掉且不给点（否则点了只会弹错误框）；
  *   2) 老 ini 没有 chname/title 键时，用"文件名去扩展名"当书名，章名留空。
@@ -286,32 +435,77 @@ static std::vector<ShelfItem> s_shelf;
 void ShelfRefresh()
 {
     s_shelf.clear();
+
+    /* 把一条路径加进书架（去重）。pshelf 里可能已经有它了。 */
+    struct Helper {
+        static bool Add(std::vector<ShelfItem>& out, const std::wstring& p)
+        {
+            if (p.empty()) return false;
+            for (size_t i = 0; i < out.size(); i++) {
+                if (lstrcmpiW(out[i].path.c_str(), p.c_str()) == 0) return false;
+            }
+            ShelfItem it;
+            it.path = p;
+            std::wstring sec = PosSectionFor(p);
+
+            it.title = IniGetStr(sec.c_str(), L"title", L"");
+            if (it.title.empty()) {
+                /* 老记录没有 title 键：从路径里抠出文件名当书名（.txt 去扩展名，其它格式留着） */
+                size_t slash = p.find_last_of(L"\\/");
+                it.title = (slash == std::wstring::npos) ? p : p.substr(slash + 1);
+                size_t dot = it.title.find_last_of(L'.');
+                if (dot != std::wstring::npos && dot > 0) {
+                    std::wstring ext = it.title.substr(dot);
+                    for (size_t q = 0; q < ext.size(); q++) ext[q] = (wchar_t)towlower(ext[q]);
+                    if (ext == L".txt") it.title = it.title.substr(0, dot);
+                }
+            }
+            it.chapter = IniGetStr(sec.c_str(), L"chname", L"");
+            it.ch   = IniGetInt(sec.c_str(), L"ch", 0);
+            it.chn  = IniGetInt(sec.c_str(), L"chn", 0);
+            it.pct  = IniGetInt(sec.c_str(), L"pct", -1);   /* -1 = 这本书从没存过进度 */
+            it.ts   = IniGetInt(sec.c_str(), L"ts", 0);
+            it.missing = (GetFileAttributesW(p.c_str()) == INVALID_FILE_ATTRIBUTES);
+            out.push_back(it);
+            return true;
+        }
+    };
+
+    /* 1) 先按最近打开顺序加入 */
     for (int i = 0; i < IDM_RECENT_MAX; i++) {
-        std::wstring p = RecentGet(i);
-        if (p.empty()) continue;
+        Helper::Add(s_shelf, RecentGet(i));
+    }
 
-        ShelfItem it;
-        it.path = p;
-        std::wstring sec = PosSectionFor(p);
-
-        it.title = IniGetStr(sec.c_str(), L"title", L"");
-        if (it.title.empty()) {
-            /* 老记录没有 title 键：从路径里抠出文件名当书名（.txt 去扩展名，其它格式留着） */
-            size_t slash = p.find_last_of(L"\\/");
-            it.title = (slash == std::wstring::npos) ? p : p.substr(slash + 1);
-            size_t dot = it.title.find_last_of(L'.');
-            if (dot != std::wstring::npos && dot > 0) {
-                std::wstring ext = it.title.substr(dot);
-                for (size_t q = 0; q < ext.size(); q++) ext[q] = (wchar_t)towlower(ext[q]);
-                if (ext == L".txt") it.title = it.title.substr(0, dot);
+    /* 2) 再扫所有 f* 段落，把 [recent] 里没提到的书补回来 */
+    {
+        static std::vector<wchar_t> names(64 * 1024);
+        DWORD n = GetPrivateProfileSectionNamesW(&names[0], (DWORD)names.size(),
+                                                 s_iniPath.c_str());
+        if (n > 0) {
+            const wchar_t* p = &names[0];
+            while (*p) {
+                if (p[0] == L'f') {
+                    wchar_t sec[64];
+                    lstrcpynW(sec, p, 64);
+                    std::wstring path = IniGetStr(sec, L"path", L"");
+                    Helper::Add(s_shelf, path);
+                }
+                p += lstrlenW(p) + 1;
             }
         }
-        it.chapter = IniGetStr(sec.c_str(), L"chname", L"");
-        it.ch   = IniGetInt(sec.c_str(), L"ch", 0);
-        it.chn  = IniGetInt(sec.c_str(), L"chn", 0);
-        it.pct  = IniGetInt(sec.c_str(), L"pct", -1);   /* -1 = 这本书从没存过进度 */
-        it.missing = (GetFileAttributesW(p.c_str()) == INVALID_FILE_ATTRIBUTES);
-        s_shelf.push_back(it);
+    }
+
+    /* 3) 按最后阅读时间倒序。stable_sort 保证"没有 ts 的老记录"之间不乱序。
+     * ts 只用来排序，不参与界面显示。 */
+    std::stable_sort(s_shelf.begin(), s_shelf.end(),
+                     [](const ShelfItem& a, const ShelfItem& b) { return a.ts > b.ts; });
+
+    /* 4) 把书架顺序回写 [recent]：下次启动即使只读 [recent] 也是最新的顺序。
+     * 只写前 IDM_RECENT_MAX 条（菜单里也只有这么多），其余的书仍然靠 f* 段补回来。 */
+    for (int i = 0; i < IDM_RECENT_MAX; i++) {
+        wchar_t key[16];
+        wsprintfW(key, L"r%d", i);
+        IniSetStr(L"recent", key, i < (int)s_shelf.size() ? s_shelf[(size_t)i].path : L"");
     }
 }
 

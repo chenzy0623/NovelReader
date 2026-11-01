@@ -50,6 +50,7 @@
 /* ---- 帮助菜单 ---- */
 #define IDM_KEYS        1230    /* 快捷键说明对话框 */
 #define IDM_ABOUT       1231    /* 关于对话框（含 ini 路径） */
+#define IDM_MENU        1232    /* 在左上角「菜单」按钮下方弹出主菜单（Ctrl+F10） */
 
 /* ---- 自动下滑（速度可调） ---- */
 #define IDM_AUTO_TOGGLE 1240    /* 开 / 关自动下滑（F6） */
@@ -85,8 +86,9 @@
 #define IDC_BCLOSE      2006    /* 搜索条「关闭」按钮 */
 
 #define IDC_VIEW        2010    /* 自绘阅读视图子窗口（窗口类 NRView） */
-#define IDC_STATUS      2011    /* 底部三段式状态栏 */
+#define IDC_STATUS      2011    /* 底部状态栏（自绘，窗口类 NRStatus） */
 #define IDC_FOLD        2012    /* 侧栏折叠条：一条竖着的小按钮，点一下收起/展开左侧目录 */
+#define IDC_BAR         2013    /* 顶部工具栏（自绘，窗口类 NRToolbar） */
 
 /* ---- 资源 ID ---- */
 #define IDI_APP         3001    /* 程序图标（res\app.ico，16~256 多尺寸） */
