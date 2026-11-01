@@ -288,6 +288,14 @@ void SettingsLoad()
     g_set.cSel   = (COLORREF)(uint32_t)IniGetInt(S0, L"cSel",   (int)RGB(0xBF, 0xDC, 0xF4));
     g_set.cHov   = (COLORREF)(uint32_t)IniGetInt(S0, L"cHov",   (int)RGB(0xEC, 0xE6, 0xD8));
 
+    /* ---- 1.6.0：隐私模式与老板键 ----
+     * privacy 决定窗口标题里显不显示书名；bossKey 是全局热键的组合字符串
+     * （"Ctrl+Alt+H" 这种写法，键名解析在 layout.cpp 的 KeysParse 里）。
+     * 这两个都是"全局习惯"，不跟书走，所以放 [settings] 而不是每本书的段。 */
+    g_set.privacy = IniGetInt(S0, L"privacy", 0);
+    g_set.bossKey = IniGetStr(S0, L"bossKey", L"Ctrl+Alt+H");
+    if (g_set.bossKey.empty()) g_set.bossKey = L"Ctrl+Alt+H";   /* 空串会注册成"无修饰的键"，太危险 */
+
     /* 窗口位置：四个值缺一不可，而且要有意义的大小（right>left、bottom>top）。
      * 用 -100000 当"没有记录"的哨兵，比 0 更安全（多显示器可能出现负数坐标）。 */
     int l = IniGetInt(S0, L"winL", -100000);
@@ -321,6 +329,9 @@ void SettingsSave()
     IniSetInt(S0, L"cTitle", (int)g_set.cTitle);
     IniSetInt(S0, L"cSel",   (int)g_set.cSel);
     IniSetInt(S0, L"cHov",   (int)g_set.cHov);
+    /* 1.6.0：隐私模式与老板键（老板键可以在 Ctrl+F12 里改，改完要能记住） */
+    IniSetInt(S0, L"privacy", g_set.privacy);
+    IniSetStr(S0, L"bossKey", g_set.bossKey);
     if (g_set.hasRect) {
         IniSetInt(S0, L"winL", g_set.winRect.left);
         IniSetInt(S0, L"winT", g_set.winRect.top);

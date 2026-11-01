@@ -1982,6 +1982,20 @@ static LRESULT CALLBACK KeysBoxProc(HWND h, UINT m, WPARAM w, LPARAM l)
         if (LOWORD(w) == 2) {
             KeysSave();
             UiRebuildAccel();
+            /* 老板键不在加速键表里（它是全局热键），改完得单独同步到
+             * g_set.bossKey 再重新注册，否则改了等于没改。 */
+            {
+                std::vector<KeyBind>& binds = KeyBinds();
+                for (size_t i = 0; i < binds.size(); i++) {
+                    if (binds[i].id == IDM_BOSS) {
+                        g_set.bossKey = binds[i].cur;
+                        if (g_set.bossKey.empty()) g_set.bossKey = L"Ctrl+Alt+H";
+                        SettingsSave();
+                        UiApplyBossKey();
+                        break;
+                    }
+                }
+            }
             DestroyWindow(h);
             return 0;
         }
@@ -3787,7 +3801,12 @@ static HMENU BuildMenu()
      * 和阅读/排版不是一类；但都是随时要能按到的东西，所以放最显眼的位置。 */
     AppendMenuW(hp, MF_STRING, IDM_KEYS_EDIT, L"快捷键设置(&K)...\tCtrl+F12");
     AppendMenuW(hp, MF_STRING, IDM_PRIVACY, L"隐私模式（隐藏书名）\tCtrl+Shift+H");
-    AppendMenuW(hp, MF_STRING, IDM_BOSS, L"立即隐藏 / 唤回窗口\tCtrl+Alt+H");
+    /* 老板键的组合是可以改的（Ctrl+F12），所以菜单后面的提示要现读当前值，
+     * 不能像别的项那样写死字符串。 */
+    {
+        std::wstring bossItem = L"立即隐藏 / 唤回窗口\t" + g_set.bossKey;
+        AppendMenuW(hp, MF_STRING, IDM_BOSS, bossItem.c_str());
+    }
     AppendMenuW(hp, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(hp, MF_STRING, IDM_KEYS, L"快捷键说明");
     AppendMenuW(hp, MF_STRING, IDM_ABOUT, L"关于");
