@@ -58,6 +58,10 @@
 
 主界面（TXT 大文件，左侧目录 + 正文）：
 
+![首次打开](https://github.com/chenzy0623/NovelReader/raw/main/screenshots/09-welcome.png)
+
+*第一次打开（书架还是空的）：直接把书拖进来，或按 Ctrl+O。*
+
 ![主界面](https://github.com/chenzy0623/NovelReader/raw/main/screenshots/01-main.png)
 
 全文搜索（127 处命中，带章节名和上下文）：
