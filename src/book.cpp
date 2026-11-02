@@ -85,6 +85,36 @@ static bool IsValidUtf8(const unsigned char* p, size_t n, bool* asciiOnly)
     return true;
 }
 
+/* 返回从 p 开始"连续合法 UTF-8"的字节数（遇到第一个非法/截断字节就停）。
+ * 用于"整篇基本是 UTF-8、只有末尾截断或混进个别坏字节"的容错判断。 */
+static size_t Utf8ValidPrefixLen(const unsigned char* p, size_t n)
+{
+    size_t i = 0;
+    while (i < n) {
+        unsigned char c = p[i];
+        if (c < 0x80) { i++; continue; }
+        int len;
+        unsigned int cp;
+        if ((c & 0xE0) == 0xC0)      { len = 2; cp = c & 0x1Fu; }
+        else if ((c & 0xF0) == 0xE0) { len = 3; cp = c & 0x0Fu; }
+        else if ((c & 0xF8) == 0xF0) { len = 4; cp = c & 0x07u; }
+        else return i;
+        if (i + (size_t)len > n) return i;
+        for (int k = 1; k < len; k++) {
+            unsigned char cc = p[i + k];
+            if ((cc & 0xC0) != 0x80) return i;
+            cp = (cp << 6) | (cc & 0x3Fu);
+        }
+        if (len == 2 && cp < 0x80) return i;
+        if (len == 3 && cp < 0x800) return i;
+        if (len == 4 && cp < 0x10000) return i;
+        if (cp > 0x10FFFF) return i;
+        if (cp >= 0xD800 && cp <= 0xDFFF) return i;
+        i += (size_t)len;
+    }
+    return i;
+}
+
 /* 按代码页把字节转换成 UTF-16 宽字符串，追加到 out 末尾（不清空 out）。
  * cp 可以是 CP_UTF8(65001)、936(GBK)、54936(GB18030)、CP_ACP(系统 ANSI) 等。
  * 返回 false 表示解码失败（非法字节序列），调用方会再试别的代码页。 */
@@ -169,6 +199,17 @@ static std::wstring DecodeBytes(const std::vector<char>& buf)
         if (asciiOnly) { out.reserve(n); for (size_t i = 0; i < n; i++) out.push_back((wchar_t)(unsigned char)buf[i]); return out; }
         MbToWide(CP_UTF8, (const char*)p, (int)n, out);
         return out;
+    }
+
+    /* 3.5 容错 UTF-8：整篇 95% 以上字节是合法 UTF-8、只有末尾被截断或混进个别坏字节时，
+     * 仍然按 UTF-8 解（坏字节交给系统转成 U+FFFD），而不是整本丢给 GB18030 重解。
+     * 后者会把一本好好的 UTF-8 书解成"鏂楃牬鑻嶇┕"这种乱码：章节识别、搜索、进度全废。 */
+    {
+        size_t valid = Utf8ValidPrefixLen(p, n);
+        if (n > 0 && valid * 100 >= n * 95) {
+            MbToWide(CP_UTF8, (const char*)p, (int)n, out);
+            return out;
+        }
     }
 
     /* 4. GB18030 / GBK / 系统 ANSI
@@ -284,6 +325,7 @@ static void Normalize(std::wstring& s)
 static bool IsNumChar(wchar_t c)
 {
     if (c >= L'0' && c <= L'9') return true;
+    if (c >= 0xFF10 && c <= 0xFF19) return true;   /* 全角数字 ０-９ */
     static const wchar_t* t = L"零一二三四五六七八九十百千万亿两〇壹贰叁肆伍陆柒捌玖拾佰仟";
     return wcschr(t, c) != nullptr;
 }
@@ -328,7 +370,16 @@ static bool IsChapterLine(const std::wstring& t, int off, int len, int* oOff, in
     };
     for (size_t k = 0; k < sizeof(kws) / sizeof(kws[0]); k++) {
         size_t kl = wcslen(kws[k]);
-        if ((size_t)L >= kl && wcsncmp(str, kws[k], kl) == 0) { *oOff = s; *oLen = L; return true; }
+        if ((size_t)L >= kl && wcsncmp(str, kws[k], kl) == 0) {
+            /* 纯前缀匹配会把"结局早已注定"、"正文里他写道"这种正文行也当成章节，
+             * 整本目录/进度全乱。关键词后面必须直接结束，或者跟空白 / 数字 /
+             * 冒号 / 顿号 / 括号，才算标题（"番外 一"、"结局1"、"正文（修）"都能过）。 */
+            wchar_t nx = (L > (int)kl) ? str[kl] : 0;
+            bool okTail = (nx == 0) || IsSpaceW(nx) || IsNumChar(nx) ||
+                          nx == L'：' || nx == L':' || nx == L'、' ||
+                          nx == L'【' || nx == L'（' || nx == L'(';
+            if (okTail) { *oOff = s; *oLen = L; return true; }
+        }
     }
     /* 英文写法：Chapter 1 / CHAPTER 12 */
     if (L >= 8 && (wcsncmp(str, L"Chapter", 7) == 0 || wcsncmp(str, L"CHAPTER", 7) == 0 || wcsncmp(str, L"chapter", 7) == 0)) {
@@ -336,17 +387,22 @@ static bool IsChapterLine(const std::wstring& t, int off, int len, int* oOff, in
         while (i < L && (str[i] == L' ' || str[i] == L'.' || str[i] == L':')) i++;   /* 跳过分隔符 */
         if (i < L && str[i] >= L'0' && str[i] <= L'9') { *oOff = s; *oLen = L; return true; }
     }
-    /* 第X章 / 第X节 / 第X回 ... */
-    if (str[0] == L'第') {
+    /* 第X章 / 第X节 / 第X回 ...，允许外面再套一层括号（【第12章】/（第12章）/「第12章」），
+     * 数字之间允许全角空格（"第　12　章"）—— 网文目录这两种写法都很常见，原来全漏判。 */
+    int lead = 0;
+    if (L >= 2 && (str[0] == L'【' || str[0] == L'（' || str[0] == L'(' ||
+                   str[0] == L'「' || str[0] == L'『')) lead = 1;
+    const wchar_t* b = str + lead;
+    if (b[0] == L'第') {
         int i = 1, cnt = 0;
-        /* 吃掉所有数字字符（中间允许空格，空格不算数字） */
-        while (i < L && (IsNumChar(str[i]) || str[i] == L' ')) { if (str[i] != L' ') cnt++; i++; }
-        if (cnt > 0 && i < L) {                 /* 至少要有一个数字，且后面还有单位字 */
-            wchar_t u = str[i];
+        /* 吃掉所有数字字符（中间允许空白，空白不算数字） */
+        while (lead + i < L && (IsNumChar(b[i]) || IsSpaceW(b[i]))) { if (!IsSpaceW(b[i])) cnt++; i++; }
+        if (cnt > 0 && lead + i < L) {           /* 至少要有一个数字，且后面还有单位字 */
+            wchar_t u = b[i];
             if (u && wcschr(units, u)) {
                 /* 排除 "第三回合" 这类误判：单位字后面紧跟 合/会/答 等多字词 */
-                if (i + 1 < L) {
-                    wchar_t nx = str[i + 1];
+                if (lead + i + 1 < L) {
+                    wchar_t nx = b[i + 1];
                     if (u == L'回' && (nx == L'合' || nx == L'到' || nx == L'来' || nx == L'去' || nx == L'家')) return false;
                     if (u == L'节' && (nx == L'课' || nx == L'目' || nx == L'省')) return false;
                     if (u == L'篇' && nx == L'幅') return false;
