@@ -296,6 +296,15 @@ static const KeyName kKeyNames[] = {
 
 /* 单个键名 → vk。认三种：单字符（A~Z / 0~9 / 标点，用 ASCII 大写）、
  * F1~F24、以及上面那张表里的名字（大小写不敏感）。 */
+/* 十六进制数字 → 值（NameFromVk 的 "VK%02X" 输出要能被认回来）。 */
+static int HexDigit(wchar_t c)
+{
+    if (c >= L'0' && c <= L'9') return (int)(c - L'0');
+    if (c >= L'A' && c <= L'F') return (int)(c - L'A' + 10);
+    if (c >= L'a' && c <= L'f') return (int)(c - L'a' + 10);
+    return -1;
+}
+
 static bool VkFromName(const std::wstring& raw, BYTE* vk)
 {
     if (raw.empty()) return false;
@@ -315,6 +324,13 @@ static bool VkFromName(const std::wstring& raw, BYTE* vk)
     int cnt = (int)(sizeof(kKeyNames) / sizeof(kKeyNames[0]));
     for (int i = 0; i < cnt; i++) {
         if (up == kKeyNames[i].name) { *vk = kKeyNames[i].vk; return true; }
+    }
+    /* "VK6F" 这种十六进制写法：NameFromVk 对表外的键就是这么输出的。
+     * 认不回来的话，自定义到 OEM 键、小键盘键等存一次 ini 再读就失效（界面还会显示
+     * "Ctrl+VKBF" 这种看不懂的名字）。 */
+    if (up.size() == 4 && up[0] == L'V' && up[1] == L'K') {
+        int hi = HexDigit(up[2]), lo = HexDigit(up[3]);
+        if (hi >= 0 && lo >= 0 && hi * 16 + lo > 0) { *vk = (BYTE)(hi * 16 + lo); return true; }
     }
     /* 最后当单字符键：字母数字直接用 ASCII，这正好等于 VK 值 */
     if (up.size() == 1 && up[0] > 32 && up[0] < 127) {
