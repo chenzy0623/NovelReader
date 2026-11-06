@@ -466,7 +466,19 @@ void HandleOne(SOCKET c)
             return;
         }
         std::string body;
-        body += RecToLine(SyncRec{ key, title, L"", 0, 0, 0 }) + "\n";
+        /* 首行要带真实进度：原来 off/pct/ts 写死 0，手机把这条当"电脑的进度"存下来，
+         * 于是手机永远从第 1 页开始读（ReaderActivity 里 intent 的 off 成了死代码）。 */
+        SyncRec headRec;
+        headRec.key = key;
+        headRec.title = title;
+        {
+            std::vector<SyncRec> localAll;
+            SyncLocalRecords(localAll);
+            for (size_t i = 0; i < localAll.size(); i++) {
+                if (localAll[i].key == key) { headRec = localAll[i]; break; }
+            }
+        }
+        body += RecToLine(headRec) + "\n";
         /* 正文单独放在第二行之后，保持第一行仍是记录格式 */
         int n = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), (int)text.size(), nullptr, 0, nullptr, nullptr);
         if (n > 0)

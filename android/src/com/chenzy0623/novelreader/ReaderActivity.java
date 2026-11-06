@@ -179,7 +179,10 @@ public class ReaderActivity extends Activity {
                 final int pcOff = mine.off;
                 final String pcCh = mine.chapter;
                 final int pcPct = mine.pct;
-                if (Math.abs(pcOff - pageStart) <= 200) return;
+                /* 只在"电脑读得更靠后"时才问。原来用 Math.abs：电脑落后时也会弹窗，
+                 * 点"跳过去"反而把手机进度往回拽。C++ 侧是单向的
+                 * （hit->off - mine.off <= 200），两端规则要对齐。 */
+                if (pcOff - pageStart <= 200) return;
                 ui.post(new Runnable() {
                     @Override
                     public void run() {

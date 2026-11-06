@@ -26,7 +26,7 @@ final class Discovery implements Runnable {
     static final class Peer {
         String ip = "";
         int port = 0;
-        int seenAt = 0;         /* 最后一次收到广播的时刻（毫秒） */
+        long seenAt = 0;        /* 最后一次收到广播的时刻（毫秒，必须是 long） */
     }
 
     private final Context app;
@@ -119,7 +119,9 @@ final class Discovery implements Runnable {
                 Peer p = new Peer();
                 p.ip = pkt.getAddress().getHostAddress();
                 p.port = port;
-                p.seenAt = (int) (System.currentTimeMillis() & 0x7fffffff);
+                /* 不能截成 int：跟 currentTimeMillis() 相减会恒等于 ~1.7e12，
+                 * peer() 永远判离线，同步功能整体失效。 */
+                p.seenAt = System.currentTimeMillis();
                 peer = p;
             }
         } catch (IOException e) {

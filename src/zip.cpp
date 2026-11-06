@@ -250,15 +250,35 @@ struct OutBuf {
 
     explicit OutBuf(std::string& str) : s(str) {}
 
+    size_t want = 0;   /* 中央目录声明的原始大小（不可信数据） */
+
     void Init(size_t n) {
-        s.assign(n, '\0');
-        cap = n;
+        /* 安全：n 来自 ZIP 中央目录，是不可信数据 —— 一个 108 字节的 ZIP 就能声明
+         * 4 GB，直接 assign 会瞬间吃光内存或抛 std::bad_alloc 把程序打崩。
+         * 这里只做保守预分配（上限 4 MB），真正需要更多时由 Put/CopyBack 按需增长。 */
+        const size_t kPrealloc = 4u * 1024u * 1024u;
+        size_t cap0 = n < kPrealloc ? n : kPrealloc;
+        s.assign(cap0, '\0');
+        cap = cap0;
+        want = n;
         pos = 0;
+    }
+
+    /* 预分配不够时按需增长，但绝不超过中央目录声明的原始大小。 */
+    bool Grow(size_t need) {
+        if (need > want || pos > want - need) return false;
+        size_t newCap = cap ? cap * 2 : 64u * 1024u;
+        if (newCap > want) newCap = want;
+        if (newCap < pos + need) newCap = pos + need;
+        if (newCap <= cap) return false;
+        s.resize(newCap, '\0');
+        cap = newCap;
+        return true;
     }
 
     // 写一个字节；超过预期长度说明压缩数据比声明的长，属于损坏，直接失败。
     bool Put(uint8_t b) {
-        if (pos >= cap) return false;
+        if (pos >= cap && !Grow(1)) return false;
         s[pos++] = (char)b;
         return true;
     }
@@ -268,7 +288,8 @@ struct OutBuf {
     // 那正是"重复重复重复..."这种长串能压到极小的原理。
     bool CopyBack(size_t dist, size_t len) {
         if (dist == 0 || dist > pos) return false;   // 距离越界：非法回溯
-        if (len > cap - pos) return false;           // 输出会超出声明的原始大小
+        if (len > want - pos) return false;          // 输出会超出声明的原始大小
+        if (cap < pos + len && !Grow(len)) return false;
         for (size_t k = 0; k < len; k++) {
             s[pos] = s[pos - dist];
             pos++;
@@ -493,10 +514,6 @@ bool NameEquals(const std::string& a, const std::string& b) {
 // 的起始偏移和条目数；中央目录本身是一串固定 46 字节头 + 变长字段的记录。
 // 必须从尾巴找 EOCD 而不是从头部顺序扫，原因是 zip 允许在文件最前面塞
 // 自解压代码（SFX），也可能带注释，头部偏移并不固定。
-// 单个条目「解压后大小」的上限：中央目录里是 32 位，可被伪造成 4GB。
-// 不挡住的话 InflateRaw 会按这个数字一次性预分配，直接 OOM 或长时间卡死。
-static const uint32_t kMaxEntryUncompSize = 256u * 1024u * 1024u;
-
 bool ZipArchive::Load(const uint8_t* data, size_t size) {
     m_data = data;
     m_size = size;
@@ -556,14 +573,6 @@ bool ZipArchive::Load(const uint8_t* data, size_t size) {
         if (e.compSize == 0xFFFFFFFFu || e.uncompSize == 0xFFFFFFFFu ||
             e.localOff == 0xFFFFFFFFu) {
             return false;
-        }
-
-        // 解压后大小是中央目录里写着的 32 位数，可以被伪造成 0xFFFFFFFE。
-        // 后面 InflateRaw 会按它一次性预分配，所以这里先挡掉离谱的条目
-        // （小说里的单个条目几十 MB 已经非常宽裕，256 MB 足够）。
-        if (e.uncompSize > kMaxEntryUncompSize) {
-            p += (size_t)46 + nameLen + extraLen + commentLen;
-            continue;
         }
 
         // 变长部分：名字 + 扩展字段 + 注释，三段紧挨着，长度都记录在头上
