@@ -395,7 +395,10 @@ void PdfDoc::ParseCMap(const std::string& cm, PdfFont& f) const {
             PdfSkipWs(cm, i);
             if (i < cm.size() && cm[i] == '[') {         // 逐个映射
                 i++;
-                for (uint32_t c = lo; c <= hi; c++) {
+                /* 注意：lo/hi 来自文件里的十六进制数，hi 可能是 0xFFFFFFFF。
+             * 用 "c <= hi" 当循环条件时 c 会回绕成 0 再一路加上去 —— 死循环，
+             * 界面直接卡死。所以用 64 位计数器，并在 c == hi 时主动收尾。 */
+            for (uint64_t c = lo; c <= (uint64_t)hi; c++) {
                     std::string hd;
                     if (!readHex(hd)) break;
                     std::string bytes;

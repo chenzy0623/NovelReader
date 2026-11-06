@@ -367,6 +367,23 @@ static bool FetchOnceCurl(const std::wstring& url, std::string& body, std::wstri
     cmd += L" -o \"";
     cmd += outPath;
     cmd += L"\" \"";
+    {
+        /* 网址是解析结果 + 远端 HTML 里的 href 拼出来的，不能直接丢进命令行：
+         * 一个形如 http://x/" -o C:\\temp\\a 的链接就能改写 curl 的参数（参数注入，
+         * 甚至覆盖任意可写文件）。这里只放行网址里合法的那批字符，其余一律拒绝。 */
+        bool legal = !url.empty() && url.size() < 4096;
+        for (size_t i = 0; legal && i < url.size(); i++) {
+            wchar_t c = url[i];
+            bool okChar = (c > 0x20 && c < 0x7F && c != L'"' && c != L'\'' &&
+                           c != L'`' && c != L'^' && c != L'|' && c != L'&' &&
+                           c != L'<' && c != L'>');
+            if (!okChar) legal = false;
+        }
+        if (!legal) {
+            err = L"这一章的网址里有非法字符，为安全起见不抓取。";
+            return false;
+        }
+    }
     cmd += url;
     cmd += L"\"";
 
@@ -388,9 +405,29 @@ static bool FetchOnceCurl(const std::wstring& url, std::string& body, std::wstri
         return false;
     }
     DWORD wait = WaitForSingleObject(pi.hProcess, (DWORD)ms + 8000);
-    if (wait == WAIT_TIMEOUT) TerminateProcess(pi.hProcess, 1);
+    bool timedOut = (wait == WAIT_TIMEOUT);
+    if (timedOut) TerminateProcess(pi.hProcess, 1);
+    DWORD code = 1;
+    GetExitCodeProcess(pi.hProcess, &code);
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
+
+    /* 以前完全不看 curl 的退出码：404/403/超时之后那份"错误页 / 半页"会被当成
+     * 正文写进书里，而且显示成功。现在只有正常退出（0）才去读文件。 */
+    if (timedOut) {
+        DeleteFileW(outPath.c_str());
+        err = L"抓取超时，这一章先跳过。";
+        return false;
+    }
+    if (code != 0) {
+        DeleteFileW(outPath.c_str());
+        wchar_t why[64];
+        wsprintfW(why, L"%u", (unsigned)code);
+        err = L"curl 抓取失败（退出码 ";
+        err += why;
+        err += L"）。";
+        return false;
+    }
 
     /* 读回文件内容（大小上限和 WinInet 那条路一致，防止一页过大吃内存） */
     std::string data;

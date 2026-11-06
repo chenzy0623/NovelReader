@@ -2106,10 +2106,11 @@ void UiExportNotes()
                     L"提示", MB_ICONINFORMATION);
         return;
     }
-    wchar_t path[MAX_PATH];
-    wsprintfW(path, L"%s-笔记.md", g_book.title.c_str());
+    /* 书名能长到 200 多字，MAX_PATH 缓冲直接拼会溢出；而且书名里的非法字符
+     * 还要替换。先拼成 std::wstring，再检查长度。 */
+    std::wstring path = g_book.title + L"-笔记.md";
     /* 文件名里的 \ / : * ? " < > | 会让保存失败，统一换成下划线 */
-    for (wchar_t* p = path; *p; p++) {
+    for (wchar_t* p = path.empty() ? nullptr : &path[0]; p && *p; p++) {
         if (*p == L'\\' || *p == L'/' || *p == L':' || *p == L'*' || *p == L'?' ||
             *p == L'"' || *p == L'<' || *p == L'>' || *p == L'|') *p = L'_';
     }
@@ -2118,12 +2119,11 @@ void UiExportNotes()
     for (size_t i = 0; i < g_hls.size(); i++) {
         const Highlight& h = g_hls[(size_t)i];
         if (h.note.empty()) continue;
-        wchar_t head[64];
+        /* 章名最长 60 个字（分章规则的上限），用 wchar_t[64] 拼 "## %s\n\n" 会溢出。 */
         int ch = BookChapterAtPara(g_book, BookCharToPara(g_book, h.off));
         std::wstring name = BookChapterTitle(g_book, ch);
         if (name.empty()) name = L"（开篇）";
-        wsprintfW(head, L"## %s\n\n", name.c_str());
-        text += head;
+        text += L"## " + name + L"\n\n";
         /* 原文摘录：把换行压成空格，方便在 Markdown 里当成引用块 */
         int to = h.off + h.len;
         if (to > (int)g_book.text.size()) to = (int)g_book.text.size();
@@ -2138,7 +2138,7 @@ void UiExportNotes()
     }
     std::wstring msg = L"已导出到：\n" + std::wstring(path) + L"\n\n现在打开看看吗？";
     if (MessageBoxW(g_hMain, msg.c_str(), L"导出笔记", MB_ICONINFORMATION | MB_YESNO) == IDYES) {
-        ShellExecuteW(g_hMain, L"open", path, nullptr, nullptr, SW_SHOWNORMAL);
+        ShellExecuteW(g_hMain, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
     }
 }
 
@@ -2345,6 +2345,13 @@ static LRESULT CALLBACK KeysBoxProc(HWND h, UINT m, WPARAM w, LPARAM l)
         break;
     case WM_CLOSE:
         DestroyWindow(h);
+        return 0;
+    case WM_DESTROY:
+        /* 子窗口跟着对话框一起销毁，这两个全局句柄必须立刻置空：
+         * 否则下次打开对话框前、或迟到的子类化回调里，KeysFillList /
+         * SetWindowTextW 会拿着已经失效的 HWND 继续发消息。 */
+        s_keysList = nullptr;
+        s_keysHint = nullptr;
         return 0;
     }
     return DefWindowProcW(h, m, w, l);
@@ -2744,10 +2751,21 @@ void UiRunSearch(const std::wstring& kw)
         NrTrace(L"  FillHits done");
         ShowPanel(1);
         NrTrace(L"  ShowPanel done");
-        wchar_t b[128];
-        if (s_hits.size() >= 4000) wsprintfW(b, L"“%s” 命中超过 4000 处（仅显示前 4000）", kw.c_str());
-        else wsprintfW(b, L"“%s” 共 %d 处", kw.c_str(), (int)s_hits.size());
-        s_statusExtra = b;
+        /* 关键词来自搜索框，最长可达 511 个字：原来用 wchar_t b[128] + wsprintfW，
+         * 粘一段长文本进去就会把栈写穿。改成 std::wstring 拼接，长度不受限。 */
+        {
+            wchar_t num[32];
+            wsprintfW(num, L"%d", (int)s_hits.size());
+            std::wstring msg = L"“";
+            msg += kw;
+            if (s_hits.size() >= 4000) msg += L"” 命中超过 4000 处（仅显示前 4000）";
+            else {
+                msg += L"” 共 ";
+                msg += num;
+                msg += L" 处";
+            }
+            s_statusExtra = msg;
+        }
         UiUpdateStatus();
     }
     if (s_hits.empty()) return;
@@ -3537,8 +3555,12 @@ void UiShowPhone()
             DispatchMessageW(&msg);
         }
     }
-    if (!IsWindow(dlg)) EnableWindow(g_hMain, TRUE);
-    else EnableWindow(g_hMain, TRUE);
+    /* 退出消息循环只有两种情况：窗口被关掉了（IsWindow 为假），或者收到了
+     * WM_QUIT。两种情况的收尾其实是同一件事 —— 把窗口（若还活着）销毁、
+     * 解锁主窗 —— 原来写成一个空转的 if/else 两个相同分支，等于把"一样"
+     * 抄了两遍，改一处漏一处。 */
+    if (IsWindow(dlg)) DestroyWindow(dlg);
+    EnableWindow(g_hMain, TRUE);
     SetForegroundWindow(g_hMain);
 }
 
@@ -4797,7 +4819,9 @@ void UiAutoSlower()
 static void AutoSyncMenu()
 {
     if (!g_hMain) return;
-    HMENU hm = GetMenu(g_hMain);
+    /* 1.5.0 起没有系统菜单栏（改成自绘的弹出菜单），GetMenu(g_hMain) 永远是 NULL。
+     * 勾选/置灰要作用在 s_hAppMenu 上，否则"自动下滑"的勾永远不更新。 */
+    HMENU hm = s_hAppMenu;
     if (!hm) return;
     CheckMenuItem(hm, IDM_AUTO_TOGGLE, MF_BYCOMMAND | (s_autoOn ? MF_CHECKED : MF_UNCHECKED));
     EnableMenuItem(hm, IDM_AUTO_FAST, MF_BYCOMMAND | (s_autoOn ? MF_ENABLED : MF_GRAYED));
@@ -5050,6 +5074,11 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l)
         return 0;
 
     case WM_DESTROY:
+        /* 退出前必须把后台服务停掉：同步（TCP/UDP 线程）和手机网页服务（AcceptThread）
+         * 还在 recv/send 的时候进程就退出，CRT 析构会和它们抢资源（偶发退出崩溃/卡几秒）。
+         * 这两个函数内部各自等待线程退出，必须在 PostQuitMessage 之前调用。 */
+        SyncStop();
+        ServerStop();
         PostQuitMessage(0);
         return 0;
 
@@ -5218,7 +5247,12 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l)
         const COPYDATASTRUCT* cds = (const COPYDATASTRUCT*)l;
         if (cds && cds->dwData == 0x4E52 && cds->lpData &&
             cds->cbData >= sizeof(wchar_t) * 2) {
-            std::wstring path((const wchar_t*)cds->lpData);
+            /* 不能假设对方给的数据以 0 结尾（cbData 才是真实长度），
+             * 否则读取会越过这块临时缓冲。先按长度拷，再截到第一个 0。 */
+            size_t cch = (size_t)cds->cbData / sizeof(wchar_t);
+            std::wstring path((const wchar_t*)cds->lpData, cch);
+            size_t z = path.find(L'\0');
+            if (z != std::wstring::npos) path.resize(z);
             if (!path.empty() && GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
                 UiOpenFile(path);
             }
@@ -5423,7 +5457,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdLine, int)
     LayoutFromSettings();
     KeysLoad();
     UiRebuildAccel();
-    UiApplyBossKey();     /* 老板键是全局热键，注册失败也不影响主流程 */
+    /* 老板键必须等 g_hMain 建好之后再注册：RegisterHotKey(NULL, ...) 会把热键挂到线程上，
+     * WM_HOTKEY 的 hwnd 为 NULL，DispatchMessageW 会把它丢掉 —— 表现为"启动后按老板键没反应"。
+     * 真正的注册点挪到主窗口的 WM_CREATE 里。 */
 
     /* 状态栏属于通用控件，必须先 InitCommonControlsEx 才能 CreateWindowExW 成功 */
     INITCOMMONCONTROLSEX icc;

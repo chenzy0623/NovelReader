@@ -361,9 +361,23 @@ std::string PageRead(int id, int off, std::wstring& err)
 // ---- 查询串解析 ----------------------------------------------------------
 int QueryInt(const std::string& q, const char* key, int defVal)
 {
+    /* 只能在"参数名边界"上匹配：原来的 q.find("id=") 会让 ?valid=3&id=0
+     * 命中 valid= 里的 "id="，于是开错书、跳错位置。这里按 & 切分后比较名字。 */
     std::string pat = std::string(key) + "=";
-    size_t p = q.find(pat);
-    if (p == std::string::npos) return defVal;
+    size_t p = 0;
+    bool found = false;
+    while (p < q.size()) {
+        size_t amp = q.find('&', p);
+        size_t segEnd = (amp == std::string::npos) ? q.size() : amp;
+        if (p + pat.size() <= segEnd && q.compare(p, pat.size(), pat) == 0) {
+            found = true;
+            p += pat.size();
+            break;
+        }
+        if (amp == std::string::npos) break;
+        p = amp + 1;
+    }
+    if (!found) return defVal;
     p += pat.size();
     int v = 0;
     bool any = false;

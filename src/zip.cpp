@@ -493,6 +493,10 @@ bool NameEquals(const std::string& a, const std::string& b) {
 // 的起始偏移和条目数；中央目录本身是一串固定 46 字节头 + 变长字段的记录。
 // 必须从尾巴找 EOCD 而不是从头部顺序扫，原因是 zip 允许在文件最前面塞
 // 自解压代码（SFX），也可能带注释，头部偏移并不固定。
+// 单个条目「解压后大小」的上限：中央目录里是 32 位，可被伪造成 4GB。
+// 不挡住的话 InflateRaw 会按这个数字一次性预分配，直接 OOM 或长时间卡死。
+static const uint32_t kMaxEntryUncompSize = 256u * 1024u * 1024u;
+
 bool ZipArchive::Load(const uint8_t* data, size_t size) {
     m_data = data;
     m_size = size;
@@ -552,6 +556,14 @@ bool ZipArchive::Load(const uint8_t* data, size_t size) {
         if (e.compSize == 0xFFFFFFFFu || e.uncompSize == 0xFFFFFFFFu ||
             e.localOff == 0xFFFFFFFFu) {
             return false;
+        }
+
+        // 解压后大小是中央目录里写着的 32 位数，可以被伪造成 0xFFFFFFFE。
+        // 后面 InflateRaw 会按它一次性预分配，所以这里先挡掉离谱的条目
+        // （小说里的单个条目几十 MB 已经非常宽裕，256 MB 足够）。
+        if (e.uncompSize > kMaxEntryUncompSize) {
+            p += (size_t)46 + nameLen + extraLen + commentLen;
+            continue;
         }
 
         // 变长部分：名字 + 扩展字段 + 注释，三段紧挨着，长度都记录在头上

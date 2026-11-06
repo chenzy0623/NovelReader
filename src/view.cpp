@@ -688,6 +688,10 @@ static void UpdateMetrics(bool layoutDirty)
 static int AnchorChar()
 {
     if (!g_book.Ok()) return 0;
+    /* 防御性夹取：正常调用链里 ViewSetBook/ClampAnchor 都会先把 s_aPara 复位，
+     * 但这里直接拿它去索引 paraOff，一旦哪天有人漏了复位就是空表越界。 */
+    if (s_aPara < 0) s_aPara = 0;
+    if (s_aPara > g_book.ParaCount() - 1) s_aPara = g_book.ParaCount() - 1;
     std::vector<int> st;
     LayoutPara(s_aPara, st);
     int n = (int)st.size() - 1;
@@ -773,7 +777,8 @@ static bool ChapterPageInfo(int* cur, int* total)
     if (pEnd > pStart + 4000) pEnd = pStart + 4000;   /* 一章几千段的怪书就别数了 */
 
     int perPage = ViewLinesPerPage();
-    if (TwoColumns()) perPage *= 2;
+    /* 同 ViewScrollPages：ViewLinesPerPage 已经是"一屏能放多少行（左右两栏都算）"，
+     * 再乘 2 会把总页数算成实际的一半、当前页号翻倍。 */
     if (perPage < 1) perPage = 1;
 
     int before = 0, lines = 0;
@@ -902,9 +907,9 @@ void ViewScrollLines(int n)
 void ViewScrollPages(int n)
 {
     int cnt = LinesInView(nullptr);
+    /* LinesInView 返回的行数已经把左右两栏都算进去了（BuildFlow 是一栏满了再换下一栏），
+     * 所以这里不能再乘 2 —— 乘了就是每次翻两屏，中间那一屏永远读不到。 */
     int step = cnt > 1 ? cnt - 1 : 1;
-    /* 双栏模式下"一页"是两栏，按这个步长才不会只翻半页。 */
-    if (TwoColumns()) step *= 2;
     ViewScrollLines(n * step);
 }
 
@@ -2135,8 +2140,15 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_LBUTTONDBLCLK: {
         /* 双击选整段：命中字符 -> 段落 -> 用 paraOff 的段落区间 [a, b) 作选区。段尾的 '\n'
            要像排版时那样去掉，否则复制出来的文字末尾会多一个换行，粘到一行文本框里就会多出空行。 */
+        /* 关书回到首页之后 paraOff 已经被换成空表：这时再双击（正文或书架都算）
+         * 继续往下走就会拿 paraOff[0] 解引用空指针。先挡一道。 */
+        if (!g_book.Ok()) return 0;
         int ch = HitTestChar(GET_X_LPARAM(l), GET_Y_LPARAM(l));
         int p = BookCharToPara(g_book, ch);
+        /* BookCharToPara 对越界输入会退化成 0，段落号再夹一次，
+         * 否则 p + 1 会越界到 paraOff 外面 */
+        if (p < 0) p = 0;
+        if (p > g_book.ParaCount() - 1) p = g_book.ParaCount() - 1;
         int a = (int)g_book.paraOff[(size_t)p];
         int b = (int)g_book.paraOff[(size_t)p + 1];
         if (b > a && g_book.text[(size_t)b - 1] == L'\n') b--;

@@ -315,18 +315,19 @@ int  PosLoad(const std::wstring& path);
  *
  * 比只存 off 多存那几项，纯粹是为了首页书架（见 ShelfItem 的注释）：
  * 首页不必加载全文就能显示"第 3/120 章 3.2%"。这些键是**附加信息**，
- * 老的 ini 里没有它们也能正常读（缺省值 0）。
+ * 老的书架记录没有这些键也能正常读（缺省值 0）。
  * 滚动后 2.5 秒防抖调一次，关窗口/切书时再调一次。 */
 void PosSaveMeta(const std::wstring& path, int off, const std::wstring& chname,
                  int ch, int chn, int pct);
 
 /* 重新扫一遍 ini，重建首页书架列表（最近打开的书 + 各自进度）。
  * 调用时机：启动、打开一本书之后、关掉当前书回到首页之前。
- * 结果用 ShelfItems() 取，返回的是内部常引用，别再拷贝。 */
+ * 结果用 ShelfItems() 取；它返回的是一份拷贝 —— 书架会被后台 HTTP 线程
+ * （手机网页版 /api/shelf）重建，返回引用的话界面线程遍历时会拿到悬垂指针。 */
 void ShelfRefresh();
 
-/* 首页书架的只读视图（ini.cpp 内部维护，ShelfRefresh 之后有效） */
-const std::vector<ShelfItem>& ShelfItems();
+/* 首页书架的当前内容（ini.cpp 内部维护，ShelfRefresh 之后有效；返回拷贝） */
+std::vector<ShelfItem> ShelfItems();
 
 /* =====================================================================
  * 每本书的排版 / 高亮笔记 / 快捷键 (layout.cpp)

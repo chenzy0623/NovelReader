@@ -147,6 +147,8 @@ static bool HlDecode(const std::wstring& text, Highlight* out)
     int off = 0, len = 0, color = 0;
     if (swscanf_s(text.c_str(), L"%d,%d,%d", &off, &len, &color) != 3) return false;
     if (off < 0 || len <= 0) return false;
+    /* 长度上限：ini 里的数字是手改得动的，给个上界避免 off+len 溢出 */
+    if (len > 100000) len = 100000;
     if (color < 0) color = 0;
     if (color > 3) color = 3;
     out->off = off;

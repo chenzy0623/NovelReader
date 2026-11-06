@@ -28,8 +28,8 @@ int wmain(int argc, wchar_t** argv)
     if (!ok) { Ln(L"FAIL: " + err); return 1; }
 
     wchar_t buf[256];
-    wsprintfW(buf, L"ok  %llu ms  chars=%d  paras=%d  chapters=%d",
-              (unsigned long long)(t1 - t0), (int)b.text.size(), b.ParaCount(), (int)b.chapters.size());
+    wsprintfW(buf, L"ok  %u ms  chars=%d  paras=%d  chapters=%d",
+              (unsigned)(t1 - t0), (int)b.text.size(), b.ParaCount(), (int)b.chapters.size());
     Ln(buf);
     Ln(L"title: " + b.title);
 
@@ -63,8 +63,8 @@ int wmain(int argc, wchar_t** argv)
         ULONGLONG s0 = GetTickCount64();
         BookSearch(b, argv[2], hits, 4000);
         ULONGLONG s1 = GetTickCount64();
-        wsprintfW(buf, L"search '%s': %d hits in %llu ms", argv[2], (int)hits.size(),
-                  (unsigned long long)(s1 - s0));
+        wsprintfW(buf, L"search '%s': %d hits in %u ms", argv[2], (int)hits.size(),
+                  (unsigned)(s1 - s0));
         Ln(buf);
         for (int i = 0; i < 5 && i < (int)hits.size(); i++) {
             const Hit& h = hits[(size_t)i];

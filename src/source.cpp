@@ -134,6 +134,9 @@ void SourceSave()
     SourceEnsureBuiltin();
 
     wchar_t sec[] = L"sources";
+    /* 先读上一次的个数，再写新的 n：顺序反了 oldN 恒等于新值，
+     * 下面"清理幽灵书源"的循环就永远不执行（删掉的书源键会一直留在 ini 里）。 */
+    int oldN = IniGetInt(sec, L"n", 0);
     IniSetInt(sec, L"n", (int)s_sources.size());
     IniSetInt(sec, L"cur", s_current);
 
@@ -152,7 +155,6 @@ void SourceSave()
      * 用户手改 ini 时会看到一堆"幽灵书源"。
      * 只清到"上一次写进 ini 的个数"为止 —— 全清到 kMaxSources 会让新装的
      * ini 里多出 90 行空键，反而更难手改。 */
-    int oldN = IniGetInt(sec, L"n", 0);
     if (oldN > kMaxSources) oldN = kMaxSources;
     for (size_t i = s_sources.size(); i < (size_t)oldN; i++) {
         std::wstring prefix = L"s" + std::to_wstring(i) + L"_";

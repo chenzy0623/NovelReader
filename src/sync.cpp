@@ -146,7 +146,7 @@ bool LineToRec(const std::string& line, SyncRec& r)
  * 只用它做"这是不是同一本书"的判等，不做安全用途，所以碰撞概率够低就行。 */
 unsigned long long Fnv64(const std::wstring& s)
 {
-    unsigned long long h = 1469598103934665603ULL;
+    unsigned long long h = 14695981039346656037ULL;   /* FNV-1a 64 位的标准初始值 */
     for (size_t i = 0; i < s.size(); i++)
     {
         unsigned int c = (unsigned int)s[i];
@@ -162,6 +162,9 @@ unsigned long long Fnv64(const std::wstring& s)
 
 const int kTcpPort = 8233;          /* 同步对话端口（1.1.0 的网页服务是 8231，避开） */
 const int kUdpPort = 8234;          /* 广播发现端口 */
+/* 停服时等线程退出的上限：必须大于单请求的 5 秒收发热超时，否则会在线程
+ * 还在用套接字的时候 WSACleanup */
+const DWORD kStopWaitMs = 8000;
 
 volatile LONG g_stopFlag = 0;
 bool g_running = false;
@@ -181,6 +184,52 @@ struct Peer
     bool valid = false;
 };
 Peer g_peer;
+
+/* g_peer 是"广播线程写、界面线程读"的共享数据：ip 和 port 必须来自同一次广播，
+ * 否则会出现"连着上次那台机器的端口"这种事。所以整块结构用读写锁保护，
+ * 写的时候一次写完，读的时候先拷一份出来再用（绝不在锁外摸成员）。
+ * g_selfId 只在 SyncStart 里写一次（线程起来之前），之后只读，不需要锁。 */
+SRWLOCK g_peerLock = SRWLOCK_INIT;
+
+/* 写入对端信息（广播线程调用） */
+void SetPeer(const std::wstring& ip, int port, const std::wstring& name)
+{
+    AcquireSRWLockExclusive(&g_peerLock);
+    g_peer.ip = ip;
+    g_peer.port = port;
+    g_peer.name = name;
+    g_peer.seen = GetTickCount();
+    g_peer.valid = true;
+    ReleaseSRWLockExclusive(&g_peerLock);
+}
+
+/* 取一份对端快照（界面线程调用）：valid/seens 都一起带出来，避免两次读之间状态变了 */
+bool GetPeer(std::wstring& ip, int& port, std::wstring& name, DWORD* seen)
+{
+    bool ok = false;
+    AcquireSRWLockShared(&g_peerLock);
+    if (g_peer.valid) {
+        ip = g_peer.ip;
+        port = g_peer.port;
+        name = g_peer.name;
+        if (seen) *seen = g_peer.seen;
+        ok = true;
+    }
+    ReleaseSRWLockShared(&g_peerLock);
+    return ok;
+}
+
+/* 清掉对端（停服时调用） */
+void ClearPeer()
+{
+    AcquireSRWLockExclusive(&g_peerLock);
+    g_peer.valid = false;
+    g_peer.ip.clear();
+    g_peer.name.clear();
+    g_peer.port = 0;
+    ReleaseSRWLockExclusive(&g_peerLock);
+}
+
 /* 本机的会话 id：广播里带上它，收到自己的包就忽略。
  * 不加这个的话，自己发的广播会被自己的监听收到，程序会把自己当成"手机"去连自己，
  * 于是"两边进度一样"、永远不弹同步提示（这个坑实测踩过一次）。 */
@@ -188,7 +237,7 @@ std::string g_selfId;
 
 std::wstring IpToW(const sockaddr_in& a)
 {
-    unsigned char* b = (unsigned char*)&a.sin_addr;
+    const unsigned char* b = (const unsigned char*)&a.sin_addr;
     wchar_t buf[64];
     wsprintfW(buf, L"%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
     return buf;
@@ -251,11 +300,7 @@ DWORD WINAPI UdpThread(LPVOID)
 
 
         /* 同一台机器的多条网卡会重复广播，按 IP 覆盖即可 */
-        g_peer.ip = IpToW(from);
-        g_peer.port = port;
-        g_peer.name = who[0] ? L"手机" : L"设备";
-        g_peer.seen = GetTickCount();
-        g_peer.valid = true;
+        SetPeer(IpToW(from), port, who[0] ? L"手机" : L"设备");
     }
     return 0;
 }
@@ -317,14 +362,43 @@ void Respond(SOCKET c, int code, const char* reason, const std::string& body, co
  * 甚至没开书；等下次打开那本书时再用指纹去查。 */
 void StorePeerRec(const SyncRec& r)
 {
-    wchar_t key[64];
+    /* 这段数据是局域网里"别人"POST 过来的，长度完全不受我们控制。
+     * 以前直接 wsprintfW 进 wchar_t[64] / [512]，一条超长请求就能把栈写穿
+     * （远程栈溢出）。现在先校验、再截断：
+     *   - 指纹必须是 16 位十六进制，其它一律当坏包丢掉（ini 键名也不会被污染）
+     *   - 章节名截到 kMaxChapterLen 个字，书名截到 kMaxTitleLen 个字
+     * 键名 + 值都在拼之前算好长度，确保不超过缓冲区。 */
+    const int kMaxChapterLen = 160;
+    const int kMaxTitleLen = 120;
+
+    if (r.key.size() != 16) return;
+    for (size_t i = 0; i < r.key.size(); i++) {
+        wchar_t c = r.key[i];
+        bool hex = (c >= L'0' && c <= L'9') || (c >= L'a' && c <= L'f') || (c >= L'A' && c <= L'F');
+        if (!hex) return;
+    }
+
+    std::wstring chapter = r.chapter;
+    if ((int)chapter.size() > kMaxChapterLen) chapter.resize(kMaxChapterLen);
+    std::wstring title = r.title;
+    if ((int)title.size() > kMaxTitleLen) title.resize(kMaxTitleLen);
+
+    wchar_t key[32];
     wsprintfW(key, L"k%s", r.key.c_str());
-    wchar_t val[512];
-    wsprintfW(val, L"%d|%d|%d|%s", r.off, r.pct, r.ts, r.chapter.c_str());
+
+    /* 一屏字的章节名按最坏情况（全角 2 字节）也不到 512，这里再兜一层 */
+    std::wstring val = std::to_wstring(r.off);
+    val += L"|";
+    val += std::to_wstring(r.pct);
+    val += L"|";
+    val += std::to_wstring(r.ts);
+    val += L"|";
+    val += chapter;
     IniSetStr(L"sync", key, val);
+
     /* 书名单独存一份：万一这台机器上没有这本书，也能在提示里说出是哪本 */
     wsprintfW(key, L"t%s", r.key.c_str());
-    IniSetStr(L"sync", key, r.title);
+    IniSetStr(L"sync", key, title);
 }
 
 /* 处理一个请求。返回后由调用方关闭套接字。 */
@@ -809,24 +883,28 @@ void SyncStop()
         InterlockedExchange(&g_stopFlag, 1);
         if (g_tcp != INVALID_SOCKET) { closesocket(g_tcp); g_tcp = INVALID_SOCKET; }
         if (g_udp != INVALID_SOCKET) { closesocket(g_udp); g_udp = INVALID_SOCKET; }
-        if (g_thTcp) { WaitForSingleObject(g_thTcp, 3000); CloseHandle(g_thTcp); g_thTcp = nullptr; }
-        if (g_thUdp) { WaitForSingleObject(g_thUdp, 3000); CloseHandle(g_thUdp); g_thUdp = nullptr; }
-        if (g_thCast) { WaitForSingleObject(g_thCast, 3000); CloseHandle(g_thCast); g_thCast = nullptr; }
+        if (g_thTcp) { WaitForSingleObject(g_thTcp, kStopWaitMs); CloseHandle(g_thTcp); g_thTcp = nullptr; }
+        if (g_thUdp) { WaitForSingleObject(g_thUdp, kStopWaitMs); CloseHandle(g_thUdp); g_thUdp = nullptr; }
+        if (g_thCast) { WaitForSingleObject(g_thCast, kStopWaitMs); CloseHandle(g_thCast); g_thCast = nullptr; }
+        ClearPeer();
         return;
     }
 
     /* 先置标志再关套接字：阻塞在 accept/recvfrom 上的线程会立刻返回并退出循环，
      * 顺序反了线程会以为只是"临时失败"，接着用一个已经关掉的句柄再试一次。 */
+    g_running = false;
     InterlockedExchange(&g_stopFlag, 1);
     if (g_tcp != INVALID_SOCKET) { closesocket(g_tcp); g_tcp = INVALID_SOCKET; }
     if (g_udp != INVALID_SOCKET) { closesocket(g_udp); g_udp = INVALID_SOCKET; }
 
-    if (g_thTcp) { WaitForSingleObject(g_thTcp, 3000); CloseHandle(g_thTcp); g_thTcp = nullptr; }
-    if (g_thUdp) { WaitForSingleObject(g_thUdp, 3000); CloseHandle(g_thUdp); g_thUdp = nullptr; }
-    if (g_thCast) { WaitForSingleObject(g_thCast, 3000); CloseHandle(g_thCast); g_thCast = nullptr; }
+    /* 等待时间必须长于单个请求的最长处理时间（SO_RCVTIMEO/SO_SNDTIMEO 都是 5 秒），
+     * 否则线程可能还在 recv/send 的时候我们就 WSACleanup 了 —— 那是未定义行为，
+     * 而且下次开同步时旧线程会去抢新套接字。 */
+    if (g_thTcp) { WaitForSingleObject(g_thTcp, kStopWaitMs); CloseHandle(g_thTcp); g_thTcp = nullptr; }
+    if (g_thUdp) { WaitForSingleObject(g_thUdp, kStopWaitMs); CloseHandle(g_thUdp); g_thUdp = nullptr; }
+    if (g_thCast) { WaitForSingleObject(g_thCast, kStopWaitMs); CloseHandle(g_thCast); g_thCast = nullptr; }
 
-    g_running = false;
-    g_peer.valid = false;
+    ClearPeer();
     g_selfId.clear();
     WSACleanup();
 }
@@ -835,11 +913,15 @@ bool SyncRunning() { return g_running; }
 
 std::wstring SyncPeerUrl()
 {
-    if (!g_running || !g_peer.valid) return std::wstring();
+    if (!g_running) return std::wstring();
+    std::wstring ip, name;
+    int port = 0;
+    DWORD seen = 0;
+    if (!GetPeer(ip, port, name, &seen)) return std::wstring();
     /* 15 秒没再收到广播就当它离线了（手机锁屏时广播会停） */
-    if (GetTickCount() - g_peer.seen > 15000) return std::wstring();
+    if (GetTickCount() - seen > 15000) return std::wstring();
     wchar_t buf[128];
-    wsprintfW(buf, L"%s|%d", g_peer.ip.c_str(), g_peer.port);
+    wsprintfW(buf, L"%s|%d", ip.c_str(), port);
     std::wstring s = buf;
     return s;
 }
@@ -847,13 +929,17 @@ std::wstring SyncPeerUrl()
 std::vector<std::wstring> SyncPeers()
 {
     std::vector<std::wstring> out;
-    if (!g_running || !g_peer.valid) return out;
-    DWORD age = GetTickCount() - g_peer.seen;
+    if (!g_running) return out;
+    std::wstring ip, name;
+    int port = 0;
+    DWORD seen = 0;
+    if (!GetPeer(ip, port, name, &seen)) return out;
+    DWORD age = GetTickCount() - seen;
     if (age > 15000) return out;
 
     wchar_t buf[256];
-    wsprintfW(buf, L"%s:%d  %s  %u 秒前", g_peer.ip.c_str(), g_peer.port,
-              g_peer.name.c_str(), (unsigned)(age / 1000));
+    wsprintfW(buf, L"%s:%d  %s  %u 秒前", ip.c_str(), port,
+              name.c_str(), (unsigned)(age / 1000));
     out.push_back(buf);
     return out;
 }

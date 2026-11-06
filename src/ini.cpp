@@ -428,6 +428,14 @@ void PosSaveMeta(const std::wstring& path, int off, const std::wstring& chname,
  * 和窗口/控件无关；ui.cpp 只管把它画出来。 */
 static std::vector<ShelfItem> s_shelf;
 
+/* s_shelf 会被两个线程碰：
+ *   - 界面线程（画书架 / 菜单）不停读它；
+ *   - 后台 HTTP 线程（手机网页版的 /api/shelf）每次请求都调 ShelfRefresh() 重建它。
+ * 重建时 clear() + push_back() 会让界面线程手里的引用变成悬垂指针（实测能崩）。
+ * 所以：重建在本地 vector 上做完再整块换进去（写锁），读的一律先拷一份（读锁）。
+ * 拷贝量只有十几条记录，代价可以忽略。 */
+static SRWLOCK s_shelfLock = SRWLOCK_INIT;
+
 /* 重新扫一遍 ini 重建书架列表。
  *
  * 数据来源有两个，缺一不可：
@@ -447,7 +455,9 @@ static std::vector<ShelfItem> s_shelf;
  */
 void ShelfRefresh()
 {
-    s_shelf.clear();
+    /* 先把新书架建在本地（fresh），全程不碰 s_shelf，
+     * 最后再整块换回去 —— 这样界面线程任何时刻看到的都是一份完整的书架。 */
+    std::vector<ShelfItem> fresh;
 
     /* 把一条路径加进书架（去重）。pshelf 里可能已经有它了。 */
     struct Helper {
@@ -486,7 +496,7 @@ void ShelfRefresh()
 
     /* 1) 先按最近打开顺序加入 */
     for (int i = 0; i < IDM_RECENT_MAX; i++) {
-        Helper::Add(s_shelf, RecentGet(i));
+        Helper::Add(fresh, RecentGet(i));
     }
 
     /* 2) 再扫所有 f* 段落，把 [recent] 里没提到的书补回来 */
@@ -501,7 +511,7 @@ void ShelfRefresh()
                     wchar_t sec[64];
                     lstrcpynW(sec, p, 64);
                     std::wstring path = IniGetStr(sec, L"path", L"");
-                    Helper::Add(s_shelf, path);
+                    Helper::Add(fresh, path);
                 }
                 p += lstrlenW(p) + 1;
             }
@@ -510,22 +520,35 @@ void ShelfRefresh()
 
     /* 3) 按最后阅读时间倒序。stable_sort 保证"没有 ts 的老记录"之间不乱序。
      * ts 只用来排序，不参与界面显示。 */
-    std::stable_sort(s_shelf.begin(), s_shelf.end(),
+    std::stable_sort(fresh.begin(), fresh.end(),
                      [](const ShelfItem& a, const ShelfItem& b) { return a.ts > b.ts; });
+
+    /* 换进去（写锁，只做一次指针交换，界面线程不会看到半成品） */
+    AcquireSRWLockExclusive(&s_shelfLock);
+    s_shelf.swap(fresh);
+    ReleaseSRWLockExclusive(&s_shelfLock);
 
     /* 4) 把书架顺序回写 [recent]：下次启动即使只读 [recent] 也是最新的顺序。
      * 只写前 IDM_RECENT_MAX 条（菜单里也只有这么多），其余的书仍然靠 f* 段补回来。 */
+    std::vector<ShelfItem> snap = ShelfItems();
     for (int i = 0; i < IDM_RECENT_MAX; i++) {
         wchar_t key[16];
         wsprintfW(key, L"r%d", i);
-        IniSetStr(L"recent", key, i < (int)s_shelf.size() ? s_shelf[(size_t)i].path : L"");
+        IniSetStr(L"recent", key, i < (int)snap.size() ? snap[(size_t)i].path : L"");
     }
 }
 
-/* 给界面取书架内容用（只读引用，避免每次绘制都拷贝一堆字符串） */
-const std::vector<ShelfItem>& ShelfItems()
+/* 给界面取书架内容用。
+ *
+ * 这里返回的是**拷贝**而不是引用：后台 HTTP 线程可能正在重建书架，
+ * 返回引用的话界面线程拿着它遍历时容器可能已经被 clear() 掉（悬垂引用）。
+ * 书架最多十来本，一次拷贝只有几个字符串，绘制时这点开销可以忽略。 */
+std::vector<ShelfItem> ShelfItems()
 {
-    return s_shelf;
+    AcquireSRWLockShared(&s_shelfLock);
+    std::vector<ShelfItem> copy = s_shelf;
+    ReleaseSRWLockShared(&s_shelfLock);
+    return copy;
 }
 
 /* ---------------- 最近打开 ---------------- */

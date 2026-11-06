@@ -378,7 +378,12 @@ HBITMAP RenderPageToBitmap(int index, int targetW, int* outW, int* outH)
      * 既然调用方传进来的 targetW 就是最终显示宽度，1:1 渲染 + HALFTONE 贴图
      * 基本是等尺寸搬运、不会二次重采样，中文小字照样清楚。 */
     const int renderW = destW;
-    int renderH = (int)(pageHpt * renderW / pageWpt + 0.5);
+    /* 页面高度是 PDF 里的数字，可能是 1e9（或者 pageWpt 极小时算成 inf/nan）：
+     * 直接乘完转 int 会溢出成负数/垃圾值，然后去申请一张巨图把内存吃光。
+     * 这里夹一个上限（2 万像素，A4 竖版 2 倍超采样也才 2000 出头）。 */
+    double hCalc = pageHpt * (double)renderW / (pageWpt > 0.0 ? pageWpt : 1.0);
+    if (!(hCalc > 0.0) || hCalc > 20000.0) hCalc = 20000.0;
+    int renderH = (int)(hCalc + 0.5);
     if (renderH < 1) renderH = 1;
 
     /* 临时文件名（序号递增，避免上一轮文件句柄没释放就被覆盖） */

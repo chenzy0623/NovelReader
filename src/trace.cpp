@@ -30,7 +30,10 @@ void NrTrace(const wchar_t* fmt, ...)
 {
     /* 单条日志上限 2000 字符，超了会被截断（wvsprintfW 不做边界检查，
      * 所以缓冲区必须给得比实际需要的宽裕些） */
+    /* 必须清零：wvsprintfW 遇到不支持的格式（%f/%llu）可能一个字都不写，
+     * 后面 std::wstring line = buf 就会读到未初始化的栈内容。 */
     wchar_t buf[2000];
+    buf[0] = 0;
     va_list ap;
     va_start(ap, fmt);
     wvsprintfW(buf, fmt, ap);   /* wsprintf 子集，不支持 %llu，够用 */
