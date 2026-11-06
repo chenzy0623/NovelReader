@@ -689,7 +689,9 @@ void PdfDoc::RunContent(const std::string& cs, int page,
         return true;
     };
 
+    size_t tokGuard = 0;
     while (i < cs.size()) {
+        if (++tokGuard > 2000000) break;   /* 内容流记号总数上限，防异常长流拖死 */
         PdfSkipWs(cs, i);
         if (i >= cs.size()) break;
         char c = cs[i];
@@ -731,6 +733,10 @@ void PdfDoc::RunContent(const std::string& cs, int page,
             i++;
             Operand arr; arr.type = 4; arr.num = 0;
             while (i < cs.size()) {
+                /* 恶意/损坏 PDF 能塞一个几十万元素的数组（[0 0 0 ...]），每个元素
+                 * 都是带 string+vector 的 Operand，内存会被吃光（实测 62KB 的 PDF
+                 * 在 32 位下直接 bad_alloc 崩溃）；正常 TJ 数组几百个元素就到头了。 */
+                if (arr.arr.size() > 100000) break;
                 PdfSkipWs(cs, i);
                 if (i >= cs.size()) break;
                 if (cs[i] == ']') { i++; break; }

@@ -230,9 +230,17 @@ std::wstring IniFilePath()
  * 超长会被 API 截断（私有的 ini API 就是这么设计的）。 */
 std::wstring IniGetStr(const wchar_t* sec, const wchar_t* key, const wchar_t* def)
 {
-    wchar_t buf[2048] = { 0 };
-    GetPrivateProfileStringW(sec, key, def ? def : L"", buf, 2048, s_iniPath.c_str());
-    return std::wstring(buf);
+    /* 不能用定长 2048：字体文件列表这类值会越攒越长（十几条就超），被静默截断。
+     * GetPrivateProfileStringW 返回实际写入的字符数，等于缓冲区大小-1 就是被截断了，
+     * 加倍重试到 1M 字符为止（防止异常 ini 死循环）。 */
+    std::vector<wchar_t> buf(512);
+    for (;;) {
+        DWORD n = GetPrivateProfileStringW(sec, key, def ? def : L"", &buf[0],
+                                           (DWORD)buf.size(), s_iniPath.c_str());
+        if ((size_t)n + 1 < buf.size()) return std::wstring(&buf[0], (size_t)n);
+        if (buf.size() >= (size_t)1 << 20) return std::wstring(&buf[0], (size_t)n);
+        buf.resize(buf.size() * 2);
+    }
 }
 
 /* 写字符串键。注意：传空串等于删除这个键。 */

@@ -5251,12 +5251,13 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l)
         const COPYDATASTRUCT* cds = (const COPYDATASTRUCT*)l;
         if (cds && cds->dwData == 0x4E52 && cds->lpData &&
             cds->cbData >= sizeof(wchar_t) * 2) {
-            /* 不能假设对方给的数据以 0 结尾（cbData 才是真实长度），
-             * 否则读取会越过这块临时缓冲。先按长度拷，再截到第一个 0。 */
-            size_t cch = (size_t)cds->cbData / sizeof(wchar_t);
-            std::wstring path((const wchar_t*)cds->lpData, cch);
-            size_t z = path.find(L'\0');
-            if (z != std::wstring::npos) path.resize(z);
+            /* 必须按 cbData 限长：对端可能给一个不含 '\0' 的缓冲区，
+             * 直接当 NUL 结尾宽串读会读越界（读到别的进程的临时缓冲）。 */
+            size_t maxChars = (size_t)cds->cbData / sizeof(wchar_t);
+            const wchar_t* pw = (const wchar_t*)cds->lpData;
+            size_t plen = 0;
+            while (plen < maxChars && pw[plen] != L'\0') plen++;
+            std::wstring path(pw, plen);
             if (!path.empty() && GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
                 UiOpenFile(path);
             }
