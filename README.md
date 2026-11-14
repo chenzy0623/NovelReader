@@ -1,13 +1,13 @@
 # 小说阅读器 NovelReader
 
 一个**单文件、免安装、零依赖**的 Windows 小说阅读器。用 C++17 + Win32 从零写成，
-**1013 KB** 一个 exe，双击就能用，不写注册表、不装运行库、不需要联网。
+**1076 KB** 一个 exe，双击就能用，不写注册表、不装运行库、不需要联网。
 
 支持 **TXT / EPUB / PDF / DOCX / HTML / Markdown**，自动识别章节，全文搜索，
 记忆阅读位置，自动下滑，书签，换字体，自定义配色，还能直接把网页小说抓成本地书。
 
-![版本](https://img.shields.io/badge/version-1.7.0-blue)
-![体积](https://img.shields.io/badge/size-1013%20KB-brightgreen)
+![版本](https://img.shields.io/badge/version-1.8.0-blue)
+![体积](https://img.shields.io/badge/size-1076%20KB-brightgreen)
 ![平台](https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-lightgrey)
 ![依赖](https://img.shields.io/badge/dependencies-none-success)
 ![许可](https://img.shields.io/badge/license-MIT-orange)
@@ -20,9 +20,9 @@
 
 到 [Releases](https://github.com/chenzy0623/NovelReader/releases) 下载最新版：
 
-- **[NovelReader-1.7.0-win64.zip](https://github.com/chenzy0623/NovelReader/releases/download/v1.7.0/NovelReader-1.7.0-win64.zip)**（推荐，含使用说明和示例小说）
-- [单个 NovelReader.exe](https://github.com/chenzy0623/NovelReader/releases/download/v1.7.0/NovelReader.exe)（只要程序本体）
-- **[NovelReader-1.7.0.apk](https://github.com/chenzy0623/NovelReader/releases/download/v1.7.0/NovelReader-1.7.0.apk)**（安卓端，69 KB，Android 5.0+ 直接装）
+- **[NovelReader-1.8.0-win64.zip](https://github.com/chenzy0623/NovelReader/releases/download/v1.8.0/NovelReader-1.8.0-win64.zip)**（推荐，含使用说明和示例小说）
+- [单个 NovelReader.exe](https://github.com/chenzy0623/NovelReader/releases/download/v1.8.0/NovelReader.exe)（只要程序本体）
+- **[NovelReader-1.8.0.apk](https://github.com/chenzy0623/NovelReader/releases/download/v1.8.0/NovelReader-1.8.0.apk)**（安卓端，69 KB，Android 5.0+ 直接装）
 
 解压任意目录，双击 `NovelReader.exe` 即可。**绿色版**：阅读进度存在 exe 同目录的
 `NovelReader.ini`（目录不可写时自动改用 `%APPDATA%\NovelReader\`），删掉 ini 就等于恢复出厂。
@@ -54,10 +54,14 @@
 | 老板键 / 隐私模式 | `Ctrl+Alt+H` 一键藏窗口（全局热键，切走也能召回）；隐私模式把书名换成「文档」 |
 | 手机同步 | 手机装 APK，和电脑在同一个 WiFi 里各自打开「同步」，两边读到哪互相比对，进度差得多会先问你要不要跳 |
 | 书源搜索 | `Ctrl+S` 按书源搜书名/作者，选中就下载整本、分好章直接读；书源可整套替换（见下） |
+| 多源同时搜 | 勾上「搜全部源」，几个书源同时问一遍，结果带 `[书源名]` 前缀、同名自动去重，下载用产出这条结果的那个源的规则 |
+| 书源导入导出 | 书源管理里一键导出成 JSON（`.json` 里就是规则本身，可以直接发给别人），也能导入别人的规则集；重名的自动跳过 |
 | 手机阅读 | 局域网 HTTP 服务，手机浏览器直接读（菜单位置：帮助 → 手机阅读） |
 | 大文件 | 14.7 MB / 8794 章实测 0.8 秒载入，只渲染可视区域，滚动不掉帧 |
 | 目录收起 | 点侧栏底部「‹ 收起目录」或 `Ctrl+T`，正文占满整屏 |
 | 单实例 | 重复双击不会开出第二个窗口互相覆盖进度，而是把文件转发给已开着的那个 |
+| 检查更新 | 帮助 → 检查更新：只读 GitHub 的 releases 接口，有新版就告诉你并打开下载页（不会偷偷替换 exe） |
+| 崩溃转储 | 万一崩了，`%LOCALAPPDATA%\NovelReader\crashes` 里留一份 `.dmp` + 同名文本摘要（版本、异常码、地址），保留最近 5 份 |
 
 ---
 
@@ -147,6 +151,48 @@ EPUB：
 - **状态栏**：书名 / 章节 / 进度三段，底部一条通栏进度线；自动下滑时右侧多一个 `▸自动 4`。
 - **搜索条**：输入框和三个按钮都跟着配色走，没有系统灰和立体边框。
 - 菜单栏被拿掉了（系统灰条在夜间配色下是全场唯一亮色），改成「菜单」按钮 + 右键弹出的弹出式菜单。
+
+---
+
+## 1.8.0 新功能：书源生态 + 工程化
+
+这一版没有动阅读界面，改的是"书从哪来"和"怎么保证它一直能用"。
+
+### 多源并发搜索
+
+`Ctrl+S` 打开书源搜索，勾上「搜全部源」（默认开着），几个书源会被**同时**问一遍：
+
+![多源搜索](screenshots/24-multi-source.png)
+
+- 每行前面标着 `[书源名]`，同一本书在多个源里都搜到的话只留第一条（按书名归一化去重）；
+- 选中一行按「下载并打开」，用的是**产出这条结果的那个源**的规则 —— 不再是下拉框里当前选中的那个；
+- 一个源挂了不影响别的：坏规则只让自己那条报错，其它源照常出结果，失败时把各源的原因列出来；
+- 并发上限 6 个源，结果上限 200 条，免得一次搜索把内存和网站都拖死。
+
+### 书源导入 / 导出
+
+书源管理（`Ctrl+S` 对话框里的「管理」）底部多了「导出」「导入」：
+
+- **导出**：存成 `NovelReader-书源.json`，里面就是规则本身（搜索网址 + 三条正则），内置源不导出；
+- **导入**：把别人给的 JSON 读回来，按「名字 + 搜索网址」去重后追加，最多 16 个源；
+- 文件格式宽松：顶层可以是数组，也可以是 `{"sources": […]}`；字段名认 `searchUrl` / `listRe` / `tocContainer` / `bodyRe` 这些别名；UTF-8 / UTF-16 / GBK 的记事本文件都能读，`\uXXXX` 转义也解。
+
+顺便修了一个真问题：**内置源的搜索规则过时了**（网站把 `<a><h3>` 改成了 `<h3><a>`），
+所以以前用内置源搜什么都搜不到。这版换了新规则，还把内置源改名为「无忧书城（内置）」——
+老用户的 ini 里那一格名字对不上，程序会自动换成新规则，不用手动删配置。
+
+仓库里 `dist\示例书源\` 附了一份四个源的合集（无忧书城 / 笔趣阁 / 无趣阁 / 格格党），
+导入就能用，也可以照着自己加。
+
+### 工程化
+
+- **版本号进代码**：`src/version.h` 一份常量，关于框、检查更新、崩溃摘要都读它，不再各自写字符串；
+- **检查更新**：`帮助 → 检查更新`，后台线程请求 GitHub 的 `releases/latest`，有新版只提示并打开下载页；
+- **崩溃转储**：`SetUnhandledExceptionFilter` + `MiniDumpWriteDump`，崩溃时写 dmp 和一份文本摘要，保留最近 5 份；
+- **单元测试**：`tests\` 下 87 项纯逻辑测试（JSON 解析/转义/往返、版本号比较、畸形输入、文件读写），
+  `tests\tests.bat` 一条命令跑完，不依赖 UI 和网络；
+- **GitHub Actions**：`.github\workflows\build.yml`，push / PR / 打 tag 时用固定版本的 llvm-mingw 编 exe、
+  跑单元测试、把 exe 传成 artifact。
 
 ---
 
@@ -312,6 +358,18 @@ EPUB：
 | 第二实例传文件 | `WM_COPYDATA` 不按 `cbData` 校验长度，可能读越界 |
 | 自定义快捷键 | 绑到 OEM 键 / 小键盘键后存一次 ini 再读回来就失效（界面显示 `Ctrl+VKBF`） |
 | PDF 解析 | 超长 TJ 数组 / 超长内容流没有上限，构造的文件能把内存吃光 |
+| 双击打开崩溃 | 启动参数里带文件路径时，`wWinMain` 早期用到还没建立的窗口句柄（偶发崩溃） |
+| 书架跨线程 | 书架列表被 UI 线程和刷新线程同时读写（`std::vector` 迭代器失效，UAF）；改成读写锁 + 换表再 swap |
+| 同步对端表 | `g_peer` 被同步线程和界面线程同时写；加了锁，清空也走 `ClearPeer()` |
+| 停同步卡死 | 关程序时等同步线程退出没有上限；改成先置退出标志再等 8 秒 |
+| 退出不停服务 | 点关闭只关窗口，局域网 HTTP 服务线程还在跑；`WM_DESTROY` 里 `SyncStop()` + `ServerStop()` |
+| 同步指纹 | `FNV-1a 64` 的初值写错了（不是 14695981039346656037），不同机器算出的 key 对不上 |
+| 书源管理菜单 | `AutoSyncMenu` 取的是主菜单句柄，改的是错误的那个菜单 |
+| curl 退出码 | 网页抓书只看文件在不在，不看 curl 退出码，超时/4xx 会被当成"抓成功" |
+| 端口参数解析 | `QueryInt` 按子串匹配参数名，`?valid=3&id=0` 会把 `id` 读成 3 |
+| 书源保存 | 删源后旧键残留（幽灵书源）；`oldN` 在写 `n` 之后才读，清理逻辑永远不执行 |
+| 排版夹取 | 锚点字符偏移、布局尺寸、`renderH` 没有上限，异常 PDF 能把界面画到屏幕外 |
+| 调试日志 | `NrTrace` 的缓冲区没初始化，遇到不支持的格式串会写进未初始化栈内容 |
 
 > 说明：这份记录只写已经改掉并且重新编译验证过的问题。审计报告里还列了若干
 > 未修的低危项（例如 `WM_COPYDATA` 未按 `cbData` 校验长度、PDF 对象流 O(n²) 扫描），
@@ -407,8 +465,8 @@ PDF / EPUB / DOCX / HTML / Markdown 会**先抽出纯文本**，再走同一套�
 手机上的阅读进度会写进电脑上的同一份 `NovelReader.ini`，所以两边天然同步；
 回到电脑按 `Ctrl+Shift+G` 直接跳到手机读到的地方。
 
-> 这份实现没有 APK：本机没有 Java / Android SDK，也没有签名证书。局域网网页方案
-> 不需要安装、不受应用商店限制，是目前最省事的做法。
+> 1.7.0 起也提供了安卓 APK（`NovelReader-1.8.0.apk`，纯粹的同步 + 阅读客户端）。
+> 网页方案仍然保留：不用装东西、不受应用商店限制，临时借用别人的手机最省事。
 
 ---
 
@@ -421,7 +479,9 @@ cd 源码
 build.bat
 ```
 
-产物 `build\NovelReader.exe`。实际用到的编译参数：
+产物 `build\NovelReader.exe`，成功时最后一行是 `=== output: …\NovelReader.exe  (1101312 bytes) ===`。
+想换工具链位置就设环境变量 `BIN`（默认 `D:\llvm-mingw\bin`）；再设 `NR_NOPAUSE=1`
+可以让脚本跑完不等人按键（CI 用）。实际用到的编译参数：
 
 ```bat
 windres -I src -I res -O coff res\app.rc -o build\app.res
@@ -434,6 +494,33 @@ g++ -std=gnu++17 -O2 -DUNICODE -D_UNICODE -D_WIN32_WINNT=0x0601 -municode -mwind
 
 `-static -s` 让 exe 不依赖任何 DLL 且去符号；`--gc-sections` 只能救回几 KB，
 真正省体积的是"不用 C++ 异常、不用 STL 流、不用第三方库"。
+
+### 单元测试
+
+纯逻辑部分（JSON 解析/转义、版本号比较、书源文件读写）有 87 项测试，不需要图形界面也不需要网络：
+
+```bat
+tests\tests.bat
+:: 通过 87 项，失败 0 项 —— 最后一行 "=== tests OK ==="
+```
+
+### 带日志的调试版
+
+```bat
+build_dbg.bat
+:: 产物 build\NovelReader_dbg.exe，运行日志在 build\nr_trace.log
+```
+
+`NrTrace(...)` 在正式版里是空宏（连字符串都不进二进制），只在 `-DNR_TRACE` 时才有实现。
+
+### 安卓端
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File android\build_apk.ps1
+```
+
+不用 Gradle：脚本按 `aapt2 compile/link → javac → d8 → zipalign → apksigner` 的手工流程拼出
+`build\NovelReader-1.8.0.apk`，需要 `E:\Android\` 下的 JDK 17 + SDK build-tools（见 `dist\Android开发环境说明.txt`）。
 
 ---
 
@@ -449,17 +536,25 @@ NovelReader/
 │  ├─ zip.cpp/.h         自写 zip 容器 + DEFLATE (RFC1951) 解压
 │  ├─ pdf.cpp/.h         自写 PDF 解析：对象扫描、FlateDecode、ToUnicode、文本重建
 │  ├─ pdfrender.cpp/.h   用系统 Windows.Data.Pdf 把整页渲染成位图（原始版式）
-│  ├─ web.cpp/.h         网页抓取 + 书源搜索（WinInet / curl 兜底 + 目录识别）
+│  ├─ web.cpp/.h         网页抓取 + 书源搜索（WinInet / curl 兜底 + 目录识别 + 多源并发搜索）
 │  ├─ source.cpp/.h      书源模型：六项规则 + ini 存取 + 增删改
+│  ├─ sourcejson.cpp/.h  书源的 JSON 导入 / 导出（自带一个小 JSON 解析器）
+│  ├─ version.h          版本号常量（关于框、检查更新、崩溃摘要共用）
+│  ├─ update.cpp/.h      检查更新（GitHub releases 接口，只提示不自动替换）
+│  ├─ crashdump.cpp/.h   崩溃转储（MiniDumpWriteDump + 文本摘要，保留最近 5 份）
 │  ├─ server.cpp/.h      手机阅读：局域网 HTTP 服务
 │  ├─ ini.cpp            ini 读写、设置与阅读进度、书架数据
 │  ├─ view.cpp           阅读视图：排版、换行、滚动、选择、绘制
 │  ├─ ui.cpp             主窗口、菜单、侧栏、搜索条、各种对话框
 │  └─ trace.cpp          调试日志（仅在 -DNR_TRACE 编译时启用）
+├─ tests/                单元测试（tests.bat 一键跑）
+├─ android/              安卓端（build_apk.ps1 手工出包，不需要 Gradle）
+├─ .github/workflows/    GitHub Actions：编译 + 单元测试 + 上传 exe
 ├─ res/                  图标 + 资源脚本 + manifest
 ├─ screenshots/          README 用的截图
-├─ build.bat             一键编译（GBK 编码，cmd 直接跑）
-└─ dist/                 使用说明、下发用的示例小说
+├─ build.bat             一键编译（纯 ASCII，cmd 直接跑）
+├─ build_dbg.bat         带 NrTrace 日志的调试版
+└─ dist/                 使用说明、示例小说、示例书源
 ```
 
 ---

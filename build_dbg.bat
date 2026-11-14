@@ -15,9 +15,10 @@ if errorlevel 1 goto fail
   -municode -mwindows -Wall -Wextra ^
   -o build\NovelReader_dbg.exe ^
   src\book.cpp src\ini.cpp src\layout.cpp src\view.cpp src\ui.cpp src\zip.cpp src\format.cpp ^
-  src\pdf.cpp src\pdfrender.cpp src\server.cpp src\web.cpp src\source.cpp src\sync.cpp src\trace.cpp build\app_dbg.res ^
+  src\pdf.cpp src\pdfrender.cpp src\server.cpp src\web.cpp src\source.cpp src\sync.cpp src\trace.cpp ^
+  src\sourcejson.cpp src\update.cpp src\crashdump.cpp build\app_dbg.res ^
   -static -static-libgcc -static-libstdc++ ^
-  -lgdiplus -lshcore -lruntimeobject -lwininet -lws2_32 -liphlpapi -lcomctl32 -lcomdlg32 -lshell32 -lole32 -lgdi32 -luser32 -ladvapi32
+  -lgdiplus -lshcore -lruntimeobject -lwininet -lws2_32 -liphlpapi -lcomctl32 -lcomdlg32 -lshell32 -lole32 -lgdi32 -luser32 -ladvapi32 -ldbghelp
 if errorlevel 1 goto fail
 
 echo.

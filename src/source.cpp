@@ -48,11 +48,15 @@ const BookSource& SourceBuiltin()
     static BookSource s_builtin;
     static bool s_init = false;
     if (!s_init) {
-        s_builtin.name = L"内置示例源";
+        s_builtin.name = L"无忧书城（内置）";
         s_builtin.search = L"https://www.51shucheng.net/search?q={kw}";
-        /* 结果页：<a href="书籍页" title="…"><h3>书名</h3></a><p>简介</p>
-         * 第 3 组（简介）整体可选：有的站没有简介，没有也不能整条匹配失败。 */
-        s_builtin.listRe = L"<a href=\"([^\"]+)\"[^>]*><h3>([^<]+)</h3></a>(?:<p>([^<]*)</p>)?";
+        /* 结果页：<h3><a href="书籍页">书名</a></h3><p class="search-book-author">…
+         * 2025 年这个站把书名从 <a><h3>…</h3></a> 改成了 <h3><a>…</a></h3>，
+         * 旧规则就一条都匹配不到（表现为"这个书源没搜到结果"）。
+         * 简介那两段整体可选：没有简介也不能让整条匹配失败。 */
+        s_builtin.listRe = L"<h3><a href=\"([^\"]+)\"[^>]*>([^<]+)</a></h3>"
+                           L"(?:<p class=\"search-book-author\">[^<]*<a[^>]*>[^<]*</a></p>"
+                           L"<p class=\"search-book-intro\">([^<]*))?";
         /* 目录容器起点：先切到这一段再跑目录正则，
          * 免得把"推荐阅读""新书榜"里同样叫"第几章"的链接混进来。 */
         s_builtin.tocStart = L"category-toc-list";

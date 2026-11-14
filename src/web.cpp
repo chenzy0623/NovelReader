@@ -24,6 +24,8 @@
 #include <cstdio>
 #include <cstring>
 #include <regex>         /* 书源规则用正则表示，标准库自带，不增加体积 */
+#include <thread>        /* 1.8.0：多书源并发搜索 */
+#include <exception>     /* std::exception（regxx 规则写坏时 std::regex_error 会抛） */
 
 /* ---------------- 上限：防止被"全书一万章"的站点拖死 ---------------- */
 
@@ -326,21 +328,38 @@ static void FilterChapters(const std::vector<RawLink>& in, const std::wstring& b
 static HINTERNET s_inetProxy  = nullptr;
 static HINTERNET s_inetDirect = nullptr;
 
+/* 1.8.0：多书源并发搜索会让好几个线程同时抓网页，上面两个句柄就成了共享状态：
+ *   - InetHandle 里"看到空就建"是典型的 check-then-act，两个线程会各建一个，
+ *     其中一个被后写的覆盖掉（句柄泄漏，且可能有人在用被关掉的旧句柄）；
+ *   - InetCloseAll 可能在别的线程正用会话时把句柄关掉，那次请求就直接失败。
+ * 所以：句柄创建/关闭用一把 SRW 锁，并记一个"在途请求数"，收尾时若还有请求在跑
+ * 就不关（会话留着下次复用，进程退出时系统统一回收）。 */
+static SRWLOCK s_inetLock = SRWLOCK_INIT;
+static LONG    s_inetActive = 0;        /* 正在用 WinInet 会话的线程数 */
+
 static HINTERNET InetHandle(bool direct)
 {
     HINTERNET& slot = direct ? s_inetDirect : s_inetProxy;
-    if (slot) return slot;
-    slot = InternetOpenW(L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) NovelReader/1.0",
-                         direct ? INTERNET_OPEN_TYPE_DIRECT : INTERNET_OPEN_TYPE_PRECONFIG,
-                         nullptr, nullptr, 0);
-    return slot;
+    AcquireSRWLockExclusive(&s_inetLock);
+    if (!slot) {
+        slot = InternetOpenW(L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) NovelReader/1.0",
+                             direct ? INTERNET_OPEN_TYPE_DIRECT : INTERNET_OPEN_TYPE_PRECONFIG,
+                             nullptr, nullptr, 0);
+    }
+    HINTERNET ret = slot;
+    ReleaseSRWLockExclusive(&s_inetLock);
+    return ret;
 }
 
-/* 进程退出前不用特意关，系统会回收；但抓书结束时关掉更干净（也便于再抓一次时重建） */
+/* 进程退出前不用特意关，系统会回收；但抓书结束时关掉更干净（也便于再抓一次时重建）。
+ * 有别的线程还在用会话时直接跳过：关掉正在被使用的句柄会让那次抓取莫名失败。 */
 static void InetCloseAll()
 {
+    if (InterlockedCompareExchange(&s_inetActive, 0, 0) > 0) return;
+    AcquireSRWLockExclusive(&s_inetLock);
     if (s_inetProxy) { InternetCloseHandle(s_inetProxy); s_inetProxy = nullptr; }
     if (s_inetDirect) { InternetCloseHandle(s_inetDirect); s_inetDirect = nullptr; }
+    ReleaseSRWLockExclusive(&s_inetLock);
 }
 
 /* ---------------- curl.exe 兜底 ----------------
@@ -368,8 +387,15 @@ static bool FetchOnceCurl(const std::wstring& url, std::string& body, std::wstri
     GetTempPathW(MAX_PATH, tmpDir);
     std::wstring dir = std::wstring(tmpDir) + L"NovelReaderCurl";
     CreateDirectoryW(dir.c_str(), nullptr);
-    wchar_t name[64];
-    swprintf(name, 64, L"\\f%08x.html", (unsigned)GetTickCount());
+    /* 临时文件名必须唯一：多书源并发搜索时好几个线程同时走 curl，
+     * 只用 GetTickCount（15.6ms 一跳）命名，同一跳里的两个线程会撞名，
+     * 一个线程读到另一个线程的半截文件，甚至把对方正在写的文件删掉。
+     * 所以再拼上线程 id 和一个进程内自增序号。 */
+    static LONG s_tmpSeq = 0;
+    LONG seq = InterlockedIncrement(&s_tmpSeq);
+    wchar_t name[80];
+    swprintf(name, 80, L"\\f%08x_%04x_%08x.html", (unsigned)GetTickCount(),
+             (unsigned)(GetCurrentThreadId() & 0xFFFF), (unsigned)seq);
     std::wstring outPath = dir + name;
 
     int ms = timeoutMs > 0 ? timeoutMs : 15000;
@@ -500,20 +526,46 @@ static std::wstring HostLowerOf(const std::wstring& url)
     return host;
 }
 
-/* 已经确认过"WinInet 抓不动、curl 可以"的站点，下次直接走 curl，省掉两次 403 的往返 */
+/* 已经确认过"WinInet 抓不动、curl 可以"的站点，下次直接走 curl，省掉两次 403 的往返。
+ * 1.8.0：并发搜索会让多个线程同时查/加这张表，所以读写都上锁。 */
 static std::vector<std::wstring> s_curlOnlyHosts;
+static SRWLOCK s_curlHostLock = SRWLOCK_INIT;
 
 static bool CurlOnlyHost(const std::wstring& host)
 {
-    for (size_t i = 0; i < s_curlOnlyHosts.size(); i++)
-        if (s_curlOnlyHosts[i] == host) return true;
-    return false;
+    bool found = false;
+    AcquireSRWLockShared(&s_curlHostLock);
+    for (size_t i = 0; i < s_curlOnlyHosts.size(); i++) {
+        if (s_curlOnlyHosts[i] == host) { found = true; break; }
+    }
+    ReleaseSRWLockShared(&s_curlHostLock);
+    return found;
 }
+
+/* 记一个"这个站只有 curl 抓得动"。已经记过就什么都不做（并发时两个线程会同时来记）。 */
+static void CurlRememberHost(const std::wstring& host)
+{
+    if (host.empty()) return;
+    AcquireSRWLockExclusive(&s_curlHostLock);
+    bool found = false;
+    for (size_t i = 0; i < s_curlOnlyHosts.size(); i++) {
+        if (s_curlOnlyHosts[i] == host) { found = true; break; }
+    }
+    if (!found) s_curlOnlyHosts.push_back(host);
+    ReleaseSRWLockExclusive(&s_curlHostLock);
+}
+
+/* 抓取期间把"在途请求数"加一（析构时减一），InetCloseAll 靠它判断能不能安全关会话。 */
+struct InetActiveGuard {
+    InetActiveGuard() { InterlockedIncrement(&s_inetActive); }
+    ~InetActiveGuard() { InterlockedDecrement(&s_inetActive); }
+};
 
 /* 一趟抓取。direct 决定是否绕过代理。结果与错误都通过引用返回。 */
 static bool FetchOnce(const std::wstring& u, bool direct, std::string& body, std::wstring& finalUrl,
                       std::wstring& err, int timeoutMs)
 {
+    InetActiveGuard active;
     HINTERNET inet = InetHandle(direct);
     if (!inet) { err = L"无法初始化网络组件（WinInet）。"; return false; }
 
@@ -636,13 +688,13 @@ bool WebFetchUrl(const std::wstring& url, std::string& body, std::wstring& final
         body.swap(body3);
         finalUrl = final3;
         err.clear();
-        if (!host.empty() && !CurlOnlyHost(host)) s_curlOnlyHosts.push_back(host);
+        if (CurlOnlyHost(host) == false) CurlRememberHost(host);
         return true;
     }
 
     /* curl 也被挡：说明这个站的 WinInet 那条路一定不通，记住它，
      * 下次直接走 curl，不再浪费两次请求（限流的环境下这很关键）。 */
-    if (blocked && !host.empty() && !CurlOnlyHost(host)) s_curlOnlyHosts.push_back(host);
+    if (blocked) CurlRememberHost(host);
 
     body.clear();
     err = e1;
@@ -1199,6 +1251,129 @@ bool WebSourceSearch(const std::wstring& keyword, std::vector<WebBookHit>& out,
     if (SourceList().empty()) SourceLoad();
     int idx = SourceCurrent();
     return WebSourceSearchEx(SourceList()[(size_t)idx], keyword, out, err, timeoutMs);
+}
+
+/* 1.8.0：多书源并发搜索（说明见 web.h）。
+ * 实现上刻意用了"每源一条线程、结果写进自己的槽位"的最笨办法：
+ *   - 每个线程只碰自己的 vector，不需要在解析阶段加锁（锁只在合并时用一次，
+ *     其实连合并都不需要锁 —— 线程 join 之后主线程统一读）；
+ *   - 并发数限 6：一次开十几个线程去轰同一个站点/同一台机器没有意义，
+ *     反而更容易触发限流和 Cloudflare 人机验证；
+ *   - 一个源失败不算整体失败：errs 里记下原因，其他源的结果照常返回。
+ * 同名去重做在这里而不是 WebSourceSearchEx 里：单个源内部已经按网址去过重，
+ * 跨源时同一本书的网址不一样，只能按书名（去掉书名号、空白）判断。 */
+static std::wstring HitTitleKey(const std::wstring& t)
+{
+    /* 只保留"字"，去掉《》<>【】空白和标点：同一个书名在不同站的写法常差这几个符号 */
+    std::wstring k;
+    k.reserve(t.size());
+    for (size_t i = 0; i < t.size(); i++) {
+        wchar_t c = t[i];
+        if (c == L' ' || c == L'\t' || c == L'\r' || c == L'\n' || c == 0x3000) continue;
+        if (c == L'《' || c == L'》' || c == L'<' || c == L'>' || c == L'【' || c == L'】' ||
+            c == L'（' || c == L'）' || c == L'"' || c == L'\'' || c == L'·' || c == L'-' ||
+            c == L'_' || c == L'.' || c == L'。' || c == L'，' || c == L'：' || c == L'!') continue;
+        if (c >= L'A' && c <= L'Z') c = (wchar_t)(c - L'A' + L'a');
+        k.push_back(c);
+    }
+    return k;
+}
+
+bool WebSourceSearchAll(const std::vector<BookSource>& srcs, const std::wstring& keyword,
+                        std::vector<WebBookHit>& out, std::vector<std::wstring>& errs,
+                        int timeoutMs)
+{
+    out.clear();
+    errs.assign(srcs.size(), std::wstring());
+    if (srcs.empty()) return false;
+
+    const std::wstring kw = TrimW(keyword);
+    if (kw.empty()) {
+        if (!errs.empty()) errs[0] = L"请先在搜索框里输入书名或作者。";
+        return false;
+    }
+
+    /* 每个源一个槽位，线程只写自己的槽位（所以不用锁） */
+    std::vector<std::vector<WebBookHit> > hits(srcs.size());
+    std::vector<std::wstring> localErrs(srcs.size());
+    std::vector<char> okFlag(srcs.size(), 0);
+
+    /* 简单的并发闸门：同时最多 6 条线程在跑（总数可能十几条，排队进来） */
+    const int kMaxParallel = 6;
+    size_t next = 0;
+
+    /* 用一批 std::thread 处理：先把所有源都排进线程池，再 join 全部。
+     * 闸门用一个自增下标 + 互斥锁实现（比条件变量简单，且这里临界区极短）。 */
+    SRWLOCK idxLock = SRWLOCK_INIT;
+    std::vector<std::thread> workers;
+    const int workerCount = (int)(srcs.size() < (size_t)kMaxParallel ? srcs.size() : (size_t)kMaxParallel);
+
+    for (int w = 0; w < workerCount; w++) {
+        workers.push_back(std::thread([&]() {
+            for (;;) {
+                size_t idx;
+                AcquireSRWLockExclusive(&idxLock);
+                idx = next < srcs.size() ? next++ : srcs.size();
+                ReleaseSRWLockExclusive(&idxLock);
+                if (idx >= srcs.size()) return;
+
+                std::wstring e;
+                bool ok = false;
+                try {
+                    ok = WebSourceSearchEx(srcs[idx], kw, hits[idx], e, timeoutMs);
+                } catch (const std::exception&) {
+                    /* 正则库在畸形规则下会抛异常（std::regex_error 继承自 std::exception）：
+                     * 必须挡住，否则一个坏规则会带走整个搜索 */
+                    hits[idx].clear();
+                    e = L"这个书源的规则写错了（正则表达式无效），在「书源管理」里检查一下。";
+                    ok = false;
+                } catch (...) {
+                    hits[idx].clear();
+                    e = L"这个书源搜索时出了未知错误。";
+                    ok = false;
+                }
+                localErrs[idx] = e;
+                okFlag[idx] = ok ? 1 : 0;
+            }
+        }));
+    }
+    for (size_t i = 0; i < workers.size(); i++) {
+        if (workers[i].joinable()) workers[i].join();
+    }
+
+    /* 合并：按书源顺序，同名只留第一条（结果里带着 srcIdx，下载时用对应的规则） */
+    std::vector<std::wstring> seen;
+    size_t okCount = 0;
+    for (size_t i = 0; i < srcs.size(); i++) {
+        errs[i] = localErrs[i];
+        if (!okFlag[i]) continue;
+        okCount++;
+        for (size_t k = 0; k < hits[i].size(); k++) {
+            WebBookHit h = hits[i][k];
+            std::wstring key = HitTitleKey(h.title);
+            if (key.empty()) continue;
+            bool dup = false;
+            for (size_t s = 0; s < seen.size(); s++) {
+                if (seen[s] == key) { dup = true; break; }
+            }
+            if (dup) continue;
+            seen.push_back(key);
+            h.srcIdx = (int)i;
+            out.push_back(h);
+            if (out.size() >= 200) break;       /* 合并结果也设个上限，列表再长也没人翻 */
+        }
+    }
+
+    if (okCount == 0) {
+        /* 全军覆没：把第一个非空错误抬到 errs[0]，调用方好显示 */
+        for (size_t i = 0; i < errs.size(); i++) {
+            if (!errs[i].empty()) {
+                if (errs[0].empty()) errs[0] = errs[i];
+                break;
+            }
+        }
+    }
+    return !out.empty();
 }
 
 bool WebSourceFetchBook(const std::wstring& bookUrl, std::wstring& text, std::wstring& title,

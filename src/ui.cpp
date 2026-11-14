@@ -47,12 +47,18 @@
 #include "sync.h"
 #include "pdf.h"
 #include "source.h"
+/* 1.8.0：书源导入/导出（JSON）、版本常量、检查更新、崩溃转储 */
+#include "sourcejson.h"
+#include "version.h"
+#include "update.h"
+#include "crashdump.h"
 #include <commctrl.h>
 #include <commdlg.h>
 #include <shellapi.h>
 #include <windowsx.h>
 #include <cwchar>
 #include <algorithm>
+#include <thread>
 
 /* ---- 全局量（common.h 里 extern 声明，此处定义）----
  * g_dpi ：启动时由 wWinMain 从屏幕 DC 取一次，之后只读；S() 换算全靠它。
@@ -2151,7 +2157,7 @@ void UiExportNotes()
     }
     std::wstring msg = L"已导出到：\n" + std::wstring(path) + L"\n\n现在打开看看吗？";
     if (MessageBoxW(g_hMain, msg.c_str(), L"导出笔记", MB_ICONINFORMATION | MB_YESNO) == IDYES) {
-        ShellExecuteW(g_hMain, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        ShellExecuteW(g_hMain, L"open", path, nullptr, nullptr, SW_SHOWNORMAL);
     }
 }
 
@@ -3724,14 +3730,23 @@ void UiOpenWebNovel()
 #define SRC_CLOSE  105      /* 关闭 */
 #define SRC_COMBO  106      /* 书源下拉框 */
 #define SRC_MGR    107      /* 「管理…」按钮 */
+#define SRC_ALL    108      /* 1.8.0：「搜全部源」复选框 */
 
 static HWND s_srcEdit = nullptr;
 static HWND s_srcList = nullptr;
 static HWND s_srcCombo = nullptr;            /* 书源下拉框 */
+static HWND s_srcAll = nullptr;              /* 「搜全部源」复选框 */
 static std::vector<WebBookHit> s_srcHits;    /* 与列表项一一对应 */
 static std::wstring s_srcOpenPath;           /* 关窗后要打开的文件 */
 static bool s_srcBusy = false;               /* 正在联网，挡住重复点击 */
 static bool s_srcReady = false;              /* 窗口类注册过没有 */
+
+/* 「搜全部源」的开关存在 ini 的 [src] all，默认开：多数人只有一个源时会觉得
+ * "反正就一个"，而加了源之后又希望一次搜完，所以默认开、并记住用户的选择。 */
+static bool SrcAllEnabled()
+{
+    return IniGetInt(L"src", L"all", 1) != 0;
+}
 
 static void ShowSourceMgr(HWND parent);      /* 实现在下面，先声明 */
 
@@ -3750,7 +3765,11 @@ static void SrcRefillCombo()
     SendMessageW(s_srcCombo, CB_SETCURSEL, (WPARAM)cur, 0);
 }
 
-/* 点「搜索」：问一次站点，把结果灌进列表。 */
+/* 点「搜索」：问站点，把结果灌进列表。
+ * 1.8.0 起支持"搜全部源"：勾上复选框就把所有书源并发问一遍（最多 6 个同时跑），
+ * 结果按书源顺序合并、同名书只留第一条，列表行前面标出源名。
+ * 只有一个源时强制走单源路径 —— 线程开销白花，而且错误提示会变成
+ * "某某源：…"这种绕圈子的话。 */
 static void SrcDoSearch(HWND dlg)
 {
     if (s_srcBusy) return;
@@ -3764,6 +3783,9 @@ static void SrcDoSearch(HWND dlg)
         return;
     }
 
+    bool all = s_srcAll ? (SendMessageW(s_srcAll, BM_GETCHECK, 0, 0) == BST_CHECKED) : false;
+    if (all && SourceList().size() < 2) all = false;
+
     if (s_srcList) SendMessageW(s_srcList, LB_RESETCONTENT, 0, 0);
     s_srcHits.clear();
 
@@ -3771,18 +3793,45 @@ static void SrcDoSearch(HWND dlg)
     HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
     std::vector<WebBookHit> hits;
     std::wstring err;
-    bool ok = WebSourceSearch(kw, hits, err);
+    bool ok = false;
+    if (all) {
+        std::vector<std::wstring> errs;
+        ok = WebSourceSearchAll(SourceList(), kw, hits, errs, 20000);
+        if (!ok) {
+            /* 把各源的错误拼成一段：用户要能看出是"网络问题"还是"某个源的规则坏了" */
+            int shown = 0;
+            for (size_t i = 0; i < errs.size() && shown < 4; i++) {
+                if (errs[i].empty()) continue;
+                if (!err.empty()) err += L"\n";
+                err += SourceList()[i].name + L"：" + errs[i];
+                shown++;
+            }
+            if (err.empty()) err = L"所有书源都没有搜到结果。";
+        }
+    } else {
+        ok = WebSourceSearch(kw, hits, err);
+    }
     SetCursor(old);
     s_srcBusy = false;
-    NrTrace(L"SRC search done ok=%d hits=%d err='%s'", (int)ok, (int)hits.size(), err.c_str());
+    NrTrace(L"SRC search done all=%d ok=%d hits=%d err='%s'", (int)all, (int)ok, (int)hits.size(),
+            err.c_str());
 
     if (!ok) {
         MessageBoxW(dlg, err.c_str(), L"没搜到", MB_ICONINFORMATION);
         return;
     }
     s_srcHits = hits;
+    std::vector<BookSource>& list = SourceList();
     for (size_t i = 0; i < hits.size(); i++) {
-        std::wstring line = hits[i].title;
+        std::wstring line;
+        /* 标出源名：全源模式下同一本书可能出现在多个源里（已按书名去重，但不同源
+         * 的书名只是"像"，不是"一样"），不标源的话用户分不清该下哪个 */
+        if (hits[i].srcIdx >= 0 && hits[i].srcIdx < (int)list.size()) {
+            line = L"[";
+            line += list[(size_t)hits[i].srcIdx].name;
+            line += L"] ";
+        }
+        line += hits[i].title;
         if (!hits[i].desc.empty()) {
             line += L"  ·  ";
             line += hits[i].desc;
@@ -3811,7 +3860,17 @@ static void SrcDoDownload(HWND dlg)
     if (s_srcEdit) EnableWindow(s_srcEdit, FALSE);
     HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
     std::wstring text, title, err;
-    bool ok = WebSourceFetchBook(hit.url, text, title, err, WebProgressCb, nullptr, hit.title);
+    /* 必须用产出这条结果的源去抓：全源模式下下拉框里选中的源不一定是它（列表可能
+     * 混合了好几个源的结果，各站点的目录/正文规则完全不同）。srcIdx<0 是单源结果，
+     * 走原来的"用当前源"路径。 */
+    bool ok = false;
+    std::vector<BookSource>& srcs = SourceList();
+    if (hit.srcIdx >= 0 && hit.srcIdx < (int)srcs.size()) {
+        ok = WebSourceFetchBookEx(srcs[(size_t)hit.srcIdx], hit.url, text, title, err,
+                                  WebProgressCb, nullptr, hit.title);
+    } else {
+        ok = WebSourceFetchBook(hit.url, text, title, err, WebProgressCb, nullptr, hit.title);
+    }
     SetCursor(old);
     if (s_srcEdit) EnableWindow(s_srcEdit, TRUE);
     s_srcBusy = false;
@@ -3855,15 +3914,18 @@ static LRESULT CALLBACK SourceBoxProc(HWND h, UINT msg, WPARAM w, LPARAM l)
 {
     switch (msg) {
     case WM_CREATE: {
-        /* 第一行：选书源 + 管理按钮。书源可以随时换，所以放在最上面 */
+        /* 第一行：选书源 + 搜全部源 + 管理按钮。书源可以随时换，所以放在最上面 */
         CreateWindowExW(0, L"STATIC", L"书源：", WS_CHILD | WS_VISIBLE | SS_LEFT,
                         S(16), S(20), S(50), S(20), h, nullptr, nullptr, nullptr);
         s_srcCombo = CreateWindowExW(WS_EX_CLIENTEDGE, L"COMBOBOX", L"",
                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL |
                                      CBS_DROPDOWNLIST,
-                                     S(70), S(16), S(300), S(220), h, (HMENU)SRC_COMBO, nullptr, nullptr);
+                                     S(70), S(16), S(200), S(220), h, (HMENU)SRC_COMBO, nullptr, nullptr);
+        s_srcAll = CreateWindowExW(0, L"BUTTON", L"搜全部源", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                                   S(280), S(18), S(110), S(24), h, (HMENU)SRC_ALL, nullptr, nullptr);
+        if (s_srcAll && SrcAllEnabled()) SendMessageW(s_srcAll, BM_SETCHECK, BST_CHECKED, 0);
         CreateWindowExW(0, L"BUTTON", L"管理(&M)...", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                        S(378), S(16), S(90), S(26), h, (HMENU)SRC_MGR, nullptr, nullptr);
+                        S(400), S(16), S(90), S(26), h, (HMENU)SRC_MGR, nullptr, nullptr);
         SrcRefillCombo();
 
         /* 第二行：关键词 + 搜索 */
@@ -3871,22 +3933,23 @@ static LRESULT CALLBACK SourceBoxProc(HWND h, UINT msg, WPARAM w, LPARAM l)
                         S(16), S(56), S(200), S(20), h, nullptr, nullptr, nullptr);
         s_srcEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-                                    S(16), S(80), S(400), S(26), h, (HMENU)SRC_EDIT, nullptr, nullptr);
+                                    S(16), S(80), S(420), S(26), h, (HMENU)SRC_EDIT, nullptr, nullptr);
         CreateWindowExW(0, L"BUTTON", L"搜索(&S)", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-                        S(424), S(80), S(86), S(26), h, (HMENU)SRC_SEARCH, nullptr, nullptr);
+                        S(448), S(80), S(86), S(26), h, (HMENU)SRC_SEARCH, nullptr, nullptr);
         s_srcList = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL |
                                     LBS_NOINTEGRALHEIGHT | LBS_NOTIFY,
-                                    S(16), S(116), S(494), S(220), h, (HMENU)SRC_LIST, nullptr, nullptr);
+                                    S(16), S(116), S(552), S(250), h, (HMENU)SRC_LIST, nullptr, nullptr);
         CreateWindowExW(0, L"BUTTON", L"下载并打开(&D)", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                        S(16), S(348), S(140), S(30), h, (HMENU)SRC_DOWN, nullptr, nullptr);
+                        S(16), S(374), S(140), S(30), h, (HMENU)SRC_DOWN, nullptr, nullptr);
         CreateWindowExW(0, L"BUTTON", L"关闭", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                        S(438), S(348), S(72), S(30), h, (HMENU)SRC_CLOSE, nullptr, nullptr);
+                        S(496), S(374), S(72), S(30), h, (HMENU)SRC_CLOSE, nullptr, nullptr);
         CreateWindowExW(0, L"STATIC",
-                        L"书源可以换（「管理…」里能改规则、加新站）。整本少则几十章、"
-                        L"多则一两千章，下载时进度显示在主窗口状态栏，按 ESC 可取消。",
+                        L"书源可以换（「管理…」里能改规则、加新站、导入导出）。勾上「搜全部源」"
+                        L"会把所有书源同时问一遍。整本少则几十章、多则一两千章，下载时进度"
+                        L"显示在主窗口状态栏，按 ESC 可取消。",
                         WS_CHILD | WS_VISIBLE | SS_LEFT,
-                        S(16), S(386), S(494), S(44), h, nullptr, nullptr, nullptr);
+                        S(16), S(410), S(552), S(74), h, nullptr, nullptr, nullptr);
         if (s_srcEdit) SetFocus(s_srcEdit);
         return 0;
     }
@@ -3900,6 +3963,13 @@ static LRESULT CALLBACK SourceBoxProc(HWND h, UINT msg, WPARAM w, LPARAM l)
             /* 打开书源管理；关掉之后规则可能变了，重填下拉框 */
             ShowSourceMgr(h);
             SrcRefillCombo();
+            return 0;
+        case SRC_ALL:
+            /* 记住开关：下次打开书源搜索时还是上次的选择 */
+            if (HIWORD(w) == BN_CLICKED && s_srcAll) {
+                bool on = SendMessageW(s_srcAll, BM_GETCHECK, 0, 0) == BST_CHECKED;
+                IniSetInt(L"src", L"all", on ? 1 : 0);
+            }
             return 0;
         case SRC_COMBO:
             /* 下拉框换选中项 = 换书源，立刻落盘，下次启动还用这个 */
@@ -3923,6 +3993,7 @@ static LRESULT CALLBACK SourceBoxProc(HWND h, UINT msg, WPARAM w, LPARAM l)
         s_srcEdit = nullptr;
         s_srcList = nullptr;
         s_srcCombo = nullptr;
+        s_srcAll = nullptr;
         return 0;
     }
     return DefWindowProcW(h, msg, w, l);
@@ -3950,6 +4021,8 @@ static LRESULT CALLBACK SourceBoxProc(HWND h, UINT msg, WPARAM w, LPARAM l)
 #define MGR_DEL      212    /* 删除 */
 #define MGR_RESET    213    /* 恢复内置规则 */
 #define MGR_CLOSE    214    /* 关闭 */
+#define MGR_EXPORT   215    /* 1.8.0：把书源导出成 JSON（备份 / 发给朋友） */
+#define MGR_IMPORT   216    /* 1.8.0：从 JSON 导入书源 */
 
 static HWND s_mgrList = nullptr;
 static HWND s_mgrName = nullptr;
@@ -4051,11 +4124,17 @@ static LRESULT CALLBACK SourceMgrProc(HWND h, UINT msg, WPARAM w, LPARAM l)
         }
 
         CreateWindowExW(0, L"BUTTON", L"保存(&S)", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-                        S(212), S(312), S(96), S(30), h, (HMENU)MGR_SAVE, nullptr, nullptr);
+                        S(212), S(312), S(86), S(30), h, (HMENU)MGR_SAVE, nullptr, nullptr);
         CreateWindowExW(0, L"BUTTON", L"恢复内置规则(&R)", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                        S(316), S(312), S(140), S(30), h, (HMENU)MGR_RESET, nullptr, nullptr);
+                        S(304), S(312), S(130), S(30), h, (HMENU)MGR_RESET, nullptr, nullptr);
+        /* 1.8.0：导入/导出。书源规则写得出来的人不多，复制一份 JSON 给朋友是最省事的
+         * 分享方式；同时也是"换电脑"时唯一的备份手段（规则只存在 ini 里）。 */
+        CreateWindowExW(0, L"BUTTON", L"导出(&E)", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                        S(440), S(312), S(64), S(30), h, (HMENU)MGR_EXPORT, nullptr, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"导入(&I)", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                        S(512), S(312), S(64), S(30), h, (HMENU)MGR_IMPORT, nullptr, nullptr);
         CreateWindowExW(0, L"BUTTON", L"关闭", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                        S(560), S(312), S(82), S(30), h, (HMENU)MGR_CLOSE, nullptr, nullptr);
+                        S(586), S(312), S(62), S(30), h, (HMENU)MGR_CLOSE, nullptr, nullptr);
         CreateWindowExW(0, L"STATIC",
                         L"规则说明：搜索网址里的 {kw} 会被换成书名。三条正则各只用前两组括号 —— "
                         L"第 1 组是网址、第 2 组是名字。留空的规则会自动退化成"
@@ -4124,6 +4203,106 @@ static LRESULT CALLBACK SourceMgrProc(HWND h, UINT msg, WPARAM w, LPARAM l)
             MgrLoad(0);
             MessageBoxW(h, L"内置规则已恢复。", L"书源管理", MB_ICONINFORMATION);
             return 0;
+        case MGR_EXPORT: {
+            MgrCommit();
+            SourceSave();
+            if (SourceList().size() <= 1) {
+                MessageBoxW(h, L"现在只有内置源，没有需要导出的自定义书源。\n"
+                               L"（内置源每台机器都自带，导出去只会让别人的列表里多一条重复的。）",
+                            L"导出书源", MB_ICONINFORMATION);
+                return 0;
+            }
+            wchar_t path[MAX_PATH];
+            lstrcpynW(path, L"NovelReader-书源.json", MAX_PATH);
+            OPENFILENAMEW ofn;
+            ZeroMemory(&ofn, sizeof(ofn));
+            ofn.lStructSize = sizeof(ofn);
+            ofn.hwndOwner = h;
+            ofn.lpstrFilter = L"书源文件 (*.json)\0*.json\0所有文件 (*.*)\0*.*\0\0";
+            ofn.lpstrFile = path;
+            ofn.nMaxFile = MAX_PATH;
+            ofn.lpstrTitle = L"导出书源";
+            ofn.lpstrDefExt = L"json";
+            ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
+            if (!GetSaveFileNameW(&ofn)) return 0;
+
+            std::wstring err;
+            if (!SourceExportJsonFile(path, SourceList(), false, err)) {
+                std::wstring m = L"导出失败：\n\n";
+                m += err.empty() ? std::wstring(L"写文件失败。") : err;
+                MessageBoxW(h, m.c_str(), L"导出书源", MB_ICONWARNING);
+                return 0;
+            }
+            std::wstring m = L"已导出 ";
+            m += std::to_wstring((int)SourceList().size() - 1);
+            m += L" 个书源到：\n\n";
+            m += path;
+            m += L"\n\n这个文件可以发给朋友，或者在别的电脑上「导入」。";
+            MessageBoxW(h, m.c_str(), L"导出书源", MB_ICONINFORMATION);
+            return 0;
+        }
+        case MGR_IMPORT: {
+            wchar_t path[MAX_PATH];
+            path[0] = 0;
+            OPENFILENAMEW ofn;
+            ZeroMemory(&ofn, sizeof(ofn));
+            ofn.lStructSize = sizeof(ofn);
+            ofn.hwndOwner = h;
+            ofn.lpstrFilter = L"书源文件 (*.json)\0*.json\0所有文件 (*.*)\0*.*\0\0";
+            ofn.lpstrFile = path;
+            ofn.nMaxFile = MAX_PATH;
+            ofn.lpstrTitle = L"导入书源";
+            ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
+            if (!GetOpenFileNameW(&ofn)) return 0;
+
+            std::vector<BookSource> in;
+            std::wstring err;
+            if (!SourceImportJsonFile(path, in, err)) {
+                std::wstring m = L"导入失败：\n\n";
+                m += err.empty() ? std::wstring(L"文件格式不对。") : err;
+                MessageBoxW(h, m.c_str(), L"导入书源", MB_ICONWARNING);
+                return 0;
+            }
+            if (in.empty()) {
+                MessageBoxW(h, L"这个文件里没有书源。", L"导入书源", MB_ICONINFORMATION);
+                return 0;
+            }
+
+            /* 去重按"名字 + 搜索网址"：同名但网址不同说明是另一个站，应当允许共存；
+             * 占满上限之后 SourceAdd 返回 -1，这里只统计不报错，最后一起告诉用户。 */
+            int added = 0, dup = 0, full = 0;
+            for (size_t i = 0; i < in.size(); i++) {
+                BookSource s = in[i];
+                s.builtin = false;
+                bool exists = false;
+                std::vector<BookSource>& list = SourceList();
+                for (size_t k = 0; k < list.size(); k++) {
+                    if (list[k].name == s.name && list[k].search == s.search) { exists = true; break; }
+                }
+                if (exists) { dup++; continue; }
+                int idx = SourceAdd();       /* 上限判断在 source.cpp 里，只有一处 */
+                if (idx < 0) { full++; continue; }
+                SourceList()[(size_t)idx] = s;
+                added++;
+            }
+            SourceSave();
+            MgrFillList();
+
+            std::wstring m = L"导入完成：新增 ";
+            m += std::to_wstring(added);
+            m += L" 个，重复跳过 ";
+            m += std::to_wstring(dup);
+            m += L" 个。";
+            if (full > 0) {
+                m += L"\n\n有 ";
+                m += std::to_wstring(full);
+                m += L" 个没导进来：书源最多 16 个，先删掉不用的再导一次。";
+            }
+            MessageBoxW(h, m.c_str(), L"导入书源",
+                        added > 0 ? MB_ICONINFORMATION : MB_ICONWARNING);
+            if (added > 0) MgrLoad((int)SourceList().size() - 1);
+            return 0;
+        }
         case MGR_CLOSE:
             DestroyWindow(h);
             return 0;
@@ -4218,7 +4397,7 @@ void UiSourceSearch()
 
     RECT wr;
     GetWindowRect(g_hMain, &wr);
-    int wpx = S(526), hpx = S(466);
+    int wpx = S(600), hpx = S(536);
     int x = (wr.left + wr.right - wpx) / 2;
     int y = (wr.top + wr.bottom - hpx) / 2;
 
@@ -4456,6 +4635,7 @@ static HMENU BuildMenu()
     }
     AppendMenuW(hp, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(hp, MF_STRING, IDM_KEYS, L"快捷键说明");
+    AppendMenuW(hp, MF_STRING, IDM_CHECK_UPDATE, L"检查更新(&U)...");
     AppendMenuW(hp, MF_STRING, IDM_ABOUT, L"关于");
     AppendMenuW(h, MF_POPUP, (UINT_PTR)hp, L"帮助(&H)");
     return h;
@@ -4516,7 +4696,9 @@ static void ShowKeys()
  */
 static void ShowAbout()
 {
-    std::wstring m = L"轻量小说阅读器  NovelReader\n\n";
+    std::wstring m = L"轻量小说阅读器  NovelReader  ";
+    m += NR_VERSION_STR;                 /* 1.8.0：版本号只有 version.h 一处定义 */
+    m += L"\n\n";
     m += L"第一作者：chenzy0623\n";
     m += L"第二作者：xuanmo 的大肥鱼\n\n";
     m += L"支持 TXT / EPUB / PDF / HTML / Markdown / DOCX 等格式；\n";
@@ -4527,7 +4709,75 @@ static void ShowAbout()
     m += L"支持全文搜索（章节名、任意关键词）。\n\n";
     m += L"配置与进度保存在：\n";
     m += IniFilePath();
+    std::wstring cd = CrashDumpDir();
+    if (!cd.empty()) {
+        m += L"\n\n万一程序崩溃，现场会存在：\n";
+        m += cd;
+        m += L"\n（把这个目录里的文件发给开发者就能定位问题）";
+    }
     MessageBoxW(g_hMain, m.c_str(), L"关于", MB_ICONINFORMATION);
+}
+
+/* ---------------- 检查更新（1.8.0） ----------------
+ * 为什么要单开线程：WebFetchUrl 是同步的，遇到网络不通要等十几秒，放在主线程
+ * 会把界面整个冻住（用户会以为程序死了）。所以：
+ *   1. 点菜单 → 建一个 detach 的线程去问 GitHub；
+ *   2. 线程拿到结果后 new 一个 UpdateInfo，PostMessage 回主窗口；
+ *   3. 主窗口（MainProc 的 WM_APP_UPDATE）负责弹框和 delete。
+ * s_updBusy 挡住连点：连着点十下就会开十个线程、弹十个框。
+ */
+static bool s_updBusy = false;
+
+static void UiCheckUpdate()
+{
+    if (s_updBusy) {
+        MessageBoxW(g_hMain, L"正在检查，稍等一下……", L"检查更新", MB_ICONINFORMATION);
+        return;
+    }
+    s_updBusy = true;
+    std::thread([]() {
+        UpdateInfo* r = new UpdateInfo(UpdateCheck());
+        if (!PostMessageW(g_hMain, WM_APP_UPDATE, 0, (LPARAM)r)) {
+            /* 主窗口已经没了（用户在等待期间退出了程序）：自己收尾，别泄漏 */
+            delete r;
+        }
+    }).detach();
+}
+
+/* MainProc 里 WM_APP_UPDATE 的处理。参数是从线程传回来的 UpdateInfo*。 */
+static void UiOnUpdateReady(UpdateInfo* r)
+{
+    s_updBusy = false;
+    if (!r) return;
+    std::wstring msg;
+    if (!r->ok) {
+        msg = L"检查更新失败：\n\n";
+        msg += r->err.empty() ? std::wstring(L"未知原因。") : r->err;
+        MessageBoxW(g_hMain, msg.c_str(), L"检查更新", MB_ICONWARNING);
+        delete r;
+        return;
+    }
+    if (r->latest <= NR_VERSION_NUM) {
+        msg = L"当前已是最新版本（";
+        msg += NR_VERSION_STR;
+        msg += L"）。";
+        MessageBoxW(g_hMain, msg.c_str(), L"检查更新", MB_ICONINFORMATION);
+    } else {
+        msg = L"发现新版本：";
+        msg += r->tag;
+        msg += L"\n当前版本：";
+        msg += NR_VERSION_STR;
+        if (!r->name.empty()) {
+            msg += L"\n\n";
+            msg += r->name;
+        }
+        msg += L"\n\n现在打开下载页吗？";
+        if (MessageBoxW(g_hMain, msg.c_str(), L"发现新版本",
+                        MB_YESNO | MB_ICONINFORMATION) == IDYES) {
+            ShellExecuteW(g_hMain, L"open", r->url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        }
+    }
+    delete r;
 }
 
 /* 把「读到哪」写进 ini 的书架信息里（关闭这本书、程序退出、定时防抖落盘都走这里）。
@@ -4915,6 +5165,7 @@ static void OnCommand(int id, int code, HWND ctl)
     case IDM_SELALL:    ViewSelectAll(); break;
     case IDM_KEYS:      ShowKeys(); break;
     case IDM_ABOUT:     ShowAbout(); break;
+    case IDM_CHECK_UPDATE: UiCheckUpdate(); break;
     case IDM_MENU: {
         /* 键盘唤起主菜单（Ctrl+F10）：弹在左上角「菜单」按钮的正下方，
          * 位置和用鼠标点那个按钮完全一致。BarMenuRect 是自绘顶栏里的坐标，
@@ -5168,6 +5419,12 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l)
         return (LRESULT)s_listBrush;
     }
 
+    case WM_APP_UPDATE:
+        /* 检查更新的后台线程回来了：l 是它 new 出来的 UpdateInfo*，
+         * 弹完框必须 delete（UiOnUpdateReady 负责，包含失败路径）。 */
+        UiOnUpdateReady((UpdateInfo*)l);
+        return 0;
+
     case WM_APP_STATUS: {
         /* 视图状态变化（滚动 / 换书 / 跳转）的统一回调。view.cpp 用 PostMessage 发，
          * 于是这条消息排到当前绘制之后，绘制路径里就不会插进布局、落盘这类慢操作。
@@ -5197,8 +5454,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_TIMER:
         /* 安静期到了：写一次位置，并记下时间给上面 15 秒兜底用。定时器是单发的 ——
          * 先 KillTimer，下次状态变化时再重新 SetTimer。
-         */
-        if (w == TIMER_POS) {
+         */        if (w == TIMER_POS) {
             KillTimer(h, TIMER_POS);
             if (g_book.Ok()) {
                 UiSaveProgress();
@@ -5406,6 +5662,9 @@ static std::wstring FirstFileArg()
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdLine, int)
 {
     (void)cmdLine;
+    /* 1.8.0：装崩溃转储。尽量早 —— 越早装，能接住的"启动阶段崩溃"越多；
+     * 它只注册一个进程级过滤器，不影响正常路径。 */
+    CrashDumpInstall();
     /* 必须在任何窗口/DC 操作之前调用，否则后面取到的 g_dpi 是错的 */
     SetProcessDPIAware();
     /* 取屏幕 DC 只为问一个数：LOGPIXELSY = 每英寸多少像素，96 即 100% 缩放 */

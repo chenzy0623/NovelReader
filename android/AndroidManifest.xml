@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  小说阅读器 手机端（1.7.0）
+  小说阅读器 手机端（1.8.0）
 
   设计要点：
     * 不做账号、不做云。手机和电脑在同一个 Wi-Fi 里互相广播发现，
@@ -11,8 +11,8 @@
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.chenzy0623.novelreader"
-    android:versionCode="1"
-    android:versionName="1.7.0">
+    android:versionCode="2"
+    android:versionName="1.8.0">
 
     <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="34" />
 

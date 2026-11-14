@@ -1,0 +1,40 @@
+{
+  "app": "NovelReader",
+  "type": "book-sources",
+  "version": 1,
+  "count": 4,
+  "sources": [
+    {
+      "name": "无忧书城（内置）",
+      "search": "https://www.51shucheng.net/search?q={kw}",
+      "list": "<h3><a href=\"([^\"]+)\"[^>]*>([^<]+)</a></h3>",
+      "tocStart": "category-toc-list",
+      "toc": "<a href=\"([^\"]+[.]html)\"[^>]*>([^<]{1,60})</a>",
+      "content": "<div[^>]*id=\"neirong\"[^>]*>([\\s\\S]*?)</div>"
+    },
+    {
+      "name": "笔趣阁",
+      "search": "https://www.biqugese.com/search/result.html?searchkey={kw}",
+      "list": "<a href=\"(/book/\\d+/)\" class=\"novelname\"[^>]*>([^<]+)</a>",
+      "tocStart": "<ul class=\"dirlist",
+      "toc": "<a href=\"(/book/\\d+/\\d+[.]html)\"[^>]*>([^<]+)</a>",
+      "content": "<div class=\"content\" id=\"chaptercontent\">[\\s\\S]*?<p>([\\s\\S]*?)</div>"
+    },
+    {
+      "name": "笔趣阁·无趣阁",
+      "search": "https://www.wuquge.com/search/result.html?searchkey={kw}",
+      "list": "<a href=\"(/book/\\d+/)\" class=\"novelname\"[^>]*>([^<]+)</a>",
+      "tocStart": "<ul class=\"dirlist",
+      "toc": "<a href=\"(/book/\\d+/\\d+[.]html)\"[^>]*>([^<]+)</a>",
+      "content": "<div class=\"content\" id=\"chaptercontent\">[\\s\\S]*?<p>([\\s\\S]*?)</div>"
+    },
+    {
+      "name": "格格党",
+      "search": "https://www.52ggd.com/search/?searchkey={kw}",
+      "list": "<h3><span class=\"uptime\">[^<]*</span><a href=\"(/k/[^\"]+)\">([^<]+)</a>",
+      "tocStart": "<ul class=\"chaw_c\" id=\"chapterList\">",
+      "toc": "<a href=\"(/xiaoshuo/\\d+_\\d+/\\d+/)\">([^<]{1,40})</a>",
+      "content": "<div id=\"TextContent\" class=\"read-content\">([\\s\\S]*?)</div>"
+    }
+  ]
+}

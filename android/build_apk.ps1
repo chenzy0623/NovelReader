@@ -1,4 +1,4 @@
-﻿# build_apk.ps1 —— 手工构建 Android APK（不需要 Gradle）
+# build_apk.ps1 —— 手工构建 Android APK（不需要 Gradle）
 #
 # 为什么不用 Gradle：本机只装了 JDK 17 + Android SDK 的 build-tools/platform-tools，
 # 没有 Gradle，也没有网络去下 Gradle 发行包。而一个纯 Java、零依赖的 App
@@ -15,7 +15,7 @@
 # 用法（PowerShell 5.1）：
 #   powershell -NoProfile -ExecutionPolicy Bypass -File android\build_apk.ps1
 #
-# 产物：build\NovelReader-1.7.0.apk
+# 产物：build\NovelReader-1.8.0.apk
 
 $ErrorActionPreference = 'Stop'
 
@@ -34,7 +34,7 @@ $androidJar = Join-Path $sdk 'platforms\android-34\android.jar'
 $javac   = Join-Path $jdk 'bin\javac.exe'
 $keytool = Join-Path $jdk 'bin\keytool.exe'
 
-$apkName = 'NovelReader-1.7.0.apk'
+$apkName = 'NovelReader-1.8.0.apk'
 $finalApk = Join-Path $out $apkName
 
 foreach ($t in @($aapt2, $d8, $zipalign, $apksign, $androidJar, $javac)) {

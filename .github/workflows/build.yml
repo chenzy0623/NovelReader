@@ -1,0 +1,70 @@
+# 构建 + 单元测试（Windows）
+#
+# 为什么用 windows-latest 而不是交叉编译：NovelReader 是纯 Win32 程序，链接
+# 需要 windres/gdiplus/runtimeobject 这些东西，用 Windows runner 最省事，
+# 和本地 build.bat 完全同一条路径 —— CI 挂了本地也一定挂，不会出现"只有
+# CI 能过"的诡异情况。
+#
+# LLVM-MinGW 版本固定（20240619），避免某天上游更新后编译器行为变了、
+# 构建突然红掉却查不出原因。要升级就改这里的版本号和下面的目录名。
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    env:
+      LLVM_MINGW_VER: 20240619
+      LLVM_MINGW_DIR: llvm-mingw-20240619-ucrt-x86_64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache LLVM-MinGW
+        id: cache-llvm
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.LLVM_MINGW_DIR }}
+          key: llvm-mingw-${{ env.LLVM_MINGW_VER }}-ucrt-x86_64
+
+      - name: Download LLVM-MinGW
+        if: steps.cache-llvm.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $url = "https://github.com/mstorsjo/llvm-mingw/releases/download/$env:LLVM_MINGW_VER/llvm-mingw-$env:LLVM_MINGW_VER-ucrt-x86_64.zip"
+          Write-Host "downloading $url"
+          Invoke-WebRequest -Uri $url -OutFile llvm-mingw.zip
+          Expand-Archive -Path llvm-mingw.zip -DestinationPath . -Force
+          Remove-Item llvm-mingw.zip
+
+      - name: Build
+        shell: cmd
+        env:
+          NR_NOPAUSE: 1
+        run: |
+          set BIN=%GITHUB_WORKSPACE%\%LLVM_MINGW_DIR%\bin
+          call build.bat
+
+      - name: Unit tests
+        shell: cmd
+        run: |
+          set BIN=%GITHUB_WORKSPACE%\%LLVM_MINGW_DIR%\bin
+          call tests\tests.bat
+
+      # 产物留一份，方便直接下载试跑（不进 Release，Release 由本地打包上传）
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NovelReader-${{ github.sha }}
+          path: build/NovelReader.exe
+          if-no-files-found: error

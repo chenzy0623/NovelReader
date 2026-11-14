@@ -58,6 +58,9 @@ struct WebBookHit {
     std::wstring title;     /* 书名，例如"斗破苍穹" */
     std::wstring url;       /* 书籍详情页网址（绝对地址） */
     std::wstring desc;      /* 简介摘要，截断到几十字，列表里给用户判断是哪本 */
+    int srcIdx = -1;        /* 1.8.0：这条结果来自第几个书源（并发搜索时用）。
+                             * 下载必须用产出它的那个源的规则，否则规则对不上，抓不到正文。
+                             * -1 表示"用当前选中的源"。 */
 };
 
 /* 用指定书源搜索（关键字会做 UTF-8 百分号编码）。
@@ -65,6 +68,24 @@ struct WebBookHit {
  * 界面上的书源下拉框、命令行工具都走它。 */
 bool WebSourceSearchEx(const BookSource& src, const std::wstring& keyword,
                        std::vector<WebBookHit>& out, std::wstring& err, int timeoutMs = 20000);
+
+/* 1.8.0：同时用好几个书源搜同一个关键词（每个源一个线程，最多 6 个并发）。
+ *
+ * 为什么要并发：单源搜索要等"请求 → 响应 → 正则"，一个源慢一点就是十几秒；
+ * 找一本书往往要试三四个源，串行搜完用户早就关窗口了。并发之后总耗时
+ * 约等于最慢的那一个源，而不是所有源之和。
+ *
+ * 参数 srcs：要搜的书源（调用方通常传 SourceList() 里所有"配了搜索网址"的源）。
+ * 参数 out ：输出，按书源顺序合并（前面的源结果在前），同名书只留第一条；
+ *            每条的 srcIdx 是它在 srcs 里的下标。
+ * 参数 errs：输出，长度与 srcs 相同，每个源自己的失败原因（成功的源是空串）。
+ * 返回：至少一个源搜到东西返回 true。
+ *
+ * 线程安全：内部会给 WinInet 会话、curl 兜底站点表上锁，所以可以和别的抓取并发；
+ * 但它自己会阻塞到所有线程结束（界面上要显示"搜索中"，不要在主线程里再干别的）。 */
+bool WebSourceSearchAll(const std::vector<BookSource>& srcs, const std::wstring& keyword,
+                        std::vector<WebBookHit>& out, std::vector<std::wstring>& errs,
+                        int timeoutMs = 20000);
 
 /* 用指定书源把一本书抓成文本（bookUrl 是书籍页/目录页网址）。
  * 规则全由调用方给，所以这里不认识任何具体站点。 */

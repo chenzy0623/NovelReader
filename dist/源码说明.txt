@@ -1,4 +1,4 @@
-﻿﻿NovelReader 1.7.0 —— 源码说明与编译方法
+NovelReader 1.8.0 —— 源码说明与编译方法
 ==========================================
 
 这个文件夹里是阅读器的全部源码：纯 C++17 + Win32 API，没有任何第三方库
@@ -37,6 +37,17 @@
   源码\src\source.h      书源数据结构的声明（BookSource + 存取接口）
   源码\src\source.cpp    书源的读写与增删：六项规则存进 ini 的 [sources] 段、
                         内置示例源、最多 16 个、删源时清掉旧键
+  源码\src\sourcejson.h  书源 JSON 导入/导出的声明
+  源码\src\sourcejson.cpp 手写的递归下降 JSON 解析器（8 MB / 32 层上限）、字段名归一化
+                         （searchUrl / listRe / tocContainer / bodyRe 等别名）、
+                         UTF-8/UTF-16/GBK 编码识别、导出格式 {"app","type","sources"}
+  源码\src\version.h     版本号常量（NR_VERSION_MAJOR/MINOR/PATCH + 文本 + 数字）
+  源码\src\update.h      检查更新的声明（UpdateInfo / UpdateCheck）
+  源码\src\update.cpp    读 GitHub releases/latest：手抠 JSON 字段、解析 tag、
+                         版本号比较（VersionParse：跳过前缀、最多 3 段、防溢出）
+  源码\src\crashdump.h   崩溃转储的声明（CrashDumpInstall / CrashDumpDir）
+  源码\src\crashdump.cpp SetUnhandledExceptionFilter + MiniDumpWriteDump，写 .dmp
+                         和同名文本摘要，保留最近 5 份，InterlockedExchange 防重入
   源码\src\layout.h    每本书排版的声明（BookLayout）+ 高亮/笔记（Highlight）+ 快捷键表
   源码\src\layout.cpp  每本书排版 / 高亮 / 笔记 / 快捷键的 ini 存取与键名解析（约 520 行）
   源码\src\server.h     手机阅读服务的声明
@@ -48,7 +59,10 @@
   源码\src\ui.cpp       主窗口、自绘顶栏/状态栏/列表、书架交互、书源对话框、
                         自动下滑、字体/配色对话框、书源搜索与书源管理、
                         网页与手机入口、单实例
-  源码\src\trace.cpp    调试用日志（只在定义 NR_TRACE 时编入，正式版不包含）
+  源码\trace.cpp    调试用日志（只在定义 NR_TRACE 时编入，正式版不包含）
+  源码\tests\       单元测试（tests.cpp + tests.bat，87 项纯逻辑用例，不依赖界面/网络）
+  源码\android\     安卓端（Java，build_apk.ps1 手工出包：aapt2 → javac → d8 → 签名）
+  源码\.github\workflows\build.yml  CI：win 上编译 + 跑测试 + 上传 exe
   源码\res\app.rc       资源脚本（图标 + manifest，必须保持纯 ASCII）
   源码\res\app.manifest 清单：视觉样式 6.0、DPI 感知、长路径支持
   源码\res\app.ico      程序图标（16~256 多尺寸）
@@ -63,7 +77,11 @@
   cd 源码
   build.bat
 
-产物：build\NovelReader.exe
+产物：build\NovelReader.exe（成功时最后一行 === output: … (1101312 bytes) ===）
+
+build.bat 支持两个环境变量（CI 用）：
+  BIN          工具链 bin 目录，默认 D:\llvm-mingw\bin
+  NR_NOPAUSE   设为 1 时跑完不等按键；脚本同时用退出码表示成功/失败
 
 build.bat 会做两件事：
   1) windres 把 res\app.rc 编成 .res（图标 + manifest）
@@ -78,9 +96,10 @@ build.bat 会做两件事：
       src\book.cpp src\ini.cpp src\layout.cpp src\view.cpp src\ui.cpp ^
       src\zip.cpp src\format.cpp src\pdf.cpp src\pdfrender.cpp ^
       src\server.cpp src\web.cpp src\source.cpp ^
+      src\sourcejson.cpp src\update.cpp src\crashdump.cpp ^
       build\app.res -o build\NovelReader.exe ^
       -lcomctl32 -lcomdlg32 -lshell32 -lole32 -lgdi32 -luser32 -ladvapi32 ^
-      -lgdiplus -lshcore -lruntimeobject -lwininet -lws2_32 -liphlpapi
+      -lgdiplus -lshcore -lruntimeobject -lwininet -lws2_32 -liphlpapi -ldbghelp
 
 说明：
   -static -static-libgcc -static-libstdc++   不依赖任何 DLL
@@ -138,9 +157,10 @@ build.bat 会做两件事：
    抓完一章后先丢导航行（上一章/下一章/目录/返回目录…），再丢掉"与章节标题
    重复的那一行"，最后连续空行压成一行。
 
-8. 手机阅读为什么是网页而不是 APK
-   开发环境没有 Java / Android SDK，打包不出能装到手机上的 APK；局域网网页
-   方案不用安装、不受应用商店限制，进度还能和电脑共用同一份 ini。
+8. 手机阅读为什么先是网页、后来才有 APK
+   最早开发环境没有 Java / Android SDK，装不出 APK，所以先做局域网网页方案
+   （不用安装、不受应用商店限制、进度和电脑共用同一份 ini）。1.7.0 起补了
+   安卓端（android/，零第三方依赖的纯 Java），网页方案仍然保留。
 
 9. 进度与书架
    NovelReader.ini 里每本书一个段（段名是路径的 FNV-1a 哈希），记 off（字符
@@ -209,6 +229,51 @@ build.bat 会做两件事：
       字体作为默认，之后各记各的。这样也不用做"回滚默认值"的逻辑 ——
       新书天然从那套默认开始。
 
+
+14. 多源并发搜索与书源 JSON（1.8.0）
+---------------------------------
+   · 并发模型：WebSourceSearchAll 把每个书源塞进一个槽位（hits / localErrs / okFlag），
+     由 kMaxParallel = 6 个线程用「取下一个下标」的方式领任务，join 后按源顺序合并。
+     不引线程池也不引 future —— 每个线程只写自己那个槽位，收尾在调用线程做，
+     所以除下标计数器（SRWLOCK 保护的 next）之外没有共享可变状态。
+   · 单源失败不影响整轮：正则编译/匹配的异常都在工作线程里 catch 掉，只记进该源的 err。
+   · 去重：HitTitleKey 去掉书名里的《》<>【】和空白再转小写，同名只留先出现的那条；
+     每条结果带上 srcIdx，下载时用它去取「产出这条结果的源」的规则，而不是下拉框当前项。
+   · 并发前必须先修的四个坑（都在 web.cpp）：
+       a) FetchOnceCurl 的临时文件原来只用 GetTickCount 命名，同 tick 的两个线程会撞名
+          → 加上线程号低 16 位和原子自增序号；
+       b) s_curlOnlyHosts 这个"只能走 curl 的站"列表原来无锁 push_back → 加 SRWLOCK，
+          并用 CurlRememberHost() 统一做去重写入；
+       c) InetCloseAll()（关闭 WinInet 会话）原来在每次搜索收尾都调，会把别的线程
+          正在用的会话句柄关掉 → 加在途计数 s_inetActive，有请求在跑就只标记不关闭；
+       d) InetHandle() 的"检查再创建" → 用 SRWLOCK 独占锁包住整个惰性创建过程。
+
+   · JSON：sourcejson.cpp 里是一个手写的递归下降解析器（不用第三方库，测试可以单独链接）。
+     解析限制 8 MB / 32 层嵌套；字段名走 FieldOf 归一（search/searchUrl/url、
+     list/listRe/searchRe、tocStart/tocContainer、toc/tocRe、content/bodyRe…）；
+     顶层允许是数组，也允许 {"sources": […]}; 键名对上但值不是数组时会明确报错，
+     而不是静默忽略（这个"静默"是单元测试抓出来的）。
+   · 编码：BytesToWide 先认 BOM（UTF-8/UTF-16LE/BE），无 BOM 时先按严格 UTF-8 解，
+     失败再退 CP_ACP —— 覆盖老记事本存的 GBK 文件。
+   · 文件 IO 用 CreateFileW + 循环读写（不用 CRT 的 fopen/_wfopen，避免窄路径转换）；
+     导出路径的父目录用 EnsureParentDir 逐级创建（盘符 "C:" 本身要跳过，
+     其余以盘符开头的目录不能跳 —— 这条也是单元测试抓出来的）。
+
+15. 工程化（1.8.0）
+---------------------------------
+   · version.h 一份常量，关于框、检查更新、崩溃摘要都引用它，别再各自写字符串；
+     版本比较用 VersionParse：跳过 "v" 之类的前缀，最多取 3 段，每段 < 100000 防溢出，
+     "1.8" 等价于 1.8.0。
+   · 检查更新在后台 std::thread 里跑，结果 new 出来用 WM_APP_UPDATE PostMessage 回主窗口，
+     主窗口负责弹框并 delete —— 线程不碰任何 HWND。
+   · 崩溃转储装在最外层（wWinMain 第一件事），SetUnhandledExceptionFilter 里
+     只做写文件这件"尽量能成"的事：MiniDumpNormal|WithThreadInfo|WithDataSegs、
+     写一份 UTF-8 文本摘要、PruneOld 只留 5 份、InterlockedExchange 防重入
+     （崩溃处理里再崩一次会递归）。
+   · 单元测试 tests/tests.cpp 只链接 sourcejson.cpp 和 update.cpp，网抓部分用打桩
+     （tests.cpp 里自带一个 WebFetchUrl 空实现），所以不需要图形界面也不需要网络；
+     tests.bat 必须保持纯 ASCII —— UTF-8 的中文会让 cmd 按 OEM 页读，把路径截坏。
+
   12. 排版规则只写一份（BuildFlow）
 
       1.5.0 之前"每段怎么断行、每行多宽"这套规则在绘制和命中测试里各写了
@@ -245,25 +310,32 @@ build.bat 会做两件事：
       注册失败（被别的程序占用）要明确告诉用户，否则他会以为功能坏了。
 四、调试
 ------------------------------------------
-  build_dbg.bat          编出带 NrTrace 的调试版
-  set NR_TRACE=1         运行时把关键路径写进 exe 同目录的 nr_trace.log
+  build_dbg.bat          编出带 NrTrace 的调试版（build\NovelReader_dbg.exe）
+  NR_TRACE=1             有它才编入 NrTrace，日志写在 exe 同目录 nr_trace.log
 
-trace 覆盖：菜单命令分发、搜索链路、自动下滑的定时器、锚点恢复、抓书进度。
+  tests\tests.bat        单元测试（源码逻辑，不需要界面/网络）
+
+trace 覆盖：菜单命令分发、搜索链路、书源搜索各源结果、自动下滑的定时器、锚点恢复、抓书进度。
 
 
 五、代码规模（约）
 ------------------------------------------
-  ui.cpp      4900 行      主窗口、自绘顶栏/状态栏/列表、全部交互
-  view.cpp    1700 行      排版（BuildFlow）与绘制、书架卡片
-  pdf.cpp      900 行      PDF 解析
-  pdfrender.cpp 590 行     PDF 原始版式渲染（WinRT + GDI+）
-  server.cpp   650 行      局域网阅读服务
-  web.cpp      1120 行     网页抓书 + 书源搜索（规则驱动）
-  layout.cpp    520 行     每本书排版、高亮/笔记、快捷键表
-  source.cpp    250 行     书源模型与 ini 存取
-  format.cpp   640 行      EPUB/DOCX/HTML/MD 抽正文
-  zip.cpp      645 行      zip + DEFLATE
-  book.cpp     560 行      解码、分章、搜索
-  ini.cpp      300 行      配置、进度、书架、书签
-  common.h     320 行      数据结构与接口
-  合计约 9600 行，注释约占 30%
+  ui.cpp        5400 行      主窗口、自绘顶栏/状态栏/列表、全部交互
+  view.cpp      2050 行      排版（BuildFlow）与绘制、书架卡片
+  web.cpp       1250 行      网页抓书 + 书源搜索（规则驱动、多源并发）
+  pdf.cpp        980 行      PDF 解析
+  sync.cpp       900 行      局域网进度同步（电脑端）
+  server.cpp     860 行      局域网阅读服务
+  format.cpp     690 行      EPUB/DOCX/HTML/MD 抽正文
+  book.cpp       680 行      解码、分章、搜索
+  ini.cpp        600 行      配置、进度、书架、书签
+  zip.cpp        590 行      zip + DEFLATE
+  sourcejson.cpp 570 行      书源 JSON 解析 / 导出
+  pdfrender.cpp  520 行      PDF 原始版式渲染（WinRT + GDI+）
+  common.h       480 行      数据结构与接口
+  layout.cpp     400 行      每本书排版、高亮/笔记、快捷键表
+  source.cpp     180 行      书源模型与 ini 存取
+  update.cpp     150 行      检查更新
+  crashdump.cpp  150 行      崩溃转储
+  合计约 17000 行（src/ 下 25 个 cpp/h），另有 tests/ 约 700 行、android/ 约 1300 行；
+  注释约占 30%

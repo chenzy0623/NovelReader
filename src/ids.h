@@ -51,6 +51,7 @@
 #define IDM_KEYS        1230    /* 快捷键说明对话框 */
 #define IDM_ABOUT       1231    /* 关于对话框（含 ini 路径） */
 #define IDM_MENU        1232    /* 在左上角「菜单」按钮下方弹出主菜单（Ctrl+F10） */
+#define IDM_CHECK_UPDATE 1233   /* 检查更新：问 GitHub Releases 有没有新版本 */
 
 /* ---- 自动下滑（速度可调） ---- */
 #define IDM_AUTO_TOGGLE 1240    /* 开 / 关自动下滑（F6） */
@@ -77,6 +78,8 @@
 #define IDM_PDF_MODE     1292   /* PDF 原始版式 / 文字重排 切换（F9，仅 PDF 有效） */
 #define IDM_SOURCE       1293   /* 书源搜索：按书源规则搜书并下载整本（Ctrl+S） */
 #define IDM_SOURCE_MGR   1294   /* 书源管理：改规则 / 加新站 / 删源 */
+#define IDM_SRC_EXPORT   1296   /* 书源导出成 JSON（备份 / 分享给朋友） */
+#define IDM_SRC_IMPORT   1297   /* 从 JSON 导入书源 */
 
 /* ---- 1.6.0：排版（1300~1309） ---- */
 #define IDM_LAY_MARGIN_BASE 1300 /* 页边距档位起始 ID，实际用 1300+i（i=0 窄 / 1 标准 / 2 宽） */
