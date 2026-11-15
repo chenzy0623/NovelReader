@@ -104,6 +104,10 @@
 #define IDM_BOSS         1321    /* 立即隐藏窗口（老板键，默认 Ctrl+Alt+H，可在对话框里改） */
 #define IDM_PRIVACY      1322    /* 隐私模式：标题栏 / 顶栏 / 状态栏不显示书名（Ctrl+Shift+H） */
 
+/* ---- 1.8.1：启动与关窗行为（1234~1235） ---- */
+#define IDM_TRAY_TOGGLE  1234    /* 关闭窗口时缩到托盘：开 / 关（只在第一次关窗时自动问一次） */
+#define IDM_START_HOME   1235    /* 启动时停在书架 / 直接打开上次那本 */
+
 /* ---- 子控件 ID ---- */
 #define IDC_TOC         2001    /* 左侧章节目录 LISTBOX */
 #define IDC_HITS        2002    /* 左侧搜索结果 LISTBOX（与目录互斥显示） */

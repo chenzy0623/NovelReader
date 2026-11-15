@@ -1,12 +1,12 @@
 # 小说阅读器 NovelReader
 
 一个**单文件、免安装、零依赖**的 Windows 小说阅读器。用 C++17 + Win32 从零写成，
-**1076 KB** 一个 exe，双击就能用，不写注册表、不装运行库、不需要联网。
+**1089 KB** 一个 exe，双击就能用，不写注册表、不装运行库、不需要联网。
 
 支持 **TXT / EPUB / PDF / DOCX / HTML / Markdown**，自动识别章节，全文搜索，
 记忆阅读位置，自动下滑，书签，换字体，自定义配色，还能直接把网页小说抓成本地书。
 
-![版本](https://img.shields.io/badge/version-1.8.0-blue)
+![版本](https://img.shields.io/badge/version-1.8.1-blue)
 ![体积](https://img.shields.io/badge/size-1076%20KB-brightgreen)
 ![平台](https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-lightgrey)
 ![依赖](https://img.shields.io/badge/dependencies-none-success)
@@ -20,9 +20,9 @@
 
 到 [Releases](https://github.com/chenzy0623/NovelReader/releases) 下载最新版：
 
-- **[NovelReader-1.8.0-win64.zip](https://github.com/chenzy0623/NovelReader/releases/download/v1.8.0/NovelReader-1.8.0-win64.zip)**（推荐，含使用说明和示例小说）
-- [单个 NovelReader.exe](https://github.com/chenzy0623/NovelReader/releases/download/v1.8.0/NovelReader.exe)（只要程序本体）
-- **[NovelReader-1.8.0.apk](https://github.com/chenzy0623/NovelReader/releases/download/v1.8.0/NovelReader-1.8.0.apk)**（安卓端，69 KB，Android 5.0+ 直接装）
+- **[NovelReader-1.8.1-win64.zip](https://github.com/chenzy0623/NovelReader/releases/download/v1.8.1/NovelReader-1.8.1-win64.zip)**（推荐，含使用说明和示例小说）
+- [单个 NovelReader.exe](https://github.com/chenzy0623/NovelReader/releases/download/v1.8.1/NovelReader.exe)（只要程序本体）
+- **[NovelReader-1.8.1.apk](https://github.com/chenzy0623/NovelReader/releases/download/v1.8.1/NovelReader-1.8.1.apk)**（安卓端，69 KB，Android 5.0+ 直接装）
 
 解压任意目录，双击 `NovelReader.exe` 即可。**绿色版**：阅读进度存在 exe 同目录的
 `NovelReader.ini`（目录不可写时自动改用 `%APPDATA%\NovelReader\`），删掉 ini 就等于恢复出厂。
@@ -45,7 +45,10 @@
 | 多格式 | TXT、EPUB、PDF、DOCX、HTML、Markdown，以及任意扩展名的纯文本 |
 | PDF 两种看法 | 默认抽文字重排（能搜索、能换字体）；`F9` 切「原始版式」，整页按原样渲染，图表、分栏、字体效果一点不走样 |
 | 网页抓书 | `Ctrl+U` 输入目录页网址，自动找目录、逐章抓取，存成本地书 |
-| 界面 | 顶栏胶囊按钮 + 书架卡片 + 自绘状态栏进度线，不是系统控件拼的 |
+| 界面 | 顶栏胶囊按钮 + 书架书脊 + 自绘状态栏进度线，不是系统控件拼的 |
+| 书脊书架 | 首页是一排可以横着滑的书脊，书名竖排在书脊上：滚轮左右翻，点任意一本就打开，回车开中间那本，中间那本自动放大高亮 |
+| 关窗缩托盘 | 第一次关窗会问一次「收进托盘还是直接退出」，之后按你的选择走；托盘图标双击还原、右键退出，文件菜单里随时能改 |
+| 三条杠面板 | 左上角菜单键弹出的是一整块分组面板（不是几条细线），鼠标划过整行高亮，`Esc` 或点外面收起 |
 | 升级不丢书 | 新版本放在新目录里也能自动找回旧书架与阅读进度 |
 | 每本书独立排版 | 字号、行距、页边距、首行缩进、分页、双栏、强制字体都按书名分别记，读网文和读古籍互不干扰 |
 | 分页 / 双栏 | 按「本章第几页 / 共几页」翻页，可切双栏横排（自动开分页）；`Ctrl+Shift+P` / `Ctrl+Shift+C` |
@@ -151,6 +154,39 @@ EPUB：
 - **状态栏**：书名 / 章节 / 进度三段，底部一条通栏进度线；自动下滑时右侧多一个 `▸自动 4`。
 - **搜索条**：输入框和三个按钮都跟着配色走，没有系统灰和立体边框。
 - 菜单栏被拿掉了（系统灰条在夜间配色下是全场唯一亮色），改成「菜单」按钮 + 右键弹出的弹出式菜单。
+
+---
+
+## 1.8.1 新功能：书脊书架 + 托盘 + 选项面板
+
+这一版全是「用起来更顺手」的改动，阅读、搜索、抓书这些老功能一行没动。
+
+### 书架变成一排书脊
+
+![书脊书架](screenshots/25-shelf-spines.png)
+
+- 书名**竖排在书脊上**，书脊颜色按书名散列固定（同一本书永远是同一个颜色），底部细线是阅读进度；
+- 滚轮左右翻（鼠标停在书架上滚一下就动一格），`←/→`、`↑/↓`、`PgUp/PgDn` 同样能翻，`Home/End` 到两头；
+- 鼠标点到哪本就开哪本（不用先挪到中间）；按回车开的是**离屏幕中线最近**的那本，它会自动放大、加一圈主题色描边；
+- 一本书都没有时照旧显示欢迎页。
+
+### 关窗缩到托盘
+
+`×` 关窗时第一次会问一次「收进托盘 / 直接退出」，选完记住（ini 里 `trayClose`）：
+
+- 收进托盘：窗口隐藏、进程还在，手机同步服务保持连通；双击托盘图标还原，右键图标可「还原窗口 / 退出」；
+- 想改回来：文件菜单里勾掉/勾上「关闭时缩到托盘」即可，不会再问第二遍；
+- 文件菜单还多了一条「启动时停在书架」（默认开）。默认每次启动都落在书架，想看「接着上次读」就把它关掉。
+
+### 三条杠弹出的选项面板
+
+左上角的菜单键（还是那三条横线）现在弹出的是一整块**分组面板**：
+
+![选项面板](screenshots/26-bar-panel.png)
+
+- 文件 / 收藏 / 阅读 / 排版 / 搜索 / 帮助分组排开，两列装不下自动变三列、四列（1280×768 的机器也能整块落在屏幕里）；
+- 右边对齐显示快捷键，鼠标扫过去整行高亮并带一条主题色竖条；
+- 点条目直接执行、`Esc` 或点面板外面收起，再点一次菜单键也收起。
 
 ---
 
@@ -465,7 +501,7 @@ PDF / EPUB / DOCX / HTML / Markdown 会**先抽出纯文本**，再走同一套�
 手机上的阅读进度会写进电脑上的同一份 `NovelReader.ini`，所以两边天然同步；
 回到电脑按 `Ctrl+Shift+G` 直接跳到手机读到的地方。
 
-> 1.7.0 起也提供了安卓 APK（`NovelReader-1.8.0.apk`，纯粹的同步 + 阅读客户端）。
+> 1.7.0 起也提供了安卓 APK（`NovelReader-1.8.1.apk`，纯粹的同步 + 阅读客户端）。
 > 网页方案仍然保留：不用装东西、不受应用商店限制，临时借用别人的手机最省事。
 
 ---
@@ -520,7 +556,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File android\build_apk.ps1
 ```
 
 不用 Gradle：脚本按 `aapt2 compile/link → javac → d8 → zipalign → apksigner` 的手工流程拼出
-`build\NovelReader-1.8.0.apk`，需要 `E:\Android\` 下的 JDK 17 + SDK build-tools（见 `dist\Android开发环境说明.txt`）。
+`build\NovelReader-1.8.1.apk`，需要 `E:\Android\` 下的 JDK 17 + SDK build-tools（见 `dist\Android开发环境说明.txt`）。
 
 ---
 

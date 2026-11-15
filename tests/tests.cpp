@@ -311,13 +311,16 @@ static void TestUpdateParse()
 /* ------------------------------------------------------------------ 比较逻辑（与界面一致） */
 static void TestCompare()
 {
-    /* 界面里用的是 latest <= NR_VERSION_NUM 判"已是最新"，这里把这个口径固定下来 */
+    /* 界面里用的是 latest <= NR_VERSION_NUM 判"已是最新"，这里把这个口径固定下来。
+     * 注意别把版本号写死：以前写死 "v1.8.1"，等真发到 1.8.1 时这条就恒假了。
+     * 用 NR_VERSION_STR 拼当前版本，高/低版本取足够远的固定值。 */
     UpdateInfo u;
-    Check(UpdateParseReleaseJson(L"{\"tag_name\":\"v1.8.0\"}", u), "同版本");
+    Check(UpdateParseReleaseJson(L"{\"tag_name\":\"v" NR_VERSION_STR L"\"}", u), "同版本");
+    Check(u.latest == NR_VERSION_NUM, "同版本号解析一致");
     Check(u.latest <= NR_VERSION_NUM, "同版本视为已最新");
-    Check(UpdateParseReleaseJson(L"{\"tag_name\":\"v1.8.1\"}", u), "高版本");
+    Check(UpdateParseReleaseJson(L"{\"tag_name\":\"v99.0.0\"}", u), "高版本");
     Check(!(u.latest <= NR_VERSION_NUM), "高版本视为有新版本");
-    Check(UpdateParseReleaseJson(L"{\"tag_name\":\"v1.7.9\"}", u), "低版本");
+    Check(UpdateParseReleaseJson(L"{\"tag_name\":\"v1.0.0\"}", u), "低版本");
     Check(u.latest <= NR_VERSION_NUM, "低版本视为已最新");
 }
 

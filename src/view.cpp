@@ -320,6 +320,34 @@ static void EnsureFonts()
     InvalidCounts();
 }
 
+/* 书脊专用字体（两档：正常 / 长书名用的小一档）。
+ * 为什么不复用 s_fontN：正文的字号是用户按阅读习惯调的（12~40pt），
+ * 拿它来写书脊，调到 30pt 时一根书脊只写得下两三个字，整个书架就废了。
+ * 这里按 96 DPI 的设计值自己缩放，跟 DPI 变了一起重建。 */
+static HFONT s_spineFont = nullptr, s_spineFontS = nullptr;
+static int   s_spinePx = 0;
+static void EnsureSpineFonts()
+{
+    int px = S(19);
+    if (s_spineFont && s_spinePx == px) return;
+    if (s_spineFont)  DeleteObject(s_spineFont);
+    if (s_spineFontS) DeleteObject(s_spineFontS);
+    LOGFONTW lf;
+    ZeroMemory(&lf, sizeof(lf));
+    lf.lfWeight = FW_SEMIBOLD;
+    lf.lfCharSet = DEFAULT_CHARSET;
+    lf.lfOutPrecision = OUT_TT_PRECIS;
+    lf.lfClipPrecision = CLIP_DEFAULT_PRECIS;
+    lf.lfQuality = CLEARTYPE_QUALITY;
+    lf.lfPitchAndFamily = DEFAULT_PITCH | FF_DONTCARE;
+    lstrcpynW(lf.lfFaceName, L"Microsoft YaHei", LF_FACESIZE);
+    lf.lfHeight = -px;
+    s_spineFont = CreateFontIndirectW(&lf);
+    lf.lfHeight = -S(13);
+    s_spineFontS = CreateFontIndirectW(&lf);
+    s_spinePx = px;
+}
+
 /* 当前字体的像素高度（正数）。标题行高、欢迎页行距、ui.cpp 里算侧栏边距都要用它；内部先
    EnsureFonts()，保证刚启动还没绘制过时也能拿到正确值。 */
 int ViewFontPixel() { EnsureFonts(); return -s_fontPx; }
@@ -1314,66 +1342,162 @@ static void DrawRun(int x, int y, int start, int end)
  * 而 DrawWelcome 的实体在下面才定义，所以这里先声明一下。 */
 static void DrawWelcome(int W, int H);
 
-/* 书架卡片的几何量。绘制与点击命中**共用**下面这几个函数，绝不各算一份 ——
- * 两份规则一旦不同步，用户点到的卡片和看到的卡片就会错开（自绘界面里这种 bug 极难查）。
+/* 书脊几何量。绘制、点击命中、滚轮夹取**共用**下面这几个函数，绝不各算一份 ——
+ * 两份规则一旦不同步，用户点到的书脊和看到的书脊就会错开（自绘界面里这种 bug 极难查）。
  * 全是 96 DPI 设计值，用时过 S()。 */
-static int HomeCardW()  { return S(300); }   /* 卡片设计宽（单列时会被拉宽到整行） */
-static int HomeCardH()  { return S(96); }    /* 卡片高：书名 + 章名 + 底部进度条 */
-static int HomeGap()    { return S(14); }    /* 卡片之间的横竖间距 */
-static int HomeListTop(){ return S(104); }   /* 网格从"大标题 + 副标题"下面开始 */
+static int ShelfSpineW() { return S(88); }    /* 一根书脊的宽 */
+static int ShelfSpineH() { return S(300); }   /* 书脊高（窗口矮时会缩） */
+static int ShelfGap()    { return S(12); }    /* 书脊之间的缝 */
+static int ShelfTop()    { return S(118); }   /* 书架区顶部（大标题 + 副标题下面） */
+static int ShelfStep()   { return ShelfSpineW() + ShelfGap(); }
 
-/* 计算网格：列数按可用宽度自适应（窗口窄就退成一列），返回左边距。
- * 卡片宽度在最后会被拉伸填满整行 —— 右边不留一条参差的空白，视觉上更整齐。 */
-static int HomeGrid(int W, int& cols, int& cardW)
+/* 横向滚动量（像素），0 = 最左边。
+ * 滚一格正好一根书脊：滚完自然对齐，中间那本永远是"被选中"的那本，
+ * 不需要额外的吸附动画，手感也更像真的在架子上抽书。 */
+static int s_shelfX = 0;
+
+/* 左右边距：窗口窄时收一收，别把书脊挤没 */
+static int ShelfMargin(int W)
 {
-    int margin = S(40);
-    if (margin * 2 > W / 3) margin = S(18);      /* 窗口窄时把左右边距收一收，别把卡片挤没了 */
-    int avail = W - margin * 2;
-    int gap = HomeGap();
-    cols = 1;
-    while (cols < 3 && (cols + 1) * HomeCardW() + cols * gap <= avail) cols++;
-    cardW = (avail - (cols - 1) * gap) / cols;
-    if (cardW < S(160)) cardW = S(160);
-    return margin;
+    int m = S(40);
+    if (m * 2 > W / 3) m = S(16);
+    return m;
 }
 
-/* 第 idx 张卡片的矩形（客户区坐标）。idx 越界时返回空矩形 */
-static RECT HomeCardRect(int idx, int W)
+/* 书架可用宽度（去掉左右边距） */
+static int ShelfAvail(int W)
+{
+    int avail = W - ShelfMargin(W) * 2;
+    if (avail < ShelfSpineW()) avail = ShelfSpineW();
+    return avail;
+}
+
+/* 一排书脊的总宽（n 本是 n 根书脊 + n-1 道缝） */
+static int ShelfContentW(int n)
+{
+    if (n <= 0) return 0;
+    return n * ShelfSpineW() + (n - 1) * ShelfGap();
+}
+
+/* 最大滚动量：内容放得下时是 0（此时整排居中，滚轮不响应） */
+static int ShelfMaxScroll(int W, int n)
+{
+    int over = ShelfContentW(n) - ShelfAvail(W);
+    return over > 0 ? over : 0;
+}
+
+/* 把 s_shelfX 夹进合法范围。窗口一改大小、书架一增删书，都要过这里，
+ * 否则滚动量会停在旧范围里（表现为"左边多出一块空白"或"最后一本够不到"）。 */
+static int ShelfClamp(int W, int n)
+{
+    int maxX = ShelfMaxScroll(W, n);
+    if (s_shelfX < 0) s_shelfX = 0;
+    if (s_shelfX > maxX) s_shelfX = maxX;
+    return s_shelfX;
+}
+
+/* 书脊的竖直摆放：底边对齐到"书架板"，像真的立在架子上。
+ * 窗口太矮就把书脊等比缩短，不会顶到标题、也不会压到底部提示。 */
+static void ShelfBand(int H, int& top, int& h)
+{
+    int areaTop = ShelfTop();
+    int areaBottom = H - S(64);
+    if (areaBottom - areaTop < S(140)) areaBottom = areaTop + S(140);  /* 极矮窗口兜底 */
+    h = ShelfSpineH();
+    int room = areaBottom - areaTop - S(10);
+    if (h > room) h = room;
+    if (h < S(120)) h = S(120);
+    top = areaBottom - h;
+}
+
+/* 第 idx 根书脊的矩形（客户区坐标）。lift = 抬起的像素：悬停 / 居中那本会被"抽出来"一点。
+ * n 由调用方传进来，避免每根书脊都去调一次 ShelfItems()（它返回的是拷贝）。 */
+static RECT ShelfRect(int idx, int W, int H, int n, int lift)
 {
     RECT r = { 0, 0, 0, 0 };
-    int cols = 1, cardW = HomeCardW();
-    int margin = HomeGrid(W, cols, cardW);
-    if (idx < 0 || cols <= 0) return r;
-    int col = idx % cols;
-    int row = idx / cols;
-    int x = margin + col * (cardW + HomeGap());
-    int y = HomeListTop() + row * (HomeCardH() + HomeGap());
+    if (idx < 0 || idx >= n) return r;
+    int left = ShelfMargin(W);
+    int contentW = ShelfContentW(n);
+    if (contentW <= ShelfAvail(W)) left += (ShelfAvail(W) - contentW) / 2;  /* 放得下就整排居中 */
+    else left -= ShelfClamp(W, n);
+    int top = 0, h = 0;
+    ShelfBand(H, top, h);
+    int x = left + idx * ShelfStep();
     r.left = x;
-    r.top = y;
-    r.right = x + cardW;
-    r.bottom = y + HomeCardH();
+    r.top = top - lift;
+    r.right = x + ShelfSpineW();
+    r.bottom = top - lift + h;
     return r;
 }
 
-/* 客户区坐标 → 书架卡片序号；不在任何卡片上返回 -1。
- * 边界：有书打开时首页不显示（返回 -1）；书架为空时也返回 -1（此时画的是引导语）。 */
-static int HomeRowAt(int x, int y)
+/* 离屏幕中线最近的那根书脊（回车键打开它，绘制时也用它决定谁"抽出来"）。没有书返回 -1 */
+static int ShelfCentered(int W, int H, int n)
+{
+    if (n <= 0) return -1;
+    int mid = W / 2;
+    int best = 0, bestD = 0x7FFFFFFF;
+    for (int i = 0; i < n; i++) {
+        RECT r = ShelfRect(i, W, H, n, 0);
+        int cx = (r.left + r.right) / 2;
+        int d = cx > mid ? cx - mid : mid - cx;
+        if (d < bestD) { bestD = d; best = i; }
+    }
+    return best;
+}
+
+/* 滚轮 / 方向键：左右移一格。dir<0 往左（看前面的书），>0 往右。
+ * 这里自己取客户区大小，调用方（消息处理）就不用再传一遍。 */
+static void ShelfScrollBy(int dir)
+{
+    int n = (int)ShelfItems().size();
+    if (n <= 0) return;
+    RECT cr = { 0, 0, 0, 0 };
+    GetClientRect(s_wnd, &cr);
+    s_shelfX += dir * ShelfStep();
+    ShelfClamp(cr.right, n);
+    InvalidateAll();
+}
+
+/* 客户区坐标 → 书脊序号；不在任何书脊上返回 -1。
+ * 边界：有书打开时首页不显示（返回 -1）；书架为空时也返回 -1（此时画的是引导语）。
+ * 命中矩形按 lift=0 判，但上方多放 S(14) 像素 —— 被"抽出来"的那本上半截也要点得到。 */
+static int ShelfIndexAt(int x, int y)
 {
     if (g_book.Ok()) return -1;
-    const std::vector<ShelfItem>& items = ShelfItems();
-    if (items.empty()) return -1;
-    if (y < HomeListTop()) return -1;
+    const std::vector<ShelfItem> items = ShelfItems();
+    int n = (int)items.size();
+    if (n <= 0) return -1;
 
-    RECT r = { 0, 0, 0, 0 };
-    GetClientRect(s_wnd, &r);
-    int W = r.right;
-    /* 逐张比对而不是用整除算行列：列数与拉伸后的卡片宽都随窗口变，硬算容易错一格 */
-    for (int i = 0; i < (int)items.size(); i++) {
-        RECT c = HomeCardRect(i, W);
-        if (c.right <= c.left) break;
-        if (x >= c.left && x < c.right && y >= c.top && y < c.bottom) return i;
+    RECT cr = { 0, 0, 0, 0 };
+    GetClientRect(s_wnd, &cr);
+    int W = cr.right, H = cr.bottom;
+    for (int i = 0; i < n; i++) {
+        RECT c = ShelfRect(i, W, H, n, 0);
+        if (c.right <= c.left) continue;
+        if (x >= c.left && x < c.right && y >= c.top - S(14) && y < c.bottom) return i;
     }
     return -1;
+}
+
+/* 书脊底色：按书名散列到一组"书皮色"，再跟主题卡片色混一下，
+ * 这样浅色主题不会刺眼、深色主题也不会糊成一团。 */
+static COLORREF ShelfColor(const std::wstring& title, const Theme& th)
+{
+    static const COLORREF kPal[] = {
+        RGB(0x8A, 0x5A, 0x3C),   /* 棕 */
+        RGB(0x3F, 0x63, 0x7A),   /* 蓝 */
+        RGB(0x4C, 0x6B, 0x4A),   /* 绿 */
+        RGB(0x6B, 0x4A, 0x6B),   /* 紫 */
+        RGB(0x7A, 0x5A, 0x35),   /* 土黄 */
+        RGB(0x5A, 0x5A, 0x62),   /* 灰蓝 */
+    };
+    unsigned h = 2166136261u;
+    for (size_t i = 0; i < title.size(); i++) {
+        h ^= (unsigned)title[i];
+        h *= 16777619u;
+    }
+    COLORREF base = kPal[h % (sizeof(kPal) / sizeof(kPal[0]))];
+    return Mix(base, th.card, 62);
 }
 
 
@@ -1400,9 +1524,10 @@ static std::wstring FitText(HDC dc, const std::wstring& s, int maxW)
 
 /* 首页：没打开书时整屏显示。
  * 两种情况：
- *   1) 书架里有记录（读过书）→ 画"书架"大标题 + 卡片网格，每张卡片是
- *      「左侧书脊色条 + 书名 + 章名 + 底部进度条 + 右侧百分比」，可点击
- *      （命中判定见 HomeRowAt，与绘制共用 HomeCardRect，保证点到哪张就是哪张）；
+ *   1) 书架里有记录（读过书）→ 一排竖着的"书脊"横铺在屏幕上，书名竖排在书脊上，
+ *      滚轮左右翻书（一格正好一根，滚完自然对齐），点任意一根就打开那一本，
+ *      回车打开离屏幕中线最近的那本；居中那本会被"抽出来"一点，表示当前选中的是它
+ *      （几何全部来自 ShelfRect，绘制与命中不会错位，见 ShelfIndexAt）；
  *   2) 书架为空（第一次运行）→ 退回原来的三行引导语，视觉上和以前完全一致。
  * 参数 W / H 是客户区宽高，由 PaintAll 传入。 */
 static void DrawHome(int W, int H)
@@ -1410,11 +1535,11 @@ static void DrawHome(int W, int H)
     const Theme& th = CurTheme();
     EnsureFonts();
 
-    const std::vector<ShelfItem>& items = ShelfItems();
+    const std::vector<ShelfItem> items = ShelfItems();
     if (items.empty()) { DrawWelcome(W, H); return; }
 
-    int margin = S(40);
-    if (margin * 2 > W / 3) margin = S(18);
+    int n = (int)items.size();
+    int margin = ShelfMargin(W);
 
     /* ---- 大标题 + 副标题 ---- */
     SelectObject(s_dc, s_fontB);
@@ -1422,115 +1547,107 @@ static void DrawHome(int W, int H)
     const wchar_t* big = L"书架";
     ExtTextOutW(s_dc, margin, S(30), 0, nullptr, big, (int)wcslen(big), nullptr);
 
-    wchar_t sub[160];
-    wsprintfW(sub, L"共 %d 本 · 单击卡片继续阅读，或按 Ctrl+O 打开新文件", (int)items.size());
+    wchar_t sub[200];
+    wsprintfW(sub, L"共 %d 本 · 滚轮翻书，点书脊打开，回车打开中间那本", n);
     SelectObject(s_dc, s_fontN);
     SetTextColor(s_dc, th.dim);
     ExtTextOutW(s_dc, margin, S(30) + s_lineH + S(2), 0, nullptr, sub, (int)wcslen(sub), nullptr);
 
-    /* ---- 卡片网格 ---- */
-    int cols = 1, cardW = HomeCardW();
-    HomeGrid(W, cols, cardW);
-    int cardH = HomeCardH();
-    int n = (int)items.size();
-    for (int i = 0; i < n; i++) {
-        RECT c = HomeCardRect(i, W);
-        if (c.bottom > H) break;                 /* 放不下了就停（书不会太多，不做滚动） */
-        const ShelfItem& it = items[(size_t)i];
-        bool hover = (i == s_homeHover) && !it.missing;
+    /* ---- 一排书脊 ---- */
+    ShelfClamp(W, n);                        /* 窗口刚改过大小的话，先把滚动量夹回合法范围 */
+    int bandTop = 0, bandH = 0;
+    ShelfBand(H, bandTop, bandH);
 
-        /* 卡片底：正常的书用卡片色，悬停时略微加深；文件已不在的卡片保持卡片色但整体灰显 */
-        HBRUSH bg = CreateSolidBrush(hover ? th.hov : th.card);
-        HPEN pen = CreatePen(PS_SOLID, 1, th.line);
+    /* 书架板：书脊脚下一块横板，让它们看着是"站在架子上"而不是浮在半空。
+     * 两层：上面深一点的是板面，下面浅一点的是板厚。 */
+    {
+        int boardY = bandTop + bandH + S(3);
+        RECT bd = { margin / 2, boardY, W - margin / 2, boardY + S(3) };
+        HBRUSH bb = CreateSolidBrush(th.line);
+        FillRect(s_dc, &bd, bb);
+        DeleteObject(bb);
+        RECT bd2 = { margin / 2, boardY + S(3), W - margin / 2, boardY + S(5) };
+        HBRUSH b2 = CreateSolidBrush(Mix(th.line, th.bg, 45));
+        FillRect(s_dc, &bd2, b2);
+        DeleteObject(b2);
+    }
+
+    int centered = ShelfCentered(W, H, n);
+
+    for (int i = 0; i < n; i++) {
+        const ShelfItem& it = items[(size_t)i];
+        bool hot = (i == s_homeHover);
+        bool sel = (i == centered);
+        int lift = sel ? S(14) : (hot ? S(9) : 0);
+        RECT r = ShelfRect(i, W, H, n, lift);
+        if (r.right < -S(24) || r.left > W + S(24)) continue;   /* 完全在视野外就不画，省一次 GDI 调用 */
+
+        /* 书脊本体：圆角矩形 + 细边。悬停时提亮、边框换成 accent；
+         * 文件已经不在的那本整体压暗，一眼能看出这条记录废了。 */
+        COLORREF face = it.missing ? Mix(th.card, th.bg, 50) : ShelfColor(it.title, th);
+        if (hot && !it.missing) face = Mix(face, th.fg, 86);
+        HBRUSH bg = CreateSolidBrush(face);
+        HPEN pen = CreatePen(PS_SOLID, (sel || hot) ? S(2) : 1,
+                             (sel || hot) ? th.accent : Mix(face, th.line, 55));
         HGDIOBJ ob = SelectObject(s_dc, bg);
         HGDIOBJ op = SelectObject(s_dc, pen);
-        RoundRect(s_dc, c.left, c.top, c.right, c.bottom, S(10), S(10));
+        RoundRect(s_dc, r.left, r.top, r.right, r.bottom, S(8), S(8));
         SelectObject(s_dc, ob);
         SelectObject(s_dc, op);
         DeleteObject(bg);
         DeleteObject(pen);
 
-        /* 左侧"书脊"色条：宽 S(6)，上下留 S(1)，用标题色（accent 化的棕/蓝）——
-         * 这是唯一给卡片带一点"书"的暗示的元素，比加图标省事也不失真。
-         * 文件丢失的卡片书脊用 dim 色，一眼看出这条记录已经废了。 */
-        RECT spine = { c.left + S(1), c.top + S(1), c.left + S(7), c.bottom - S(1) };
-        HBRUSH sb = CreateSolidBrush(it.missing ? th.dim : th.title);
-        FillRect(s_dc, &spine, sb);
-        DeleteObject(sb);
+        /* 靠左的一道竖高光：书脊的"脊背"是圆的，这道光是唯一让它看起来有厚度的地方 */
+        {
+            RECT hi = { r.left + S(6), r.top + S(8), r.left + S(6) + S(2), r.bottom - S(8) };
+            HBRUSH hb = CreateSolidBrush(Mix(face, RGB(255, 255, 255), 70));
+            FillRect(s_dc, &hi, hb);
+            DeleteObject(hb);
+        }
 
-        int padL = c.left + S(18);
-        int padR = c.right - S(12);
-
-        /* 右侧百分比：先量宽度，书名用剩余空间（FitText 二分截断补省略号） */
-        wchar_t pct[32];
-        if (it.missing)            lstrcpynW(pct, L"已丢失", 32);
-        else if (it.pct < 0)       lstrcpynW(pct, L"未读", 32);
-        else if (it.pct >= 1000)   lstrcpynW(pct, L"100%", 32);
-        else                       wsprintfW(pct, L"%d.%d%%", it.pct / 10, it.pct % 10);
-
-        SelectObject(s_dc, s_fontB);
-        SIZE psz; psz.cx = psz.cy = 0;
-        GetTextExtentPoint32W(s_dc, pct, (int)wcslen(pct), &psz);
-
-        /* 第一排：书名（粗体）+ 右侧百分比 */
-        int ty = c.top + S(12);
-        std::wstring title = FitText(s_dc, it.title, padR - psz.cx - S(12) - padL);
+        /* 书名竖排：一个字符一行。中文书脊本来就是竖排，比把字体旋转 90° 更自然，
+         * 也不用为了旋转去另建一套 lfEscapement 的字体。
+         * 字号不跟正文走（有人把正文调到 30pt，书脊上就只够写两三个字了）：
+         * 先用"大号"，放不下就整体换"小号"，还放不下才截断补省略号。 */
+        EnsureSpineFonts();
         SetTextColor(s_dc, it.missing ? th.dim : th.fg);
-        ExtTextOutW(s_dc, padL, ty, 0, nullptr, title.c_str(), (int)title.size(), nullptr);
-        SetTextColor(s_dc, it.missing ? th.dim : th.title);
-        ExtTextOutW(s_dc, padR - psz.cx, ty, 0, nullptr, pct, (int)wcslen(pct), nullptr);
-
-        /* 第二排：章节进度（次要信息，dim 色）。
-         * 这一排会被截断的是**章名**，"共 N 章"这种固定尾巴不能跟着被切掉——
-         * 所以先把尾巴量出来占好位置，剩下的宽度才给章名用。 */
-        std::wstring info, tail;
-        if (it.missing) {
-            info = L"文件已不在：";
-            info += it.path;
-        } else if (!it.chapter.empty()) {
-            info = it.chapter;
-            if (it.chn > 0) {
-                wchar_t b[64];
-                wsprintfW(b, L"   ·   共 %d 章", it.chn);
-                tail = b;
-            }
-        } else if (it.chn > 0) {
-            wchar_t b[64];
-            wsprintfW(b, L"共 %d 章 · 还没开始读", it.chn);
-            info += b;
-        } else {
-            info = L"还没开始读";
+        std::wstring title = it.title.empty() ? L"未命名" : it.title;
+        int avail = bandH - S(28) - S(22);        /* 上方留白 + 下方给进度条 */
+        if (avail < S(40)) avail = S(40);
+        HFONT fnt = s_spineFont;
+        int lineH = S(24);
+        if ((int)title.size() * lineH > avail) { fnt = s_spineFontS; lineH = S(17); }
+        int maxChars = avail / lineH;
+        if (maxChars < 1) maxChars = 1;
+        if ((int)title.size() > maxChars) {
+            if (maxChars > 1) title = title.substr(0, (size_t)(maxChars - 1)) + L"…";
+            else title = title.substr(0, 1);
         }
-        SelectObject(s_dc, s_fontN);
-        SetTextColor(s_dc, th.dim);
-        if (!tail.empty()) {
-            SIZE tsz; tsz.cx = tsz.cy = 0;
-            GetTextExtentPoint32W(s_dc, tail.c_str(), (int)tail.size(), &tsz);
-            int room = padR - padL - tsz.cx;
-            if (room < S(40)) {                 /* 卡片太窄：干脆只显示尾巴 */
-                info = tail;
-                info.erase(0, 5);               /* 去掉 "   ·   " 前缀（5 个字符） */
-            } else {
-                info = FitText(s_dc, info, room) + tail;
-            }
-        } else {
-            info = FitText(s_dc, info, padR - padL);
+        SelectObject(s_dc, fnt);
+        int cx = (r.left + r.right) / 2;
+        int blockH = (int)title.size() * lineH;
+        int ty = r.top + (bandH - blockH) / 2;    /* 整块垂直居中：长短书名的上边距一致才像一排书 */
+        for (size_t k = 0; k < title.size(); k++) {
+            wchar_t ch = title[k];
+            SIZE cs; cs.cx = cs.cy = 0;
+            GetTextExtentPoint32W(s_dc, &ch, 1, &cs);
+            ExtTextOutW(s_dc, cx - cs.cx / 2, ty, 0, nullptr, &ch, 1, nullptr);
+            ty += lineH;
         }
-        ExtTextOutW(s_dc, padL, ty + s_lineH + S(2), 0, nullptr, info.c_str(), (int)info.size(), nullptr);
 
-        /* 第三排：底部细进度条（轨道 track + 填充 accent）。
-         * 没读过的书不画填充，只留一条浅轨道，避免出现"满格"的错觉。 */
-        int barH = S(4);
-        int barY = c.bottom - S(14);
-        RECT track = { padL, barY, padR, barY + barH };
-        HBRUSH tb = CreateSolidBrush(th.track);
+        /* 书脊底部的细进度条：读过才填，没读过只留一条浅轨道，
+         * 免得出现"看着像读完了"的错觉。 */
+        int barY = r.bottom - S(18);
+        RECT track = { r.left + S(12), barY, r.right - S(12), barY + S(4) };
+        HBRUSH tb = CreateSolidBrush(Mix(face, th.bg, 40));
         FillRect(s_dc, &track, tb);
         DeleteObject(tb);
         if (!it.missing && it.pct > 0) {
-            int pw = (int)((long long)(padR - padL) * it.pct / 1000);
+            int tw = track.right - track.left;
+            int pw = (int)((long long)tw * it.pct / 1000);
             if (pw < 0) pw = 0;
-            if (pw > padR - padL) pw = padR - padL;
-            RECT fill = { padL, barY, padL + pw, barY + barH };
+            if (pw > tw) pw = tw;
+            RECT fill = { track.left, barY, track.left + pw, barY + S(4) };
             HBRUSH fb = CreateSolidBrush(th.accent);
             FillRect(s_dc, &fill, fb);
             DeleteObject(fb);
@@ -1538,17 +1655,17 @@ static void DrawHome(int W, int H)
     }
 
     /* ---- 底部提示 ---- */
-    const wchar_t* hint = L"提示：Ctrl+W 关闭当前书回到书架 · 拖入文件也能打开";
+    const wchar_t* hint = L"提示：滚轮左右翻书 · 点任意书脊打开 · 回车打开中间那本 · Ctrl+O 打开新文件";
     SelectObject(s_dc, s_fontN);
     SetTextColor(s_dc, th.dim);
+    /* 窗口窄的时候整句放不下，用 FitText 截一下，别顶到窗口外面去 */
+    std::wstring hstr = FitText(s_dc, hint, W - margin * 2);
     SIZE hz; hz.cx = hz.cy = 0;
-    GetTextExtentPoint32W(s_dc, hint, (int)wcslen(hint), &hz);
+    GetTextExtentPoint32W(s_dc, hstr.c_str(), (int)hstr.size(), &hz);
     int hy = H - s_lineH - S(14);
-    /* 提示只画在最后一张卡片下面还有空位的时候，否则会压在卡片上 */
-    int rows = (n + cols - 1) / cols;
-    int usedBottom = HomeListTop() + rows * (cardH + HomeGap());
-    if (hy > usedBottom) ExtTextOutW(s_dc, (W - hz.cx) / 2, hy, 0, nullptr, hint, (int)wcslen(hint), nullptr);
+    ExtTextOutW(s_dc, (W - hz.cx) / 2, hy, 0, nullptr, hstr.c_str(), (int)hstr.size(), nullptr);
 }
+
 /* 欢迎页：还没打开书时整屏显示的三行提示。参数：W / H 是客户区宽高（由 PaintAll
    传入，省得再取一次）；返回值：无。用 dim 色而不是正文色：视觉上弱化，让"拖一个文件
    进来"这句引导成为焦点；行距用 s_lineH + S(6)，比正文松一点，三行不至于挤成一坨。注意这里自己
@@ -1928,7 +2045,7 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM w, LPARAM l)
             POINT pt;
             GetCursorPos(&pt);
             ScreenToClient(h, &pt);
-            int idx = HomeRowAt((int)pt.x, (int)pt.y);
+            int idx = ShelfIndexAt((int)pt.x, (int)pt.y);
             const std::vector<ShelfItem>& items = ShelfItems();
             if (idx >= 0 && idx < (int)items.size() && !items[(size_t)idx].missing) {
                 SetCursor(LoadCursorW(nullptr, IDC_HAND));
@@ -1958,6 +2075,12 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM w, LPARAM l)
             return 0;
         }
         UiAutoStop();                       /* 手动拨轮时停下自动下滑 */
+        /* 首页书架：滚轮 = 横向翻书。往上一格 = 往左翻（和"滚轮往上 = 往前"的直觉一致），
+           到底/到尾自动停住（ShelfScrollBy 内部会夹取滚动量）。 */
+        if (!g_book.Ok()) {
+            if (delta > 0) ShelfScrollBy(-1); else ShelfScrollBy(1);
+            return 0;
+        }
         /* PDF 原始版式：滚轮优先在页内上下移动；已经滚到底（或整页装得下）才翻页。
            这样"整页比窗口高"的 PDF 也能顺畅看完全文，而不是一格就跳过一页。 */
         if (s_pdfMode) {
@@ -2039,6 +2162,35 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM w, LPARAM l)
             default: break;
             }
         }
+        /* 首页书架：方向键/翻页键 = 横向翻书，Home/End = 到两端，回车 = 打开中间那本。
+           必须在下面的正文滚动分支之前拦掉 —— 首页没有正文，滚正文毫无意义。 */
+        if (!g_book.Ok()) {
+            switch (w) {
+            case VK_LEFT: case VK_UP: case VK_PRIOR:   ShelfScrollBy(-1); return 0;
+            case VK_RIGHT: case VK_DOWN: case VK_NEXT: ShelfScrollBy(1);  return 0;
+            case VK_HOME:
+                s_shelfX = 0;
+                InvalidateAll();
+                return 0;
+            case VK_END: {
+                RECT cr = { 0, 0, 0, 0 };
+                GetClientRect(s_wnd, &cr);
+                s_shelfX = ShelfMaxScroll(cr.right, (int)ShelfItems().size());
+                InvalidateAll();
+                return 0;
+            }
+            case VK_RETURN: {
+                const std::vector<ShelfItem> items = ShelfItems();
+                RECT cr = { 0, 0, 0, 0 };
+                GetClientRect(s_wnd, &cr);
+                int idx = ShelfCentered(cr.right, cr.bottom, (int)items.size());
+                if (idx >= 0 && idx < (int)items.size() && !items[(size_t)idx].missing)
+                    UiOpenFile(items[(size_t)idx].path);
+                return 0;
+            }
+            default: break;
+            }
+        }
         /* 键盘翻页/跳转也停下自动下滑（不含 F6/F7/F8，那三个由快捷键表处理） */
         /* 分两段 switch：这一段只负责"停下自动下滑"，下一段才真正执行动作。好处是
            "用户手动操作就停止自动下滑"这条规则只写一次，不必在每个按键分支里重复，
@@ -2084,7 +2236,7 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM w, LPARAM l)
          * 这里不进入拖选流程 —— 首页没有正文，选字毫无意义，直接返回更干净。
          * 文件已经不存在的行（missing）点了没有反应，视觉上也已经灰显过。 */
         if (!g_book.Ok()) {
-            int idx = HomeRowAt(GET_X_LPARAM(l), GET_Y_LPARAM(l));
+            int idx = ShelfIndexAt(GET_X_LPARAM(l), GET_Y_LPARAM(l));
             const std::vector<ShelfItem>& items = ShelfItems();
             if (idx >= 0 && idx < (int)items.size() && !items[(size_t)idx].missing)
                 UiOpenFile(items[(size_t)idx].path);
@@ -2103,7 +2255,7 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM w, LPARAM l)
         /* 首页书架：悬停高亮。必须放在"拖选状态"判断之前 —— 首页永远没有拖选，
          * 若先判 s_dragging 就直接 return 了，悬停效果永远不出现。 */
         if (!g_book.Ok()) {
-            int idx = HomeRowAt(GET_X_LPARAM(l), GET_Y_LPARAM(l));
+            int idx = ShelfIndexAt(GET_X_LPARAM(l), GET_Y_LPARAM(l));
             if (idx != s_homeHover) { s_homeHover = idx; InvalidateAll(); }
             /* 请求一次"鼠标离开窗口"的通知：系统只发一次，所以每次进入都要重新登记 */
             if (!s_trackLeave) {

@@ -165,6 +165,8 @@ static void UiShowSyncStatus();          /* 同步状态对话框 */
 static std::wstring ClipToWidth(HDC dc, const std::wstring& s, int maxW);
 static bool WriteTextFileUtf8Bom(const std::wstring& path, const std::wstring& text);
 static HACCEL BuildAccel();
+/* 1.8.1：托盘相关的实现放在文件后半段（要调 SaveAll），但老板键在这里就要用 */
+static void UiTrayRemove();
 
 /* ---------------- 字体 ---------------- */
 
@@ -837,18 +839,374 @@ static bool BarMenuHit(int x, int y)
     return PtInRect(&r, p) != FALSE;
 }
 
-/* 弹出整个应用菜单（屏幕坐标）。菜单没有挂在窗口上，所以只能这样弹；
- * 用 TPM_RETURNCMD 拿到命令号后 Post 成 WM_COMMAND，走和菜单栏时期完全一样的分发路径。
- * 右键、工具栏的「菜单」按钮、以及 Ctrl+F10（见 accelerators）都走这里。 */
+/* ---------------- 三条杠弹出的「选项面板」（1.8.1） ----------------
+ * 用户需求（m02316）：「那个三条杠也改掉，按了之后要跳出来选项，不要几条白线」。
+ * 追问后确认：三条横线图标保留，要换的是**点开以后弹出来的东西** ——
+ * 原来是系统的 TrackPopupMenu，夜间主题下是一块系统灰，和这套纸感界面不搭。
+ * 现在改成自绘的两列面板：按 文件 / 阅读 / 搜索 / 帮助 分组，鼠标划过整行提亮，
+ * 点某条就 Post 一条 WM_COMMAND，和原来的菜单走同一条分发路径，功能一个不少。
+ */
+struct BarRow {
+    std::wstring text;      /* 显示文字（已去掉 & 和 \t 后面的快捷键） */
+    std::wstring accel;     /* 右侧的快捷键提示，可空 */
+    int  id = 0;            /* 命令 id；小标题行是 0 */
+    bool header = false;    /* true = 分组小标题 */
+    RECT rc = { 0, 0, 0, 0 };
+};
+static std::vector<BarRow> s_barRows;
+static HWND s_hBarPanel = nullptr;
+static int  s_barRowHover = -1;   /* 面板里悬停的行号（与顶栏按钮的 s_barHover 分开，各管各的） */
+static bool s_barActivated = false;  /* 面板是否真的被激活过（见 WM_ACTIVATE 里的说明） */
+static HFONT s_barFont = nullptr, s_barFontHead = nullptr;
+
+static int BarRowH()  { return S(28); }
+static int BarHeadH() { return S(26); }
+static int BarColW()  { return S(272); }
+static int BarPad()   { return S(12); }
+static int BarColGap() { return S(12); }
+/* 最多四列。具体用几列由 BarLayoutRows 按"屏幕工作区装得下"来挑：
+ * 两列在 1080p 下就 1200+ 像素高，1280x768 的机器直接顶出屏幕（实测踩过：
+ * 面板下半截落在屏幕外，帮助菜单最后几条根本看不见）。 */
+static const int kBarCols = 4;
+
+/* 去掉加速键前缀 '&'（"&&" 是字面量 '&'），并拆出 \t 后面的快捷键提示 */
+static void BarCleanLabel(std::wstring& text, std::wstring& accel)
+{
+    size_t tab = text.find(L'\t');
+    if (tab != std::wstring::npos) {
+        accel = text.substr(tab + 1);
+        text = text.substr(0, tab);
+    }
+    std::wstring out;
+    out.reserve(text.size());
+    for (size_t i = 0; i < text.size(); i++) {
+        if (text[i] == L'&' && i + 1 < text.size() && text[i + 1] == L'&') { out += L'&'; i++; }
+        else if (text[i] == L'&') continue;
+        else out += text[i];
+    }
+    text = out;
+}
+
+/* 把菜单树摊平成面板行。只摊一层子菜单（"最近打开"那种）：
+ * 再深就不是「选项面板」而是一整套菜单了，反而更难找。 */
+static void BarBuildRows()
+{
+    s_barRows.clear();
+    if (!s_hAppMenu) return;
+    int n = GetMenuItemCount(s_hAppMenu);
+    for (int i = 0; i < n; i++) {
+        wchar_t buf[256] = { 0 };
+        if (GetMenuStringW(s_hAppMenu, (UINT)i, buf, 256, MF_BYPOSITION) <= 0) continue;
+        HMENU sub = GetSubMenu(s_hAppMenu, i);
+        if (!sub) continue;
+        BarRow hr;
+        hr.header = true;
+        hr.text = buf;
+        std::wstring dummy;
+        BarCleanLabel(hr.text, dummy);
+        s_barRows.push_back(hr);
+
+        int m = GetMenuItemCount(sub);
+        for (int j = 0; j < m; j++) {
+            wchar_t b2[256] = { 0 };
+            if (GetMenuStringW(sub, (UINT)j, b2, 256, MF_BYPOSITION) <= 0) continue;   /* 分隔线 */
+            std::wstring t2 = b2, a2;
+            BarCleanLabel(t2, a2);
+            HMENU s2 = GetSubMenu(sub, j);
+            if (s2) {
+                BarRow h2;
+                h2.header = true;
+                h2.text = L"· " + t2;
+                s_barRows.push_back(h2);
+                /* 二级子菜单（目前只有"最近打开"）最多摊 6 条：再多面板会被撑到屏幕外，
+                 * 而且真要点第 7 本时，直接在书架上点更快。 */
+                int k2 = GetMenuItemCount(s2);
+                int shown2 = 0;
+                for (int k = 0; k < k2 && shown2 < 6; k++) {
+                    wchar_t b3[256] = { 0 };
+                    if (GetMenuStringW(s2, (UINT)k, b3, 256, MF_BYPOSITION) <= 0) continue;
+                    int id3 = (int)GetMenuItemID(s2, (UINT)k);
+                    if (id3 <= 0) continue;
+                    std::wstring t3 = b3, a3;
+                    BarCleanLabel(t3, a3);
+                    BarRow r3;
+                    r3.text = t3; r3.accel = a3; r3.id = id3;
+                    s_barRows.push_back(r3);
+                    shown2++;
+                }
+                continue;
+            }
+            int id = (int)GetMenuItemID(sub, (UINT)j);
+            if (id <= 0) continue;
+            BarRow r;
+            r.text = t2; r.accel = a2; r.id = id;
+            s_barRows.push_back(r);
+        }
+    }
+}
+
+/* 布局：按"组"贪心分到多列（谁当前矮就放谁），返回面板的客户区尺寸 */
+static void BarLayoutRows(int& outW, int& outH, int cols)
+{
+    if (cols < 1) cols = 1;
+    if (cols > kBarCols) cols = kBarCols;
+    const int pad = BarPad(), colW = BarColW(), rowH = BarRowH(), headH = BarHeadH();
+    const int gap = BarColGap();
+    int h[kBarCols] = { 0 };
+    size_t i = 0;
+    while (i < s_barRows.size()) {
+        size_t j = i + 1;
+        while (j < s_barRows.size() && !s_barRows[j].header) j++;
+        int gh = headH + (int)(j - i - 1) * rowH + S(8);
+        int col = 0;
+        for (int c = 1; c < cols; c++) { if (h[c] < h[col]) col = c; }
+        int x = pad + col * (colW + gap);
+        int y = pad + h[col];
+        SetRect(&s_barRows[i].rc, x, y, x + colW, y + headH);
+        y += headH;
+        for (size_t k = i + 1; k < j; k++) {
+            SetRect(&s_barRows[k].rc, x, y, x + colW, y + rowH);
+            y += rowH;
+        }
+        h[col] += gh;
+        i = j;
+    }
+    int maxH = 0;
+    for (int c = 0; c < cols; c++) { if (h[c] > maxH) maxH = h[c]; }
+    outW = pad * 2 + colW * cols + gap * (cols - 1);
+    outH = pad * 2 + maxH;
+}
+
+static void BarEnsureFonts()
+{
+    if (s_barFont) return;
+    LOGFONTW lf;
+    ZeroMemory(&lf, sizeof(lf));
+    lf.lfWeight = FW_NORMAL;
+    lf.lfCharSet = DEFAULT_CHARSET;
+    lf.lfQuality = CLEARTYPE_QUALITY;
+    lf.lfPitchAndFamily = DEFAULT_PITCH | FF_DONTCARE;
+    lstrcpynW(lf.lfFaceName, L"Microsoft YaHei", LF_FACESIZE);
+    lf.lfHeight = -S(15);
+    s_barFont = CreateFontIndirectW(&lf);
+    lf.lfHeight = -S(12);
+    s_barFontHead = CreateFontIndirectW(&lf);
+}
+
+static void BarPaint(HWND h, HDC dc)
+{
+    const Theme& th = CurTheme();
+    BarEnsureFonts();
+    RECT rc;
+    GetClientRect(h, &rc);
+    HBRUSH bg = CreateSolidBrush(th.card);
+    FillRect(dc, &rc, bg);
+    DeleteObject(bg);
+    /* 一圈细描边：面板是浮在纸面上的，没有边会看不出边界 */
+    HPEN pen = CreatePen(PS_SOLID, 1, th.line);
+    HGDIOBJ ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    HGDIOBJ op = SelectObject(dc, pen);
+    Rectangle(dc, rc.left, rc.top, rc.right, rc.bottom);
+    SelectObject(dc, ob);
+    SelectObject(dc, op);
+    DeleteObject(pen);
+    SetBkMode(dc, TRANSPARENT);
+
+    for (size_t i = 0; i < s_barRows.size(); i++) {
+        const BarRow& r = s_barRows[i];
+        if (r.header) {
+            SelectObject(dc, s_barFontHead);
+            SetTextColor(dc, th.dim);
+            RECT t = r.rc;
+            t.left += S(6);
+            t.bottom -= S(8);
+            DrawTextW(dc, r.text.c_str(), -1, &t,
+                      DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+            RECT ln = { r.rc.left + S(6), r.rc.bottom - S(7), r.rc.right - S(6), r.rc.bottom - S(6) };
+            HBRUSH lb = CreateSolidBrush(th.line);
+            FillRect(dc, &ln, lb);
+            DeleteObject(lb);
+            continue;
+        }
+        bool hot = ((int)i == s_barRowHover);
+        if (hot) {
+            RECT hr = r.rc;
+            hr.left += S(2);
+            hr.right -= S(2);
+            /* 悬停底色用主题色薄薄铺一层（纯 th.hov 在深色主题下几乎看不出来） */
+            HBRUSH hb = CreateSolidBrush(UiMix(th.accent, th.card, 18));
+            FillRect(dc, &hr, hb);
+            DeleteObject(hb);
+            RECT bar = { hr.left, hr.top + S(4), hr.left + S(3), hr.bottom - S(4) };
+            HBRUSH bb = CreateSolidBrush(th.accent);
+            FillRect(dc, &bar, bb);
+            DeleteObject(bb);
+        }
+        RECT t = r.rc;
+        t.left += S(14);
+        t.right -= S(12);
+        if (!r.accel.empty()) {
+            SelectObject(dc, s_barFontHead);
+            SetTextColor(dc, th.dim);
+            SIZE as; as.cx = as.cy = 0;
+            GetTextExtentPoint32W(dc, r.accel.c_str(), (int)r.accel.size(), &as);
+            RECT ar = t;
+            ar.left = t.right - as.cx;
+            DrawTextW(dc, r.accel.c_str(), -1, &ar,
+                      DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+            t.right = ar.left - S(10);
+        }
+        SelectObject(dc, s_barFont);
+        SetTextColor(dc, hot ? th.title : th.fg);
+        DrawTextW(dc, r.text.c_str(), -1, &t,
+                  DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+    }
+}
+
+static LRESULT CALLBACK BarPanelProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    switch (m) {
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        BarPaint(h, dc);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    case WM_MOUSEMOVE: {
+        POINT p = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+        int hit = -1;
+        for (size_t i = 0; i < s_barRows.size(); i++) {
+            if (s_barRows[i].header) continue;
+            if (PtInRect(&s_barRows[i].rc, p)) { hit = (int)i; break; }
+        }
+        if (hit != s_barRowHover) {
+            s_barRowHover = hit;
+            InvalidateRect(h, nullptr, FALSE);
+        }
+        TRACKMOUSEEVENT tme;
+        ZeroMemory(&tme, sizeof(tme));
+        tme.cbSize = sizeof(tme);
+        tme.dwFlags = TME_LEAVE;
+        tme.hwndTrack = h;
+        TrackMouseEvent(&tme);
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        s_barRowHover = -1;
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+    case WM_LBUTTONDOWN: {
+        POINT p = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+        for (size_t i = 0; i < s_barRows.size(); i++) {
+            const BarRow& r = s_barRows[i];
+            if (r.header || r.id <= 0) continue;
+            if (!PtInRect(&r.rc, p)) continue;
+            int id = r.id;
+            DestroyWindow(h);
+            /* 点完先收起面板再发命令：命令里可能会弹对话框，面板压在底下很难看 */
+            PostMessageW(g_hMain, WM_COMMAND, (WPARAM)id, 0);
+            return 0;
+        }
+        /* 点到面板空白处/外面：收起。这里能收到外面的点击，是因为弹出时
+         * SetCapture 了面板（见 UiShowAppMenuAt），菜单式的手感。 */
+        DestroyWindow(h);
+        return 0;
+    }
+    case WM_KEYDOWN:
+        if (w == VK_ESCAPE) { DestroyWindow(h); return 0; }
+        break;
+    case WM_ACTIVATE:
+        /* 点到面板外面（包括点主窗口）就收起，和系统菜单的手感一致。
+         * 注意刚创建时系统会先发一个 WA_INACTIVE（那时还没激活），不能把它当成
+         * "点了外面" —— 否则面板刚出来就被自己关掉了（实测踩过：list 里有窗口，
+         * 屏幕上什么都没有）。用 s_barActivated 记住"曾经激活过"再判断。 */
+        if (LOWORD(w) == WA_INACTIVE) {
+            if (s_barActivated) { DestroyWindow(h); return 0; }
+        } else {
+            s_barActivated = true;
+        }
+        break;
+    case WM_KILLFOCUS:
+        /* 焦点丢了（点了别的窗口、Alt+Tab）也收起 */
+        DestroyWindow(h);
+        return 0;
+    case WM_DESTROY:
+        ReleaseCapture();
+        s_hBarPanel = nullptr;
+        s_barRowHover = -1;
+        return 0;
+    default:
+        break;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+/* 弹出整个应用菜单（屏幕坐标）。右键、左上角三条横线、Ctrl+F10 都走这里。
+ * 面板是一次性的：每次弹出重建行、重新布局，这样"最近打开"永远是最新的。 */
 void UiShowAppMenuAt(int sx, int sy)
 {
+    if (!g_hMain) return;
+    if (s_hBarPanel) { DestroyWindow(s_hBarPanel); return; }   /* 再点一下 = 收起 */
     if (!s_hAppMenu) return;
-    /* 弹出前把"最近打开"重刷一遍：用户可能刚打开过新文件，菜单里的列表要是旧的会点错 */
-    UiRebuildRecentMenu();
-    int cmd = (int)TrackPopupMenu(s_hAppMenu,
-                                  TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RIGHTBUTTON,
-                                  sx, sy, 0, g_hMain, nullptr);
-    if (cmd) PostMessageW(g_hMain, WM_COMMAND, (WPARAM)cmd, 0);
+    UiRebuildRecentMenu();      /* 面板里有"最近打开"，弹之前先刷一遍 */
+    BarBuildRows();
+    if (s_barRows.empty()) return;
+
+    static bool s_clsReady = false;
+    HINSTANCE inst = (HINSTANCE)GetWindowLongPtrW(g_hMain, GWLP_HINSTANCE);
+    if (!s_clsReady) {
+        WNDCLASSEXW wc;
+        ZeroMemory(&wc, sizeof(wc));
+        wc.cbSize = sizeof(wc);
+        wc.style = CS_DROPSHADOW;
+        wc.lpfnWndProc = BarPanelProc;
+        wc.hInstance = inst;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.lpszClassName = L"NRBarPanel";
+        RegisterClassExW(&wc);
+        s_clsReady = true;
+    }
+
+    int w = 0, hh = 0;
+    /* 贴边保护：从右下角弹出时别跑到屏幕外面去 */
+    RECT work;
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+    const int workW = work.right - work.left;
+    const int workH = work.bottom - work.top;
+    /* 先按"最少列数装得下"来排版：两列放不下就三列，三列不行就四列。
+     * 这样小屏（1280x768）和大屏都能整块落在屏幕里，不会出现"帮助菜单最后几条
+     * 在屏幕外面"的情况。 */
+    int cols = 2;
+    for (; cols < kBarCols; cols++) {
+        BarLayoutRows(w, hh, cols);
+        if (hh <= workH && w <= workW) break;
+    }
+    if (cols >= kBarCols) BarLayoutRows(w, hh, kBarCols);
+    if (hh > workH) hh = workH;
+    if (w > workW) w = workW;
+    if (sx + w > work.right) sx = work.right - w;
+    if (sy + hh > work.bottom) sy = work.bottom - hh;
+    if (sx < work.left) sx = work.left;
+    if (sy < work.top) sy = work.top;
+
+    s_barRowHover = -1;
+    s_barActivated = false;
+    /* WS_EX_TOPMOST：面板必须盖在主窗口和阅读视图之上。只靠"owned popup"不够 ——
+     * 主窗口如果是活动窗口，弹出层可能被画到它后面（实测过：list 里有 NRBarPanel，
+     * 桌面上却只看得见书架）。 */
+    s_hBarPanel = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, L"NRBarPanel", L"",
+                                  WS_POPUP, sx, sy, w, hh,
+                                  g_hMain, nullptr, inst, nullptr);
+    if (!s_hBarPanel) return;
+    ShowWindow(s_hBarPanel, SW_SHOW);
+    SetForegroundWindow(s_hBarPanel);
+    SetFocus(s_hBarPanel);      /* 同一线程内可以先拿焦点，Esc 才会发到面板 */
+    /* 抓鼠标：这样"点面板外面收起"才可靠 —— 只靠 WM_ACTIVATE/WA_INACTIVE，
+     * 在面板其实没拿到激活状态时会漏掉（实测：点一下面板反而把它自己关掉）。 */
+    SetCapture(s_hBarPanel);
 }
 
 /* 整组按钮（胶囊容器）的矩形：贴右边缘，垂直居中。绘制与命中共用。 */
@@ -2549,6 +2907,9 @@ void UiToggleBoss()
     } else {
         ShowWindow(g_hMain, SW_SHOW);
         if (IsIconic(g_hMain)) ShowWindow(g_hMain, SW_RESTORE);
+        /* 1.8.1：如果窗口是"收进托盘"的状态，老板键叫回来之后托盘图标也该消失，
+         * 否则同一个窗口在托盘和桌面上各有一个入口，看着像开了两份。 */
+        UiTrayRemove();
         SetForegroundWindow(g_hMain);
     }
 }
@@ -4531,6 +4892,11 @@ static HMENU BuildMenu()
     AppendMenuW(f, MF_STRING, IDM_SOURCE, L"书源搜索(&S)...\tCtrl+S");
     AppendMenuW(f, MF_STRING, IDM_SOURCE_MGR, L"书源管理(&B)...");
     AppendMenuW(f, MF_SEPARATOR, 0, nullptr);
+    /* 1.8.1：两个"行为"开关。勾选状态由 AutoSyncMenu 维护，
+     * 第一次关窗时还会自动问一次（问过就不再问，见 UiCloseOrTray）。 */
+    AppendMenuW(f, MF_STRING, IDM_TRAY_TOGGLE, L"关闭时缩到托盘");
+    AppendMenuW(f, MF_STRING, IDM_START_HOME, L"启动时停在书架");
+    AppendMenuW(f, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(f, MF_STRING, IDM_EXIT, L"退出(&X)");
     AppendMenuW(h, MF_POPUP, (UINT_PTR)f, L"文件(&F)");
 
@@ -4866,6 +5232,107 @@ static void SaveAll()
     SettingsSave();
 }
 
+/* ---------------- 托盘图标（1.8.1） ----------------
+ * 用户需求（m02316）：「关掉窗口之后最小化，这个是可以选择，只提示一次，
+ * 后面要改要在设置中选择」——所以：
+ *   · 默认缩托盘，但**第一次**关窗会问一次要不要这样，问过就不再问（ini 的 trayAsked）；
+ *   · 之后想改：文件菜单 →「关闭时缩到托盘」（IDM_TRAY_TOGGLE）。
+ * 为什么不直接退出：手机同步/局域网服务在后台还要连着，收进托盘才能继续当"书签服务器"。
+ */
+#define WM_APP_TRAY (WM_APP + 4)     /* 托盘图标的回调消息（lParam 是鼠标事件） */
+
+static NOTIFYICONDATAW s_nid;        /* 加一次图标就复用这份结构，删的时候要用同一个 uID */
+static bool s_trayAdded = false;
+
+/* 往托盘里加图标。图标就是程序自己的（res\app.ico，16~256 多尺寸，系统自己挑）。
+ * 失败就失败（比如资源管理器没起来），不影响窗口本身 —— 所以不弹框、只是没图标。 */
+static void UiTrayAdd()
+{
+    if (s_trayAdded || !g_hMain) return;
+    ZeroMemory(&s_nid, sizeof(s_nid));
+    s_nid.cbSize = sizeof(s_nid);
+    s_nid.hWnd = g_hMain;
+    s_nid.uID = 1;
+    s_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    s_nid.uCallbackMessage = WM_APP_TRAY;
+    HINSTANCE inst = (HINSTANCE)GetWindowLongPtrW(g_hMain, GWLP_HINSTANCE);
+    s_nid.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(IDI_APP));
+    lstrcpynW(s_nid.szTip, L"小说阅读器", (int)(sizeof(s_nid.szTip) / sizeof(s_nid.szTip[0])));
+    s_trayAdded = Shell_NotifyIconW(NIM_ADD, &s_nid) != FALSE;
+}
+
+static void UiTrayRemove()
+{
+    if (!s_trayAdded) return;
+    Shell_NotifyIconW(NIM_DELETE, &s_nid);
+    s_trayAdded = false;
+}
+
+/* 从托盘回到前台：先删图标再显示窗口，顺序反了会看到"图标还在、窗口已经在"
+ * 的瞬间重复状态。SW_RESTORE 顺手把最小化的窗口也拉回来。 */
+static void UiTrayRestore()
+{
+    UiTrayRemove();
+    ShowWindow(g_hMain, SW_RESTORE);
+    ShowWindow(g_hMain, SW_SHOW);
+    SetForegroundWindow(g_hMain);
+}
+
+/* 收进托盘：先藏窗口再加图标。反过来会有一下白闪（窗口还在，图标已出现）。 */
+static void UiHideToTray()
+{
+    ShowWindow(g_hMain, SW_HIDE);
+    UiTrayAdd();
+}
+
+/* 真正退出：存盘 → 摘图标 → 销毁窗口。所有"确实要退出"的路径最后都走这里，
+ * 免得某条路上忘了摘图标，托盘里留下一个点不动的幽灵。 */
+static void UiQuitNow()
+{
+    SaveAll();
+    UiTrayRemove();
+    if (g_hMain) DestroyWindow(g_hMain);
+}
+
+/* 托盘右键菜单：只有两项（还原 / 退出）。用 TrackPopupMenu 是为了"点外面就关"，
+ * 自己画一个浮层还得处理焦点丢失，收益不值。 */
+static void UiTrayMenu()
+{
+    HMENU m = CreatePopupMenu();
+    if (!m) return;
+    AppendMenuW(m, MF_STRING, 1, L"还原窗口(&R)");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING, 2, L"退出(&X)");
+    POINT pt;
+    GetCursorPos(&pt);
+    SetForegroundWindow(g_hMain);        /* 不先抢前台的话，菜单点外面不会消失 */
+    int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
+                                  pt.x, pt.y, 0, g_hMain, nullptr);
+    DestroyMenu(m);
+    PostMessageW(g_hMain, WM_NULL, 0, 0); /* 老规矩：让菜单可靠收起 */
+    if (cmd == 1) UiTrayRestore();
+    else if (cmd == 2) UiQuitNow();
+}
+
+/* 关窗的唯一出口：按设置决定"缩托盘"还是"真退出"，第一次还会问一句。
+ * 注意这里不能直接 DestroyWindow —— 托盘模式下窗口只是藏起来，进程继续跑。 */
+static void UiCloseOrTray()
+{
+    if (!g_set.trayAsked) {
+        int r = NrMsgBox(g_hMain, L"关闭窗口",
+                         L"关掉窗口后要不要缩到托盘继续后台？（手机同步会保持连通）\n\n"
+                         L"「是」：关窗只是收进托盘，双击图标就能回来。\n"
+                         L"「否」：关窗就直接退出程序。\n\n"
+                         L"以后想改：文件菜单 → 关闭时缩到托盘。",
+                         NRMB_YESNO);
+        g_set.trayAsked = 1;
+        g_set.trayClose = (r == IDYES) ? 1 : 0;
+        SettingsSave();                  /* 立刻落盘：下次启动不该再问 */
+    }
+    if (g_set.trayClose) { UiHideToTray(); return; }
+    UiQuitNow();
+}
+
 /* 字号增减 d 磅并立即重排版、写入 ini。d = +1 变大、-1 变小。
  * 夹取到 9~42 磅：再小没法读，再大一行放不下几个字，排版会退化。
  * 夹取后若与原值相同就直接返回 —— 避免到顶了还每次重排一遍全书，大书重排
@@ -5080,6 +5547,9 @@ static void AutoSyncMenu()
     CheckMenuItem(hm, IDM_AUTO_TOGGLE, MF_BYCOMMAND | (s_autoOn ? MF_CHECKED : MF_UNCHECKED));
     EnableMenuItem(hm, IDM_AUTO_FAST, MF_BYCOMMAND | (s_autoOn ? MF_ENABLED : MF_GRAYED));
     EnableMenuItem(hm, IDM_AUTO_SLOW, MF_BYCOMMAND | (s_autoOn ? MF_ENABLED : MF_GRAYED));
+    /* 1.8.1：两个行为开关的勾选状态也从这里同步，别处不用管 */
+    CheckMenuItem(hm, IDM_TRAY_TOGGLE, MF_BYCOMMAND | (g_set.trayClose ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(hm, IDM_START_HOME, MF_BYCOMMAND | (g_set.startHome ? MF_CHECKED : MF_UNCHECKED));
 }
 
 /* WM_COMMAND 的中央分派：菜单项、加速键、按钮、列表通知全在这里落地。
@@ -5146,7 +5616,25 @@ static void OnCommand(int id, int code, HWND ctl)
         UiCloseFile();
         break;
     case IDM_EXIT:
-        SendMessageW(g_hMain, WM_CLOSE, 0, 0);
+        /* 显式"退出"必须真的退出，不能走 WM_CLOSE —— 托盘模式下 WM_CLOSE 只是收起来，
+         * 用户点「退出」却看见图标还在托盘里，会以为程序没关掉。 */
+        UiQuitNow();
+        break;
+    case IDM_TRAY_TOGGLE:
+        g_set.trayClose = g_set.trayClose ? 0 : 1;
+        g_set.trayAsked = 1;                 /* 手动改过就不再自动问了 */
+        SettingsSave();
+        s_statusExtra = g_set.trayClose ? L"关闭窗口：缩到托盘" : L"关闭窗口：直接退出";
+        AutoSyncMenu();
+        UiUpdateStatus();
+        if (!g_set.trayClose) UiTrayRemove();   /* 从托盘模式切回"直接退出"时把图标摘掉 */
+        break;
+    case IDM_START_HOME:
+        g_set.startHome = g_set.startHome ? 0 : 1;
+        SettingsSave();
+        s_statusExtra = g_set.startHome ? L"启动时停在书架" : L"启动时直接打开上次那本";
+        AutoSyncMenu();
+        UiUpdateStatus();
         break;
     case IDM_PREV_CH:
         ViewGotoChapter(-1);
@@ -5321,20 +5809,28 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l)
     }
 
     case WM_CLOSE:
-        /* 关闭：先存盘、再销毁。SaveAll 依赖窗口还活着（要读窗口矩形和当前阅读位置），
-         * 所以这两句的顺序不能颠倒；DestroyWindow 之后才会有 WM_DESTROY → 退出消息循环。
-         */
-        SaveAll();
-        DestroyWindow(h);
+        /* 关闭：1.8.1 起多了一条路 —— 按设置在"缩到托盘"和"真退出"之间选。
+         * 存盘/销毁的实际顺序都在 UiQuitNow 里，这里只做决策，避免两处各写一遍。 */
+        UiCloseOrTray();
         return 0;
 
     case WM_DESTROY:
         /* 退出前必须把后台服务停掉：同步（TCP/UDP 线程）和手机网页服务（AcceptThread）
          * 还在 recv/send 的时候进程就退出，CRT 析构会和它们抢资源（偶发退出崩溃/卡几秒）。
          * 这两个函数内部各自等待线程退出，必须在 PostQuitMessage 之前调用。 */
+        UiTrayRemove();                  /* 托盘图标必须先摘：进程没了它不会自己消失 */
         SyncStop();
         ServerStop();
         PostQuitMessage(0);
+        return 0;
+
+    case WM_APP_TRAY:
+        /* 托盘图标回调。lParam 是鼠标消息：
+         *   双击左键 = 还原窗口（用户最自然的动作）
+         *   右键     = 弹"还原 / 退出"两项菜单
+         * 单击左键什么都不做 —— 有人习惯单击，但"点了没反应"总比"点一下就弹出来"更稳。 */
+        if (l == WM_LBUTTONDBLCLK) UiTrayRestore();
+        else if (l == WM_RBUTTONUP || l == WM_CONTEXTMENU) UiTrayMenu();
         return 0;
 
     case WM_COMMAND:
@@ -5807,6 +6303,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdLine, int)
     std::wstring target = FirstFileArg();
     if (!target.empty() && GetFileAttributesW(target.c_str()) != INVALID_FILE_ATTRIBUTES) {
         UiOpenFile(target);
+    } else if (!g_set.startHome && !g_set.lastFile.empty() &&
+               GetFileAttributesW(g_set.lastFile.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        /* 关掉「启动时停在书架」的人，下次开程序直接续读上次那本（文件没了就退回书架） */
+        UiOpenFile(g_set.lastFile);
     } else {
         ViewFocus();
         InvalidateRect(g_hMain, nullptr, TRUE);

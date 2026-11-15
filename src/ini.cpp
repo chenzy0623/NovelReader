@@ -304,6 +304,11 @@ void SettingsLoad()
     g_set.bossKey = IniGetStr(S0, L"bossKey", L"Ctrl+Alt+H");
     if (g_set.bossKey.empty()) g_set.bossKey = L"Ctrl+Alt+H";   /* 空串会注册成"无修饰的键"，太危险 */
     g_set.phoneSrv = IniGetInt(S0, L"phoneSrv", 0);   /* 手机同步：0 关（默认） 1 开 */
+    /* 1.8.1：启动进度（首页 or 直接续读）与关窗行为（托盘 or 退出）。
+     * trayAsked 单独存：它只决定"要不要再问一次"，跟用户最后选的 trayClose 无关。 */
+    g_set.startHome = IniGetInt(S0, L"startHome", 1) ? 1 : 0;
+    g_set.trayClose = IniGetInt(S0, L"trayClose", 1) ? 1 : 0;
+    g_set.trayAsked = IniGetInt(S0, L"trayAsked", 0) ? 1 : 0;
 
     /* 窗口位置：四个值缺一不可，而且要有意义的大小（right>left、bottom>top）。
      * 用 -100000 当"没有记录"的哨兵，比 0 更安全（多显示器可能出现负数坐标）。 */
@@ -342,6 +347,9 @@ void SettingsSave()
     IniSetInt(S0, L"privacy", g_set.privacy);
     IniSetStr(S0, L"bossKey", g_set.bossKey);
     IniSetInt(S0, L"phoneSrv", g_set.phoneSrv);
+    IniSetInt(S0, L"startHome", g_set.startHome);
+    IniSetInt(S0, L"trayClose", g_set.trayClose);
+    IniSetInt(S0, L"trayAsked", g_set.trayAsked);
     if (g_set.hasRect) {
         IniSetInt(S0, L"winL", g_set.winRect.left);
         IniSetInt(S0, L"winT", g_set.winRect.top);

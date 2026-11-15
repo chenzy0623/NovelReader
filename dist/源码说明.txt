@@ -1,4 +1,4 @@
-NovelReader 1.8.0 —— 源码说明与编译方法
+NovelReader 1.8.1 —— 源码说明与编译方法
 ==========================================
 
 这个文件夹里是阅读器的全部源码：纯 C++17 + Win32 API，没有任何第三方库
@@ -274,6 +274,30 @@ build.bat 会做两件事：
      （tests.cpp 里自带一个 WebFetchUrl 空实现），所以不需要图形界面也不需要网络；
      tests.bat 必须保持纯 ASCII —— UTF-8 的中文会让 cmd 按 OEM 页读，把路径截坏。
 
+16. 书架书脊 / 托盘 / 菜单面板（1.8.1）
+---------------------------------
+   · 书脊几何全在 view.cpp：ShelfSpineW/H、ShelfGap、ShelfStep、ShelfContentW、
+     ShelfMaxScroll、ShelfClamp、ShelfBand、ShelfRect、ShelfCentered、ShelfScrollBy、
+     ShelfIndexAt、ShelfColor（书皮颜色 = 书名 FNV 散列取 6 色板，同一本书永远同色）。
+     绘制与命中测试共用同一份 ShelfRect，所以"点到哪根就开哪根"不会点错。
+   · 横向滚动只用 s_shelfX 一个整数，ShelfScrollBy 内部先 Clamp 再 InvalidateAll，
+     所以窗口拉宽/书少了会自然夹回 0，不需要额外的边界状态。
+   · 书脊字体单独一套（EnsureSpineFonts，19px/13px 两档）：正文 30pt 时书脊上
+     只写得下两三个字，所以书名先换小号、再按高度截断补省略号，整块垂直居中。
+   · 托盘用 Shell_NotifyIconW，回调消息 WM_APP_TRAY（WM_APP + 4）；
+     关窗决策集中在 UiCloseOrTray：第一次问一次就落盘（trayAsked/trayClose），
+     之后 UiHideToTray 或 UiQuitNow 二选一。UiQuitNow 里顺序是
+     SaveAll → UiTrayRemove → DestroyWindow，托盘图标必须先摘，否则进程没了它还留着。
+   · 三条杠面板是自绘窗口 NRBarPanel（不是 TrackPopupMenu）：BarBuildRows 把
+     s_hAppMenu 摊平成"header + 条目"的行数组，BarLayoutRows 按列高贪心分列，
+     列数从 2 试到 4，取第一个"高度不超过工作区"的方案（小屏 1280×768 才不会顶出屏幕）。
+     面板弹出时 SetCapture，点到面板外面就能收到 WM_LBUTTONDOWN 并自行收起。
+   · 踩过的坑：窗口创建时系统会先发一个 WM_ACTIVATE(WA_INACTIVE)，直接当"点外面"处理
+     会导致面板刚出来就把自己关掉（表现为窗口列表里有、屏幕上什么都没有），
+     所以用 s_barActivated 记住"曾经激活过"再判断。
+   · build\regress.ps1 里的 -Cmd raw 是专门为这种"一激活就自毁"的弹出层加的截图命令：
+     它不 ShowWindow / SetForegroundWindow，只做屏幕拷贝。
+
   12. 排版规则只写一份（BuildFlow）
 
       1.5.0 之前"每段怎么断行、每行多宽"这套规则在绘制和命中测试里各写了
@@ -320,22 +344,22 @@ trace 覆盖：菜单命令分发、搜索链路、书源搜索各源结果、�
 
 五、代码规模（约）
 ------------------------------------------
-  ui.cpp        5400 行      主窗口、自绘顶栏/状态栏/列表、全部交互
-  view.cpp      2050 行      排版（BuildFlow）与绘制、书架卡片
-  web.cpp       1250 行      网页抓书 + 书源搜索（规则驱动、多源并发）
-  pdf.cpp        980 行      PDF 解析
-  sync.cpp       900 行      局域网进度同步（电脑端）
-  server.cpp     860 行      局域网阅读服务
-  format.cpp     690 行      EPUB/DOCX/HTML/MD 抽正文
-  book.cpp       680 行      解码、分章、搜索
-  ini.cpp        600 行      配置、进度、书架、书签
-  zip.cpp        590 行      zip + DEFLATE
-  sourcejson.cpp 570 行      书源 JSON 解析 / 导出
-  pdfrender.cpp  520 行      PDF 原始版式渲染（WinRT + GDI+）
-  common.h       480 行      数据结构与接口
-  layout.cpp     400 行      每本书排版、高亮/笔记、快捷键表
-  source.cpp     180 行      书源模型与 ini 存取
-  update.cpp     150 行      检查更新
-  crashdump.cpp  150 行      崩溃转储
-  合计约 17000 行（src/ 下 25 个 cpp/h），另有 tests/ 约 700 行、android/ 约 1300 行；
+  ui.cpp        6330 行      主窗口、自绘顶栏/状态栏/列表、托盘、菜单面板、全部交互
+  view.cpp      2360 行      排版（BuildFlow）与绘制、书脊书架
+  web.cpp       1390 行      网页抓书 + 书源搜索（规则驱动、多源并发）
+  pdf.cpp       1050 行      PDF 解析
+  sync.cpp      1010 行      局域网进度同步（电脑端）
+  server.cpp     950 行      局域网阅读服务
+  format.cpp     740 行      EPUB/DOCX/HTML/MD 抽正文
+  book.cpp       720 行      解码、分章、搜索
+  ini.cpp        670 行      配置、进度、书架、书签
+  zip.cpp        670 行      zip + DEFLATE
+  sourcejson.cpp 620 行      书源 JSON 解析 / 导出
+  pdfrender.cpp  605 行      PDF 原始版式渲染（WinRT + GDI+）
+  common.h       600 行      数据结构与接口
+  layout.cpp     445 行      每本书排版、高亮/笔记、快捷键表
+  source.cpp     210 行      书源模型与 ini 存取
+  update.cpp     160 行      检查更新
+  crashdump.cpp  170 行      崩溃转储
+  合计约 19600 行（src/ 下 25 个 cpp/h），另有 tests/ 约 700 行、android/ 约 1300 行；
   注释约占 30%
