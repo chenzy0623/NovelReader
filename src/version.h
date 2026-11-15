@@ -5,17 +5,17 @@
  * 现在统一在这里定义，其他地方一律引用这几个宏，不要再写字面量。
  *
  * 加版本号时的规则：只改 NR_VERSION_* 这三个宏 + README/说明文档，
- * 别在别的 .cpp 里硬写 "1.8.1"。
+ * 别在别的 .cpp 里硬写 "1.8.2"。
  * ============================================================================ */
 #ifndef NR_VERSION_H
 #define NR_VERSION_H
 
 #define NR_VERSION_MAJOR 1
 #define NR_VERSION_MINOR 8
-#define NR_VERSION_PATCH 1
+#define NR_VERSION_PATCH 2
 
-/* 显示用字符串，例如 L"1.8.1" */
-#define NR_VERSION_STR L"1.8.1"
+/* 显示用字符串，例如 L"1.8.2" */
+#define NR_VERSION_STR L"1.8.2"
 
 /* 比较用的整数：主*10000 + 次*100 + 修订。
  * 只为了"谁更新"这种比较，别拿它做位运算。 */

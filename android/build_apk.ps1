@@ -15,7 +15,7 @@
 # 用法（PowerShell 5.1）：
 #   powershell -NoProfile -ExecutionPolicy Bypass -File android\build_apk.ps1
 #
-# 产物：build\NovelReader-1.8.1.apk
+# 产物：build\NovelReader-1.8.2.apk
 
 $ErrorActionPreference = 'Stop'
 
@@ -34,7 +34,7 @@ $androidJar = Join-Path $sdk 'platforms\android-34\android.jar'
 $javac   = Join-Path $jdk 'bin\javac.exe'
 $keytool = Join-Path $jdk 'bin\keytool.exe'
 
-$apkName = 'NovelReader-1.8.1.apk'
+$apkName = 'NovelReader-1.8.2.apk'
 $finalApk = Join-Path $out $apkName
 
 foreach ($t in @($aapt2, $d8, $zipalign, $apksign, $androidJar, $javac)) {

@@ -5065,8 +5065,6 @@ static void ShowAbout()
     std::wstring m = L"轻量小说阅读器  NovelReader  ";
     m += NR_VERSION_STR;                 /* 1.8.0：版本号只有 version.h 一处定义 */
     m += L"\n\n";
-    m += L"第一作者：chenzy0623\n";
-    m += L"第二作者：xuanmo 的大肥鱼\n\n";
     m += L"支持 TXT / EPUB / PDF / HTML / Markdown / DOCX 等格式；\n";
     m += L"文本编码自动识别：UTF-8 / GBK(GB18030) / UTF-16；\n";
     m += L"自动识别“第 N 章”等章节标题；\n";

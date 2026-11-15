@@ -6,13 +6,11 @@
 支持 **TXT / EPUB / PDF / DOCX / HTML / Markdown**，自动识别章节，全文搜索，
 记忆阅读位置，自动下滑，书签，换字体，自定义配色，还能直接把网页小说抓成本地书。
 
-![版本](https://img.shields.io/badge/version-1.8.1-blue)
-![体积](https://img.shields.io/badge/size-1076%20KB-brightgreen)
+![版本](https://img.shields.io/badge/version-1.8.2-blue)
+![体积](https://img.shields.io/badge/size-1089%20KB-brightgreen)
 ![平台](https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-lightgrey)
 ![依赖](https://img.shields.io/badge/dependencies-none-success)
 ![许可](https://img.shields.io/badge/license-MIT-orange)
-
-**作者**：[chenzy0623](https://github.com/chenzy0623)（第一作者） · xuanmo 的大肥鱼（第二作者）
 
 ---
 
@@ -20,9 +18,9 @@
 
 到 [Releases](https://github.com/chenzy0623/NovelReader/releases) 下载最新版：
 
-- **[NovelReader-1.8.1-win64.zip](https://github.com/chenzy0623/NovelReader/releases/download/v1.8.1/NovelReader-1.8.1-win64.zip)**（推荐，含使用说明和示例小说）
-- [单个 NovelReader.exe](https://github.com/chenzy0623/NovelReader/releases/download/v1.8.1/NovelReader.exe)（只要程序本体）
-- **[NovelReader-1.8.1.apk](https://github.com/chenzy0623/NovelReader/releases/download/v1.8.1/NovelReader-1.8.1.apk)**（安卓端，69 KB，Android 5.0+ 直接装）
+- **[NovelReader-1.8.2-win64.zip](https://github.com/chenzy0623/NovelReader/releases/download/v1.8.2/NovelReader-1.8.2-win64.zip)**（推荐，含使用说明和示例小说）
+- [单个 NovelReader.exe](https://github.com/chenzy0623/NovelReader/releases/download/v1.8.2/NovelReader.exe)（只要程序本体）
+- **[NovelReader-1.8.2.apk](https://github.com/chenzy0623/NovelReader/releases/download/v1.8.2/NovelReader-1.8.2.apk)**（安卓端，69 KB，Android 5.0+ 直接装）
 
 解压任意目录，双击 `NovelReader.exe` 即可。**绿色版**：阅读进度存在 exe 同目录的
 `NovelReader.ini`（目录不可写时自动改用 `%APPDATA%\NovelReader\`），删掉 ini 就等于恢复出厂。
@@ -154,6 +152,13 @@ EPUB：
 - **状态栏**：书名 / 章节 / 进度三段，底部一条通栏进度线；自动下滑时右侧多一个 `▸自动 4`。
 - **搜索条**：输入框和三个按钮都跟着配色走，没有系统灰和立体边框。
 - 菜单栏被拿掉了（系统灰条在夜间配色下是全场唯一亮色），改成「菜单」按钮 + 右键弹出的弹出式菜单。
+
+---
+
+## 1.8.2：关于框不再写作者
+
+「关于」对话框只留版本、格式支持和配置路径，不再出现作者信息；
+README、使用说明、源码说明、LICENSE 里的作者署名也一并去掉。
 
 ---
 
@@ -501,7 +506,7 @@ PDF / EPUB / DOCX / HTML / Markdown 会**先抽出纯文本**，再走同一套�
 手机上的阅读进度会写进电脑上的同一份 `NovelReader.ini`，所以两边天然同步；
 回到电脑按 `Ctrl+Shift+G` 直接跳到手机读到的地方。
 
-> 1.7.0 起也提供了安卓 APK（`NovelReader-1.8.1.apk`，纯粹的同步 + 阅读客户端）。
+> 1.7.0 起也提供了安卓 APK（`NovelReader-1.8.2.apk`，纯粹的同步 + 阅读客户端）。
 > 网页方案仍然保留：不用装东西、不受应用商店限制，临时借用别人的手机最省事。
 
 ---
@@ -556,7 +561,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File android\build_apk.ps1
 ```
 
 不用 Gradle：脚本按 `aapt2 compile/link → javac → d8 → zipalign → apksigner` 的手工流程拼出
-`build\NovelReader-1.8.1.apk`，需要 `E:\Android\` 下的 JDK 17 + SDK build-tools（见 `dist\Android开发环境说明.txt`）。
+`build\NovelReader-1.8.2.apk`，需要 `E:\Android\` 下的 JDK 17 + SDK build-tools（见 `dist\Android开发环境说明.txt`）。
 
 ---
 
@@ -630,7 +635,7 @@ NovelReader/
 | 全文搜索 7 万字 | 即时（`< 20 ms`） |
 | 全文搜索 14.7 MB | 约 120 ms（一次性扫完，结果可到 4000 条） |
 | 内存占用（14.7 MB 的书） | 约 15 MB 私有内存（正文一次性解码进内存，段落索引只多几 MB） |
-| 程序体积 | 1013 KB（静态链接，无 DLL 依赖） |
+| 程序体积 | 1089 KB（静态链接，无 DLL 依赖） |
 
 ---
 
@@ -670,12 +675,5 @@ NovelReader/
 
 MIT License，见 [LICENSE](LICENSE)。
 
-## 作者
-
-| 顺序 | 作者 | 分工 |
-| --- | --- | --- |
-| 第一作者 | [chenzy0623](https://github.com/chenzy0623) | 需求、设计取舍、验收与发布 |
-| 第二作者 | xuanmo 的大肥鱼 | 编码、调试、文档与截图 |
-
-Copyright (c) 2025 chenzy0623, xuanmo 的大肥鱼
+Copyright (c) 2025 NovelReader contributors
 
